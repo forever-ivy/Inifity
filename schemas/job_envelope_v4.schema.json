@@ -1,0 +1,34 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "job_envelope_v4.schema.json",
+  "title": "JobEnvelopeV4",
+  "type": "object",
+  "required": ["job_id", "source", "status", "created_at"],
+  "properties": {
+    "job_id": {"type": "string"},
+    "source": {"type": "string", "enum": ["email", "whatsapp"]},
+    "from": {"type": "string"},
+    "subject": {"type": "string"},
+    "message_text": {"type": "string"},
+    "attachment_paths": {"type": "array", "items": {"type": "string"}},
+    "root_path": {"type": "string"},
+    "inbox_dir": {"type": "string"},
+    "review_dir": {"type": "string"},
+    "status": {
+      "type": "string",
+      "enum": [
+        "received",
+        "planned",
+        "running",
+        "review_pending",
+        "approved",
+        "delivered",
+        "needs_attention",
+        "failed",
+        "incomplete_input"
+      ]
+    },
+    "created_at": {"type": "string"},
+    "updated_at": {"type": "string"}
+  }
+}

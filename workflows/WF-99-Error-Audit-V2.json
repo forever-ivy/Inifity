@@ -35,8 +35,8 @@
         260
       ],
       "parameters": {
-        "fromEmail": "={{$env.EMAIL_FROM}}",
-        "toEmail": "={{$env.EMAIL_TO}}",
+        "fromEmail": "automation@example.com",
+        "toEmail": "mariem_mimi@163.com",
         "subject": "=[n8n Error] {{$json.workflow_name}} / {{$json.job_id}}",
         "text": "={{`Execution: ${$json.execution_id}\\nStatus: ${$json.status}\\nFlags: ${($json.status_flags || []).join(', ')}\\nIterations: ${$json.iteration_count}\\nMessage: ${$json.error_message}\\nTime: ${$json.at}`}}"
       },
@@ -53,13 +53,13 @@
       ],
       "parameters": {
         "method": "POST",
-        "url": "=https://graph.facebook.com/v20.0/{{$env.WHATSAPP_PHONE_NUMBER_ID}}/messages",
+        "url": "https://graph.facebook.com/v20.0//messages",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
             {
               "name": "Authorization",
-              "value": "=Bearer {{$env.WHATSAPP_ACCESS_TOKEN}}"
+              "value": "Bearer "
             },
             {
               "name": "Content-Type",
@@ -69,7 +69,7 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={\"messaging_product\":\"whatsapp\",\"to\":\"{{$env.WHATSAPP_TO}}\",\"type\":\"text\",\"text\":{\"preview_url\":false,\"body\":\"n8n error on {{$json.workflow_name}} for {{$json.job_id}}: {{$json.error_message}}\"}}"
+        "jsonBody": "{\"messaging_product\":\"whatsapp\",\"to\":\"+8615071054627\",\"type\":\"text\",\"text\":{\"preview_url\":false,\"body\":\"n8n error on {{$json.workflow_name}} for {{$json.job_id}}: {{$json.error_message}}\"}}"
       },
       "continueOnFail": true
     },

@@ -1,187 +1,159 @@
-# Translation Task Automation
+# Translation Automation V4.1 (OpenClaw-First)
 
-This repository now provides:
+## What changed
 
-- V1: n8n direct multi-model calls (legacy, rollback only)
-- V2 (overwritten by V3.2 behavior): n8n orchestration + OpenClaw intelligence
+V4.1 makes **OpenClaw the primary orchestrator**:
 
-## Paths
+- Trigger sources:
+  - Email (IMAP poll by OpenClaw cron)
+  - WhatsApp inbound (message/file)
+- Knowledge base:
+  - Read-only source: `/Users/ivy/Library/CloudStorage/OneDrive-Personal/Knowledge Repository`
+  - Incremental indexing: `mtime + hash`
+  - Supported: `docx`, `pdf`, `md`, `txt`, `xlsx`, `csv`
+- Work outputs:
+  - `/Users/ivy/Library/CloudStorage/OneDrive-Personal/Translation Task`
+- Notifications:
+  - Milestone WhatsApp messages
+  - Pending reminders twice daily
+- Approval:
+  - WhatsApp commands: `status|approve|reject|rerun`
 
-- Project repo: `/Users/Code/workflow/translation`
-- Translation root: `/Users/ivy/Library/CloudStorage/OneDrive-Personal/Translation Task`
+`n8n` workflows remain in `workflows/` only as legacy fallback.
 
-Expected subfolders:
+## Directory roles
 
-- `Arabic Source`
-- `Glossery`
-- `Previously Translated`
-- `Translated -EN`
+- Knowledge source root: `/Users/ivy/Library/CloudStorage/OneDrive-Personal/Knowledge Repository`
+  - `Previously Translated`
+  - `Glossery`
+  - `Arabic Source`
+  - `Translated -EN`
+- Work root: `/Users/ivy/Library/CloudStorage/OneDrive-Personal/Translation Task`
+  - `_INBOX/email/{job_id}`
+  - `_INBOX/whatsapp/{job_id}`
+  - `Translated -EN/_REVIEW/{job_id}`
+  - `.system/jobs/state.sqlite`
+  - `.system/kb/*`
+  - `.system/logs/*`
 
-Review folder:
+## New V4.1 scripts
 
-- `Translated -EN/_REVIEW/{job_id}`
+- Dispatcher:
+  - `scripts/openclaw_v4_dispatcher.py`
+- Skills:
+  - `scripts/skill_email_ingest.py`
+  - `scripts/skill_whatsapp_ingest.py`
+  - `scripts/skill_kb_incremental_sync.py`
+  - `scripts/skill_kb_retrieve.py`
+  - `scripts/skill_task_router.py`
+  - `scripts/skill_translation_execute.py`
+  - `scripts/skill_approval.py`
+  - `scripts/skill_notify.py`
+  - `scripts/skill_pending_reminder.py`
+- Runtime libs:
+  - `scripts/v4_runtime.py`
+  - `scripts/v4_kb.py`
+  - `scripts/v4_pipeline.py`
+- Setup:
+  - `scripts/setup_openclaw_v4.sh`
+  - `scripts/run_v4_email_poll.sh`
+  - `scripts/run_v4_pending_reminder.sh`
 
-## Active workflow files (V2 filenames, V3.2 behavior)
-
-- `workflows/WF-00-Orchestrator-V2.json`
-- `workflows/WF-20-OpenClaw-Orchestrator-V2.json`
-- `workflows/WF-30-Manual-Review-Deliver-V2.json`
-- `workflows/WF-99-Error-Audit-V2.json`
-
-V2 reuses existing:
-
-- `workflows/WF-10-Ingest-Classify.json`
-
-## Active scripts (OpenClaw-side intelligence)
-
-- `scripts/openclaw_translation_orchestrator.py`
-- `scripts/openclaw_quality_gate.py`
-- `scripts/openclaw_artifact_writer.py`
-
-## Environment configuration
-
-### n8n env
-
-Use `.env` (or `config/env.example`) for orchestration-only settings.
-
-Important: In V2, n8n no longer stores model provider API keys.
-
-Required variables:
-
-- `TRANSLATION_ROOT`
-- `PYTHON_BIN`
-- `OPENCLAW_BASE_URL`
-- `OPENCLAW_HOOK_TOKEN`
-- `OPENCLAW_AGENT_ID`
-- `WF10_WORKFLOW_ID`
-- `WF20_V2_WORKFLOW_ID`
-- `WF30_V2_WORKFLOW_ID`
-- `WF99_V2_WORKFLOW_ID`
-
-### OpenClaw provider secrets
-
-Use `config/openclaw.providers.env.example` as template.
-Keep provider keys only in OpenClaw runtime/profile.
-
-## OpenClaw setup
-
-1. Configure hook + fallback chain:
+## Install dependencies
 
 ```bash
 cd /Users/Code/workflow/translation
-OPENCLAW_HOOK_TOKEN="<strong-random-token>" ./scripts/setup_openclaw_v2.sh
+/Users/Code/workflow/translation/.venv/bin/pip install -r requirements.txt
 ```
 
-What this script does:
+## Local env file for V4
 
-- Creates `translator-main`, `translator-diff`, `translator-draft`, `translator-qa` agents if missing.
-- Enables hooks and sets `hooks.path=/hooks`.
-- Sets hook token and primary/fallback model chain.
-
-2. Restart gateway:
+Create `/Users/Code/workflow/translation/.env.v4.local`:
 
 ```bash
+V4_WORK_ROOT="/Users/ivy/Library/CloudStorage/OneDrive-Personal/Translation Task"
+V4_KB_ROOT="/Users/ivy/Library/CloudStorage/OneDrive-Personal/Knowledge Repository"
+V4_PYTHON_BIN="/Users/Code/workflow/translation/.venv/bin/python"
+
+OPENCLAW_NOTIFY_TARGET="+8615071054627"
+OPENCLAW_NOTIFY_CHANNEL="whatsapp"
+OPENCLAW_NOTIFY_ACCOUNT="default"
+
+V4_IMAP_HOST="imap.your-provider.com"
+V4_IMAP_PORT=993
+V4_IMAP_USER="you@example.com"
+V4_IMAP_PASSWORD="your_password_or_app_password"
+V4_IMAP_MAILBOX="INBOX"
+V4_IMAP_FROM_FILTER="modeh@eventranz.com"
+V4_IMAP_MAX_MESSAGES=5
+```
+
+## OpenClaw setup (V4)
+
+```bash
+cd /Users/Code/workflow/translation
+chmod +x scripts/setup_openclaw_v4.sh scripts/run_v4_email_poll.sh scripts/run_v4_pending_reminder.sh
+./scripts/setup_openclaw_v4.sh
 openclaw gateway --force
-```
-
-3. Health check:
-
-```bash
 openclaw health --json
 ```
 
-## n8n setup
+## Manual run commands
 
-1. Start n8n with env loaded:
+### 1) Poll email and auto-run jobs
 
 ```bash
 cd /Users/Code/workflow/translation
-set -a
-source .env
-set +a
-n8n start
+./scripts/run_v4_email_poll.sh
 ```
 
-2. Open `http://localhost:5678` and import workflows in this order:
+### 2) Run pending reminders
 
-- `WF-99-Error-Audit-V2`
-- `WF-10-Ingest-Classify`
-- `WF-20-OpenClaw-Orchestrator-V2`
-- `WF-30-Manual-Review-Deliver-V2`
-- `WF-00-Orchestrator-V2`
+```bash
+cd /Users/Code/workflow/translation
+./scripts/run_v4_pending_reminder.sh
+```
 
-3. Bind credentials for IMAP/Email/WhatsApp.
+### 3) Handle approval command directly
 
-4. Fill workflow IDs in `.env`, then restart n8n.
+```bash
+cd /Users/Code/workflow/translation
+/Users/Code/workflow/translation/.venv/bin/python scripts/openclaw_v4_dispatcher.py \
+  approval --command "approve job_xxx"
+```
 
-## Runtime behavior (V3.2, on V2 filenames)
+## WhatsApp command interface
 
-1. n8n detects task event (email or scheduled poll).
-2. n8n normalizes all discovered DOCX into `candidate_files` (not fixed to one scenario).
-3. n8n calls OpenClaw `/hooks/agent` with `job_id + candidate_files + review_dir`.
-4. OpenClaw classifies task type and estimates duration:
-   - `REVISION_UPDATE`
-   - `NEW_TRANSLATION`
-   - `BILINGUAL_REVIEW`
-   - `EN_ONLY_EDIT`
-   - `MULTI_FILE_BATCH`
-5. Timeout policy:
-   - `runtime_timeout = min(estimated_minutes * 1.3, 45)`
-   - `long_task_capped` flag when capped.
-6. OpenClaw runs self-check loop (max 3 rounds):
-   - Codex write
-   - Gemini review
-   - iterative resolve
-   - stop on `double_pass=true` or round 3.
-7. Artifacts are written to `_REVIEW/{job_id}`:
-   - `Draft A (Preserve).docx`
-   - `Draft B (Reflow).docx`
-   - `Review Brief.docx`
-   - `.system/Task Brief.md`
-   - `.system/Delta Summary.json`
-   - `.system/Model Scores.json`
-   - `.system/quality_report.json`
-   - `.system/openclaw_result.json`
-8. n8n opens manual review gate only for `status=review_pending`.
-9. You edit manually and save `*_manual*.docx` or `*_edited*.docx`.
-10. Approve callback copies manual file to `Translated -EN`.
+- `status {job_id}`
+- `approve {job_id}`
+- `reject {job_id} {reason}`
+- `rerun {job_id}`
 
-## Security requirements (mandatory before production)
+## Key runtime outputs per job
 
-- Rotate any previously exposed API keys.
-- Rotate gateway token.
-- Use dedicated `hooks.token` different from gateway token.
-- Keep hook endpoint loopback/tailnet only.
+`/Users/ivy/Library/CloudStorage/OneDrive-Personal/Translation Task/Translated -EN/_REVIEW/{job_id}`
 
-## Quick daily SOP
-
-1. Put source files in `Arabic Source` (or receive by email trigger).
-2. Wait for `_REVIEW/{job_id}` artifacts.
-3. Edit `English V2 Draft.docx` manually.
-4. Save as `*_manual*.docx` in same review folder.
-5. Trigger `approve_manual` callback.
-6. Confirm final file appears in `Translated -EN`.
+- `Draft A (Preserve).docx`
+- `Draft B (Reflow).docx`
+- `Review Brief.docx`
+- `.system/Task Brief.md`
+- `.system/Delta Summary.json`
+- `.system/Model Scores.json`
+- `.system/quality_report.json`
+- `.system/openclaw_result.json`
+- `.system/execution_plan.json`
 
 ## Tests
 
 ```bash
-PYTHONPATH=/Users/Code/workflow/translation python3 -m unittest discover -s tests -v
+cd /Users/Code/workflow/translation
+PYTHONPATH=/Users/Code/workflow/translation /Users/Code/workflow/translation/.venv/bin/python -m unittest discover -s tests -v
 ```
 
-## Prerequisites
+## Schemas (V4)
 
-- `n8n`
-- `openclaw` CLI/gateway
-- `python3` + `python-docx`
-- `jq` (used by setup script)
-
-## Dedup strategy
-
-- Dedupe key: `event_hash + file_fingerprint`
-- Result: same event + same file version is skipped; same event + new file content is processed.
-
-## Rollback
-
-- Disable `WF-*-V2`
-- Re-enable legacy `WF-*`
-- No data migration required
+- `schemas/job_envelope_v4.schema.json`
+- `schemas/knowledge_sync_record.schema.json`
+- `schemas/execution_plan_v4.schema.json`
+- `schemas/execution_result_v4.schema.json`
+- `schemas/notification_event_v4.schema.json`

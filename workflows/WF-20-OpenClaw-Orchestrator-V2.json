@@ -36,13 +36,13 @@
       ],
       "parameters": {
         "method": "POST",
-        "url": "={{$env.OPENCLAW_BASE_URL || \"http://127.0.0.1:18789\"}}/hooks/agent",
+        "url": "http://127.0.0.1:18789/hooks/agent",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
             {
               "name": "Authorization",
-              "value": "=Bearer {{$env.OPENCLAW_HOOK_TOKEN}}"
+              "value": "Bearer oc_hook_CxKIZyGKph5JZCa_3raNZ0BybNzvaxG_"
             },
             {
               "name": "Content-Type",
@@ -128,7 +128,7 @@
         300
       ],
       "parameters": {
-        "command": "=mkdir -p \"{{$json.meta.review_dir}}/.system\"; for i in $(seq 1 {{$env.OPENCLAW_RESULT_POLL_TRIES || 120}}); do if [ -f \"{{$json.meta.review_dir}}/.system/openclaw_result.json\" ]; then cat \"{{$json.meta.review_dir}}/.system/openclaw_result.json\"; exit 0; fi; sleep {{$env.OPENCLAW_RESULT_POLL_INTERVAL_SECONDS || 2}}; done; META_JSON='{{ JSON.stringify($json.meta) }}'; {{$env.PYTHON_BIN || 'python3'}} /Users/Code/workflow/translation/scripts/openclaw_translation_orchestrator.py --meta-json \"$META_JSON\" >/tmp/openclaw_fallback_{{$json.job_id}}.log 2>&1 || true; if [ -f \"{{$json.meta.review_dir}}/.system/openclaw_result.json\" ]; then cat \"{{$json.meta.review_dir}}/.system/openclaw_result.json\"; else echo '{\"ok\":false,\"status\":\"needs_revision\",\"errors\":[\"openclaw_result_timeout\",\"openclaw_fallback_failed\"]}'; fi"
+        "command": "=mkdir -p \"{{$json.meta.review_dir}}/.system\"; for i in $(seq 1 120); do if [ -f \"{{$json.meta.review_dir}}/.system/openclaw_result.json\" ]; then cat \"{{$json.meta.review_dir}}/.system/openclaw_result.json\"; exit 0; fi; sleep 2; done; META_JSON='{{ JSON.stringify($json.meta) }}'; /Users/Code/workflow/translation/.venv/bin/python /Users/Code/workflow/translation/scripts/openclaw_translation_orchestrator.py --meta-json \"$META_JSON\" >/tmp/openclaw_fallback_{{$json.job_id}}.log 2>&1 || true; if [ -f \"{{$json.meta.review_dir}}/.system/openclaw_result.json\" ]; then cat \"{{$json.meta.review_dir}}/.system/openclaw_result.json\"; else echo '{\"ok\":false,\"status\":\"needs_revision\",\"errors\":[\"openclaw_result_timeout\",\"openclaw_fallback_failed\"]}'; fi"
       }
     },
     {
@@ -213,7 +213,7 @@
         480
       ],
       "parameters": {
-        "workflowId": "={{$env.WF99_V2_WORKFLOW_ID}}",
+        "workflowId": "b8pI23lfOKhgspYH",
         "options": {
           "waitForSubWorkflow": false
         }

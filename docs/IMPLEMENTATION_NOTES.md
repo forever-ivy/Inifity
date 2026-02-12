@@ -1,71 +1,81 @@
-# Implementation Notes (V3.2 Behavior on V2 Files)
+# Implementation Notes (V4.1)
 
-## What changed
+## Architecture pivot
 
-This repository keeps the same V2 workflow filenames, but behavior is upgraded to V3.2:
+V4.1 shifts from `n8n-main` to `OpenClaw-main` orchestration:
 
-1. Full-scenario task handling:
-   - `REVISION_UPDATE`
-   - `NEW_TRANSLATION`
-   - `BILINGUAL_REVIEW`
-   - `EN_ONLY_EDIT`
-   - `MULTI_FILE_BATCH`
-2. Self-check loop:
+1. OpenClaw handles:
+   - email ingest
+   - WhatsApp ingest
+   - knowledge-base sync/retrieve
+   - task routing
+   - translation execution
+   - approval commands
+   - pending reminders
+2. n8n workflows remain in repository as legacy rollback assets only.
+
+## Paths
+
+- Knowledge source (read-only):
+  - `/Users/ivy/Library/CloudStorage/OneDrive-Personal/Knowledge Repository`
+- Work root:
+  - `/Users/ivy/Library/CloudStorage/OneDrive-Personal/Translation Task`
+
+## Core behavior
+
+1. Pre-execution KB sync:
+   - mtime + sha256 incremental update
+   - formats: docx/pdf/md/txt/xlsx/csv
+2. Task planning:
+   - classify into `REVISION_UPDATE|NEW_TRANSLATION|BILINGUAL_REVIEW|EN_ONLY_EDIT|MULTI_FILE_BATCH`
+   - estimate runtime and cap via `min(estimated * 1.3, 45)`
+3. Translation self-check:
+   - Codex + Gemini
    - max rounds = 3
-   - stop rule = both Codex and Gemini pass (`double_pass=true`)
-3. Dynamic duration:
-   - estimate at runtime
-   - timeout budget = `min(estimated * 1.3, 45)`
-   - capped tasks flagged as `long_task_capped`
-4. Manual delivery remains mandatory:
-   - no `*_manual*.docx` or `*_edited*.docx` => approve blocked
+4. Delivery gate:
+   - `approve {job_id}` requires `*_manual*.docx` or `*_edited*.docx`
+5. Notifications:
+   - milestone WhatsApp notifications
+   - pending reminders twice daily
 
-## Public contracts
+## Added scripts (V4.1)
 
-### HookTaskRequest
+- `/Users/Code/workflow/translation/scripts/openclaw_v4_dispatcher.py`
+- `/Users/Code/workflow/translation/scripts/v4_runtime.py`
+- `/Users/Code/workflow/translation/scripts/v4_kb.py`
+- `/Users/Code/workflow/translation/scripts/v4_pipeline.py`
+- `/Users/Code/workflow/translation/scripts/skill_email_ingest.py`
+- `/Users/Code/workflow/translation/scripts/skill_whatsapp_ingest.py`
+- `/Users/Code/workflow/translation/scripts/skill_kb_incremental_sync.py`
+- `/Users/Code/workflow/translation/scripts/skill_kb_retrieve.py`
+- `/Users/Code/workflow/translation/scripts/skill_task_router.py`
+- `/Users/Code/workflow/translation/scripts/skill_translation_execute.py`
+- `/Users/Code/workflow/translation/scripts/skill_approval.py`
+- `/Users/Code/workflow/translation/scripts/skill_notify.py`
+- `/Users/Code/workflow/translation/scripts/skill_pending_reminder.py`
+- `/Users/Code/workflow/translation/scripts/run_v4_email_poll.sh`
+- `/Users/Code/workflow/translation/scripts/run_v4_pending_reminder.sh`
+- `/Users/Code/workflow/translation/scripts/setup_openclaw_v4.sh`
 
-- `meta` now accepts:
-  - `candidate_files[]` (primary input)
-  - legacy `files` map (backward compatibility)
-  - `task_type` (optional hint)
+## Added schemas (V4)
 
-### HookTaskResponse (result JSON)
+- `/Users/Code/workflow/translation/schemas/job_envelope_v4.schema.json`
+- `/Users/Code/workflow/translation/schemas/knowledge_sync_record.schema.json`
+- `/Users/Code/workflow/translation/schemas/execution_plan_v4.schema.json`
+- `/Users/Code/workflow/translation/schemas/execution_result_v4.schema.json`
+- `/Users/Code/workflow/translation/schemas/notification_event_v4.schema.json`
 
-New fields:
+## Runtime state
 
-- `plan` (`task_type`, `confidence`, `estimated_minutes`, `complexity_score`, `time_budget_minutes`)
-- `iteration_count`
-- `double_pass`
-- `estimated_minutes`
-- `runtime_timeout_minutes`
-- `actual_duration_minutes`
-- `status_flags[]`
-- `quality_report` (`rounds[]`, `convergence_reached`, `stop_reason`)
+SQLite state:
+- `/Users/ivy/Library/CloudStorage/OneDrive-Personal/Translation Task/.system/jobs/state.sqlite`
 
-### Artifacts written to review folder
+Logs:
+- `/Users/ivy/Library/CloudStorage/OneDrive-Personal/Translation Task/.system/logs/events.log`
+- `/Users/ivy/Library/CloudStorage/OneDrive-Personal/Translation Task/.system/logs/errors.log`
 
-- `Draft A (Preserve).docx`
-- `Draft B (Reflow).docx`
-- `Review Brief.docx`
-- `.system/Task Brief.md`
-- `.system/Delta Summary.json`
-- `.system/Model Scores.json`
-- `.system/quality_report.json`
-- `.system/openclaw_result.json`
+## Notes
 
-## Workflow impact
-
-Updated files:
-
-- `/Users/Code/workflow/translation/workflows/WF-10-Ingest-Classify.json`
-- `/Users/Code/workflow/translation/workflows/WF-20-OpenClaw-Orchestrator-V2.json`
-- `/Users/Code/workflow/translation/workflows/WF-30-Manual-Review-Deliver-V2.json`
-- `/Users/Code/workflow/translation/workflows/WF-99-Error-Audit-V2.json`
-
-## Operational notes
-
-1. V2 workflow IDs and import names are unchanged.
-2. If you already imported workflows, re-import and overwrite to get new node scripts.
-3. OpenClaw + n8n should remain on the same machine with loopback hook URL.
-4. If Gemini is unavailable, workflow flags `degraded_single_model` and continues with Codex.
-
+1. V4 setup script configures OpenClaw agents + cron jobs.
+2. Email credentials are intentionally stored in local `.env.v4.local` (not in repo).
+3. WhatsApp must stay online for command loop (`status/approve/reject/rerun`).

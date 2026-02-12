@@ -1,0 +1,17 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "execution_plan_v4.schema.json",
+  "title": "ExecutionPlanV4",
+  "type": "object",
+  "required": ["task_type", "confidence", "estimated_minutes", "runtime_timeout_minutes", "complexity_score"],
+  "properties": {
+    "task_type": {
+      "type": "string",
+      "enum": ["REVISION_UPDATE", "NEW_TRANSLATION", "BILINGUAL_REVIEW", "EN_ONLY_EDIT", "MULTI_FILE_BATCH"]
+    },
+    "confidence": {"type": "number"},
+    "estimated_minutes": {"type": "integer"},
+    "runtime_timeout_minutes": {"type": "integer"},
+    "complexity_score": {"type": "number"}
+  }
+}

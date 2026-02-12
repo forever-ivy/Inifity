@@ -135,6 +135,25 @@ def _classify_task(meta: dict[str, Any], candidates: list[dict[str, Any]]) -> tu
     if hinted in TASK_TYPES:
         return hinted, 1.0
 
+    message_blob = " ".join(
+        [
+            str(meta.get("subject") or ""),
+            str(meta.get("message_text") or ""),
+            str(meta.get("message") or ""),
+        ]
+    ).lower()
+    if message_blob:
+        if any(k in message_blob for k in ["batch", "multiple files", "multi file", "دفعة", "عدة ملفات"]):
+            return "MULTI_FILE_BATCH", 0.92
+        if any(k in message_blob for k in ["revise", "revision", "update", "compare v1", "v2", "مراجعة", "تحديث", "مقارنة"]):
+            return "REVISION_UPDATE", 0.9
+        if any(k in message_blob for k in ["new translation", "translate", "ترجمة"]):
+            return "NEW_TRANSLATION", 0.88
+        if any(k in message_blob for k in ["proofread", "edit english", "english only", "تحرير", "تدقيق"]):
+            return "EN_ONLY_EDIT", 0.86
+        if any(k in message_blob for k in ["bilingual", "arabic and english", "ثنائي اللغة"]):
+            return "BILINGUAL_REVIEW", 0.86
+
     ar_docs = [x for x in candidates if x.get("language") == "ar"]
     en_docs = [x for x in candidates if x.get("language") == "en"]
     has_ar_v1 = any(x.get("language") == "ar" and x.get("version") == "v1" for x in candidates)
@@ -536,4 +555,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

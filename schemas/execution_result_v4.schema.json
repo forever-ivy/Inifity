@@ -1,0 +1,30 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "execution_result_v4.schema.json",
+  "title": "ExecutionResultV4",
+  "type": "object",
+  "required": ["job_id", "status", "iteration_count", "double_pass", "status_flags", "artifacts", "errors"],
+  "properties": {
+    "job_id": {"type": "string"},
+    "status": {
+      "type": "string",
+      "enum": ["review_pending", "needs_attention", "failed", "incomplete_input", "delivered"]
+    },
+    "iteration_count": {"type": "integer"},
+    "double_pass": {"type": "boolean"},
+    "status_flags": {"type": "array", "items": {"type": "string"}},
+    "artifacts": {
+      "type": "object",
+      "properties": {
+        "draft_a_docx": {"type": "string"},
+        "draft_b_docx": {"type": "string"},
+        "review_brief_docx": {"type": "string"},
+        "task_brief_md": {"type": "string"},
+        "delta_summary_json": {"type": "string"},
+        "model_scores_json": {"type": "string"},
+        "quality_report_json": {"type": "string"}
+      }
+    },
+    "errors": {"type": "array", "items": {"type": "string"}}
+  }
+}

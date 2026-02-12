@@ -84,7 +84,7 @@ def build_task_brief(
         "1. Open Draft A (Preserve).docx to keep original formatting.",
         "2. Compare with Draft B (Reflow).docx and Review Brief.docx to apply required edits.",
         "3. Save your final manual file as *_manual*.docx or *_edited*.docx in this review folder.",
-        "4. Trigger approve_manual callback to deliver.",
+        f"4. Send WhatsApp command: approve {job_id} to deliver.",
     ]
     return "\n".join(lines)
 
@@ -248,4 +248,3 @@ def write_artifacts(
         "model_scores_json": str(model_scores_json.resolve()),
         "quality_report_json": str(quality_report_json.resolve()),
     }
-

@@ -35,7 +35,7 @@
         320
       ],
       "parameters": {
-        "command": "={{$env.PYTHON_BIN || 'python3'}} /Users/Code/workflow/translation/scripts/build_doc_struct.py --root \"{{$json.root_path}}\" --job-id \"{{$json.job_id}}\""
+        "command": "=/Users/Code/workflow/translation/.venv/bin/python /Users/Code/workflow/translation/scripts/build_doc_struct.py --root \"{{$json.root_path}}\" --job-id \"{{$json.job_id}}\""
       }
     },
     {
@@ -81,7 +81,7 @@
         460
       ],
       "parameters": {
-        "workflowId": "={{$env.WF99_V2_WORKFLOW_ID || $env.WF99_WORKFLOW_ID}}",
+        "workflowId": "b8pI23lfOKhgspYH",
         "options": {
           "waitForSubWorkflow": false
         }

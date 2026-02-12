@@ -1,0 +1,15 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "notification_event_v4.schema.json",
+  "title": "NotificationEventV4",
+  "type": "object",
+  "required": ["job_id", "milestone", "channel", "message", "sent_at"],
+  "properties": {
+    "job_id": {"type": "string"},
+    "milestone": {"type": "string"},
+    "channel": {"type": "string", "enum": ["whatsapp"]},
+    "message": {"type": "string"},
+    "sent_at": {"type": "string"},
+    "meta": {"type": "object"}
+  }
+}

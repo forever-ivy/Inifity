@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="/Users/Code/workflow/translation"
+cd "$ROOT_DIR"
+
+if [[ -f ".env.v4.local" ]]; then
+  set -a
+  source ".env.v4.local"
+  set +a
+fi
+
+: "${V4_IMAP_HOST:?V4_IMAP_HOST is required in .env.v4.local}"
+: "${V4_IMAP_USER:?V4_IMAP_USER is required in .env.v4.local}"
+: "${V4_IMAP_PASSWORD:?V4_IMAP_PASSWORD is required in .env.v4.local}"
+
+WORK_ROOT="${V4_WORK_ROOT:-/Users/ivy/Library/CloudStorage/OneDrive-Personal/Translation Task}"
+KB_ROOT="${V4_KB_ROOT:-/Users/ivy/Library/CloudStorage/OneDrive-Personal/Knowledge Repository}"
+NOTIFY_TARGET="${OPENCLAW_NOTIFY_TARGET:-+8615071054627}"
+
+"${V4_PYTHON_BIN:-/Users/Code/workflow/translation/.venv/bin/python}" \
+  "${ROOT_DIR}/scripts/openclaw_v4_dispatcher.py" \
+  --work-root "$WORK_ROOT" \
+  --kb-root "$KB_ROOT" \
+  --notify-target "$NOTIFY_TARGET" \
+  email-poll \
+  --imap-host "$V4_IMAP_HOST" \
+  --imap-port "${V4_IMAP_PORT:-993}" \
+  --imap-user "$V4_IMAP_USER" \
+  --imap-password "$V4_IMAP_PASSWORD" \
+  --mailbox "${V4_IMAP_MAILBOX:-INBOX}" \
+  --from-filter "${V4_IMAP_FROM_FILTER:-modeh@eventranz.com}" \
+  --max-messages "${V4_IMAP_MAX_MESSAGES:-5}" \
+  --auto-run
