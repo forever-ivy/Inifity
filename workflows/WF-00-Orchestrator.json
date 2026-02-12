@@ -1,0 +1,461 @@
+{
+  "name": "WF-00-Orchestrator",
+  "nodes": [
+    {
+      "id": "wf00_manual",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        220,
+        740
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "wf00_email_sched",
+      "name": "Email Poll Schedule",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        220,
+        200
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 15
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "wf00_read_imap",
+      "name": "Read IMAP Task Emails",
+      "type": "n8n-nodes-base.emailReadImap",
+      "typeVersion": 2,
+      "position": [
+        460,
+        200
+      ],
+      "parameters": {
+        "mailbox": "INBOX",
+        "postProcessAction": "nothing",
+        "options": {
+          "downloadAttachments": true,
+          "allowUnauthorizedCerts": false,
+          "customEmailConfig": "from:modeh@eventranz.com"
+        }
+      },
+      "credentials": {
+        "imap": {
+          "id": "cred_imap",
+          "name": "cred_imap"
+        }
+      }
+    },
+    {
+      "id": "wf00_norm_email",
+      "name": "Normalize Email Event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        700,
+        200
+      ],
+      "parameters": {
+        "jsCode": "\nconst now = new Date().toISOString();\nconst jobId = `job_${Date.now()}`;\nreturn [{\n  source: 'email',\n  triggered_at: now,\n  job_id: jobId,\n  root_path: $env.TRANSLATION_ROOT || '/Users/ivy/Library/CloudStorage/OneDrive-Personal/Translation Task',\n  raw_refs: [$json.subject || '', $json.from || ''],\n  payload: $json\n}];\n"
+      }
+    },
+    {
+      "id": "wf00_od_sched",
+      "name": "OneDrive Poll Schedule",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        220,
+        520
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 15
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "wf00_norm_od",
+      "name": "Normalize OneDrive Event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        460,
+        600
+      ],
+      "parameters": {
+        "jsCode": "\nconst now = new Date().toISOString();\nconst jobId = `job_${Date.now()}`;\nreturn [{\n  source: 'onedrive',\n  triggered_at: now,\n  job_id: jobId,\n  root_path: $env.TRANSLATION_ROOT || '/Users/ivy/Library/CloudStorage/OneDrive-Personal/Translation Task',\n  raw_refs: ['scheduled_poll'],\n  payload: {}\n}];\n"
+      }
+    },
+    {
+      "id": "wf00_merge",
+      "name": "Merge Event Streams",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        920,
+        420
+      ],
+      "parameters": {
+        "mode": "append"
+      }
+    },
+    {
+      "id": "wf00_hash",
+      "name": "Code EventFingerprint",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1140,
+        420
+      ],
+      "parameters": {
+        "jsCode": "\nconst src = `${$json.source}|${$json.root_path}|${new Date($json.triggered_at).toISOString().slice(0,16)}`;\nlet h = 0;\nfor (let i = 0; i < src.length; i++) h = Math.imul(31, h) + src.charCodeAt(i) | 0;\nreturn [{ ...$json, event_hash: `h_${Math.abs(h)}` }];\n"
+      }
+    },
+    {
+      "id": "wf00_lookup",
+      "name": "Data Store Lookup",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1360,
+        420
+      ],
+      "parameters": {
+        "jsCode": "\nconst globalData = $getWorkflowStaticData('global');\nglobalData.seen = globalData.seen || {};\nconst hash = $json.event_hash;\nconst isDuplicate = Boolean(globalData.seen[hash]);\nreturn [{ ...$json, isDuplicate }];\n"
+      }
+    },
+    {
+      "id": "wf00_if_dup",
+      "name": "IF Is Duplicate",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1580,
+        420
+      ],
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{$json.isDuplicate}}",
+              "operation": "isTrue"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "wf00_exec10",
+      "name": "Execute WF-10 Ingest-Classify",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.1,
+      "position": [
+        1800,
+        560
+      ],
+      "parameters": {
+        "workflowId": "={{$env.WF10_WORKFLOW_ID}}",
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      }
+    },
+    {
+      "id": "wf00_if_ready",
+      "name": "IF Required Files Ready",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2020,
+        560
+      ],
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{$json.valid}}",
+              "operation": "isTrue"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "wf00_exec20",
+      "name": "Execute WF-20 Delta-MultiAI",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.1,
+      "position": [
+        2240,
+        500
+      ],
+      "parameters": {
+        "workflowId": "={{$env.WF20_WORKFLOW_ID}}",
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      }
+    },
+    {
+      "id": "wf00_exec30",
+      "name": "Execute WF-30 Manual-Review-Deliver",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.1,
+      "position": [
+        2460,
+        500
+      ],
+      "parameters": {
+        "workflowId": "={{$env.WF30_WORKFLOW_ID}}",
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      }
+    },
+    {
+      "id": "wf00_mark",
+      "name": "Mark Processed Event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2680,
+        420
+      ],
+      "parameters": {
+        "jsCode": "\nconst globalData = $getWorkflowStaticData('global');\nglobalData.seen = globalData.seen || {};\nglobalData.seen[$json.event_hash] = { at: new Date().toISOString(), job_id: $json.job_id };\nreturn [{ ...$json, status: $json.status || 'processed' }];\n"
+      }
+    },
+    {
+      "id": "wf00_incomplete",
+      "name": "Set Incomplete Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2240,
+        680
+      ],
+      "parameters": {
+        "jsCode": "\nreturn [{\n  ...$json,\n  status: 'incomplete_input',\n  error_message: `Missing required files: ${($json.missing || []).join(', ')}`\n}];\n"
+      }
+    },
+    {
+      "id": "wf00_exec99",
+      "name": "Execute WF-99 Error-Audit",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.1,
+      "position": [
+        2460,
+        700
+      ],
+      "parameters": {
+        "workflowId": "={{$env.WF99_WORKFLOW_ID}}",
+        "options": {
+          "waitForSubWorkflow": false
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Normalize OneDrive Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email Poll Schedule": {
+      "main": [
+        [
+          {
+            "node": "Read IMAP Task Emails",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read IMAP Task Emails": {
+      "main": [
+        [
+          {
+            "node": "Normalize Email Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Email Event": {
+      "main": [
+        [
+          {
+            "node": "Merge Event Streams",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OneDrive Poll Schedule": {
+      "main": [
+        [
+          {
+            "node": "Normalize OneDrive Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize OneDrive Event": {
+      "main": [
+        [
+          {
+            "node": "Merge Event Streams",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Merge Event Streams": {
+      "main": [
+        [
+          {
+            "node": "Code EventFingerprint",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code EventFingerprint": {
+      "main": [
+        [
+          {
+            "node": "Data Store Lookup",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Data Store Lookup": {
+      "main": [
+        [
+          {
+            "node": "IF Is Duplicate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF Is Duplicate": {
+      "main": [
+        [
+          {
+            "node": "Mark Processed Event",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Execute WF-10 Ingest-Classify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute WF-10 Ingest-Classify": {
+      "main": [
+        [
+          {
+            "node": "IF Required Files Ready",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF Required Files Ready": {
+      "main": [
+        [
+          {
+            "node": "Execute WF-20 Delta-MultiAI",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Set Incomplete Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute WF-20 Delta-MultiAI": {
+      "main": [
+        [
+          {
+            "node": "Execute WF-30 Manual-Review-Deliver",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute WF-30 Manual-Review-Deliver": {
+      "main": [
+        [
+          {
+            "node": "Mark Processed Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set Incomplete Input": {
+      "main": [
+        [
+          {
+            "node": "Execute WF-99 Error-Audit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false
+}

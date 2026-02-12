@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "delta_pack.schema.json",
+  "title": "DeltaPack",
+  "type": "object",
+  "required": ["job_id", "added", "removed", "modified", "summary_by_section"],
+  "properties": {
+    "job_id": {"type": "string"},
+    "added": {"type": "array", "items": {"type": "object"}},
+    "removed": {"type": "array", "items": {"type": "object"}},
+    "modified": {"type": "array", "items": {"type": "object"}},
+    "summary_by_section": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["section", "changes"],
+        "properties": {
+          "section": {"type": "string"},
+          "changes": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    }
+  },
+  "additionalProperties": true
+}

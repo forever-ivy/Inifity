@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "model_scores.schema.json",
+  "title": "ModelScores",
+  "type": "object",
+  "required": ["winner", "scores", "judge_margin"],
+  "properties": {
+    "winner": {"type": "string"},
+    "judge_margin": {"type": "number"},
+    "scores": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["semantic", "terminology", "completeness", "format", "brevity", "total"],
+        "properties": {
+          "semantic": {"type": "number"},
+          "terminology": {"type": "number"},
+          "completeness": {"type": "number"},
+          "format": {"type": "number"},
+          "brevity": {"type": "number"},
+          "total": {"type": "number"}
+        }
+      }
+    }
+  },
+  "additionalProperties": true
+}

@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "delivery_record.schema.json",
+  "title": "DeliveryRecord",
+  "type": "object",
+  "required": ["job_id", "status", "delivered_at", "final_file_path"],
+  "properties": {
+    "job_id": {"type": "string"},
+    "status": {"type": "string", "enum": ["approved", "rejected", "needs_revision"]},
+    "delivered_at": {"type": "string", "format": "date-time"},
+    "final_file_path": {"type": "string"},
+    "review_file_path": {"type": "string"},
+    "notes": {"type": "string"}
+  },
+  "additionalProperties": true
+}

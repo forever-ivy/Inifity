@@ -1,0 +1,172 @@
+{
+  "name": "WF-10-Ingest-Classify",
+  "nodes": [
+    {
+      "id": "wf10_trigger",
+      "name": "Execute Workflow Trigger",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1,
+      "position": [
+        260,
+        320
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "wf10_ctx",
+      "name": "Set Runtime Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        500,
+        320
+      ],
+      "parameters": {
+        "jsCode": "\nconst root = $json.root_path || $env.TRANSLATION_ROOT || '/Users/ivy/Library/CloudStorage/OneDrive-Personal/Translation Task';\nconst jobId = $json.job_id || `job_${Date.now()}`;\nreturn [{ ...$json, root_path: root, job_id: jobId }];\n"
+      }
+    },
+    {
+      "id": "wf10_exec",
+      "name": "Execute Command Build DocStruct",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        760,
+        320
+      ],
+      "parameters": {
+        "command": "={{$env.PYTHON_BIN || 'python3'}} /Users/Code/workflow/translation/scripts/build_doc_struct.py --root \"{{$json.root_path}}\" --job-id \"{{$json.job_id}}\""
+      }
+    },
+    {
+      "id": "wf10_parse",
+      "name": "Code Parse DocStruct",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1040,
+        320
+      ],
+      "parameters": {
+        "jsCode": "\nconst incoming = $items('Set Runtime Context', 0, 0)?.[0]?.json || {};\nconst out = $json.stdout || '{}';\nlet parsed;\ntry { parsed = JSON.parse(out); } catch (e) {\n  return [{ ...incoming, valid: false, missing: ['parse_error'], error_message: e.message, raw_stdout: out, job_id: incoming.job_id || $json.job_id }];\n}\nif (!parsed.ok) {\n  return [{ ...incoming, valid: false, missing: ['bundle_error'], error_message: parsed.error || 'unknown', job_id: incoming.job_id || $json.job_id }];\n}\nreturn [{ ...incoming, ...parsed.data }];\n"
+      }
+    },
+    {
+      "id": "wf10_if_valid",
+      "name": "IF Validation",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1260,
+        320
+      ],
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{$json.valid}}",
+              "operation": "isTrue"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "wf10_exec99",
+      "name": "Execute WF-99 Error-Audit",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [
+        1480,
+        460
+      ],
+      "parameters": {
+        "workflowId": "={{$env.WF99_V2_WORKFLOW_ID || $env.WF99_WORKFLOW_ID}}",
+        "options": {
+          "waitForSubWorkflow": false
+        }
+      }
+    },
+    {
+      "id": "wf10_output",
+      "name": "Set DocStruct",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1480,
+        240
+      ],
+      "parameters": {
+        "jsCode": "\nreturn [{\n  source: $json.source,\n  triggered_at: $json.triggered_at,\n  raw_refs: $json.raw_refs || [],\n  payload: $json.payload || {},\n  root_path: $json.root_path,\n  event_hash: $json.event_hash,\n  job_id: $json.job_id,\n  valid: $json.valid,\n  missing: $json.missing || [],\n  file_fingerprint: $json.file_fingerprint || '',\n  files: $json.files,\n  root: $json.root,\n}];\n"
+      }
+    }
+  ],
+  "connections": {
+    "Execute Workflow Trigger": {
+      "main": [
+        [
+          {
+            "node": "Set Runtime Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set Runtime Context": {
+      "main": [
+        [
+          {
+            "node": "Execute Command Build DocStruct",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute Command Build DocStruct": {
+      "main": [
+        [
+          {
+            "node": "Code Parse DocStruct",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code Parse DocStruct": {
+      "main": [
+        [
+          {
+            "node": "IF Validation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF Validation": {
+      "main": [
+        [
+          {
+            "node": "Set DocStruct",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Execute WF-99 Error-Audit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false
+}

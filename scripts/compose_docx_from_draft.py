@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+"""Create a DOCX draft from text while preserving template styles."""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import re
+import sys
+from pathlib import Path
+
+from docx import Document
+
+
+def clear_document_body(doc: Document) -> None:
+    body = doc._element.body
+    for child in list(body):
+        if child.tag.endswith("sectPr"):
+            continue
+        body.remove(child)
+
+
+def split_lines(text: str) -> list[str]:
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+def build_doc(template_path: Path, output_path: Path, text: str) -> None:
+    doc = Document(str(template_path))
+    clear_document_body(doc)
+
+    lines = split_lines(text)
+    if not lines:
+        lines = ["English V2 Draft"]
+
+    for idx, line in enumerate(lines):
+        if idx == 0 and len(line) < 120:
+            doc.add_heading(line, level=1)
+        else:
+            if line.startswith("- "):
+                doc.add_paragraph(line[2:], style="List Paragraph")
+            else:
+                doc.add_paragraph(line)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    doc.save(str(output_path))
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--template", required=True)
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--draft-text", help="Plain text draft")
+    parser.add_argument("--draft-text-file", help="Path to plain text draft")
+    parser.add_argument("--draft-text-base64", help="Base64-encoded plain text draft")
+    args = parser.parse_args()
+
+    template_path = Path(args.template)
+    output_path = Path(args.output)
+
+    if not template_path.exists():
+        print(json.dumps({"ok": False, "error": f"Missing template: {template_path}"}), file=sys.stderr)
+        return 2
+
+    text = ""
+    if args.draft_text:
+        text = args.draft_text
+    elif args.draft_text_file:
+        draft_file = Path(args.draft_text_file)
+        if not draft_file.exists():
+            print(json.dumps({"ok": False, "error": f"Missing draft text file: {draft_file}"}), file=sys.stderr)
+            return 2
+        text = draft_file.read_text(encoding="utf-8")
+    elif args.draft_text_base64:
+        text = base64.b64decode(args.draft_text_base64.encode("utf-8")).decode("utf-8")
+
+    build_doc(template_path, output_path, text)
+
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "data": {
+                    "template": str(template_path.resolve()),
+                    "output": str(output_path.resolve()),
+                    "line_count": len(split_lines(text)),
+                },
+            },
+            ensure_ascii=False,
+        )
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

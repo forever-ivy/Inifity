@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "job_envelope.schema.json",
+  "title": "JobEnvelope",
+  "type": "object",
+  "required": ["job_id", "source", "triggered_at", "event_hash"],
+  "properties": {
+    "job_id": {"type": "string"},
+    "source": {"type": "string", "enum": ["email", "onedrive", "manual"]},
+    "triggered_at": {"type": "string", "format": "date-time"},
+    "event_hash": {"type": "string"},
+    "raw_refs": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "payload": {"type": "object"}
+  },
+  "additionalProperties": true
+}

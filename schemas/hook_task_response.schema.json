@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "hook_task_response.schema.json",
+  "title": "HookTaskResponse",
+  "type": "object",
+  "required": [
+    "ok"
+  ],
+  "properties": {
+    "ok": {
+      "type": "boolean"
+    },
+    "runId": {
+      "type": "string"
+    },
+    "job_id": {
+      "type": "string"
+    },
+    "status": {
+      "type": "string"
+    },
+    "review_dir": {
+      "type": "string"
+    },
+    "artifacts": {
+      "type": "object",
+      "properties": {
+        "draft_docx": {
+          "type": "string"
+        },
+        "task_brief_md": {
+          "type": "string"
+        },
+        "delta_summary_json": {
+          "type": "string"
+        },
+        "model_scores_json": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "quality": {
+      "type": "object",
+      "properties": {
+        "judge_margin": {
+          "type": "number"
+        },
+        "term_hit": {
+          "type": "number"
+        },
+        "expansion_used": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": true
+    },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "oneOf": [
+    {
+      "required": [
+        "ok",
+        "runId"
+      ]
+    },
+    {
+      "required": [
+        "ok",
+        "job_id",
+        "status",
+        "review_dir",
+        "errors"
+      ]
+    }
+  ],
+  "additionalProperties": true
+}

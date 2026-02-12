@@ -1,0 +1,175 @@
+{
+  "name": "WF-05-Sanity-Run-V2",
+  "nodes": [
+    {
+      "id": "wf05_manual",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        260,
+        300
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "wf05_ctx",
+      "name": "Code Build Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        500,
+        300
+      ],
+      "parameters": {
+        "jsCode": "const root = $env.TRANSLATION_ROOT || '/Users/ivy/Library/CloudStorage/OneDrive-Personal/Translation Task';\nreturn [{ root_path: root, job_id: `job_${Date.now()}` }];"
+      }
+    },
+    {
+      "id": "wf05_exec10",
+      "name": "Execute WF-10",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [
+        740,
+        300
+      ],
+      "parameters": {
+        "workflowId": "={{$env.WF10_WORKFLOW_ID}}",
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      }
+    },
+    {
+      "id": "wf05_if_valid",
+      "name": "IF Valid",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        980,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{$json.valid}}",
+              "operation": "isTrue"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "wf05_exec20",
+      "name": "Execute WF-20 V2",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [
+        1220,
+        240
+      ],
+      "parameters": {
+        "workflowId": "={{$env.WF20_V2_WORKFLOW_ID}}",
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      }
+    },
+    {
+      "id": "wf05_ok",
+      "name": "Code Result OK",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1460,
+        240
+      ],
+      "parameters": {
+        "jsCode": "return [{ ok: true, job_id: $json.job_id, status: $json.status, review_dir: $json.review_dir, artifacts: $json.artifacts, quality: $json.quality }];"
+      }
+    },
+    {
+      "id": "wf05_fail",
+      "name": "Code Result Incomplete",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1220,
+        420
+      ],
+      "parameters": {
+        "jsCode": "return [{ ok: false, status: 'incomplete_input', missing: $json.missing || [], job_id: $json.job_id }];"
+      }
+    }
+  ],
+  "connections": {
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Code Build Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code Build Context": {
+      "main": [
+        [
+          {
+            "node": "Execute WF-10",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute WF-10": {
+      "main": [
+        [
+          {
+            "node": "IF Valid",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF Valid": {
+      "main": [
+        [
+          {
+            "node": "Execute WF-20 V2",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Code Result Incomplete",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute WF-20 V2": {
+      "main": [
+        [
+          {
+            "node": "Code Result OK",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false
+}

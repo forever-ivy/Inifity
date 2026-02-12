@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "doc_struct.schema.json",
+  "title": "DocStruct",
+  "type": "object",
+  "required": ["job_id", "files", "valid"],
+  "properties": {
+    "job_id": {"type": "string"},
+    "valid": {"type": "boolean"},
+    "missing": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "files": {
+      "type": "object",
+      "required": ["arabic_v1", "arabic_v2", "english_v1"],
+      "properties": {
+        "arabic_v1": {"$ref": "#/$defs/fileStruct"},
+        "arabic_v2": {"$ref": "#/$defs/fileStruct"},
+        "english_v1": {"$ref": "#/$defs/fileStruct"}
+      }
+    }
+  },
+  "$defs": {
+    "fileStruct": {
+      "type": ["object", "null"],
+      "properties": {
+        "path": {"type": "string"},
+        "name": {"type": "string"},
+        "structure": {"type": "object"}
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

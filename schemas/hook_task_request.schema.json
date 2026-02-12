@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "hook_task_request.schema.json",
+  "title": "HookTaskRequest",
+  "type": "object",
+  "required": [
+    "message",
+    "agentId",
+    "sessionKey",
+    "deliver",
+    "wakeMode",
+    "meta"
+  ],
+  "properties": {
+    "message": {
+      "type": "string"
+    },
+    "name": {
+      "type": "string"
+    },
+    "agentId": {
+      "type": "string"
+    },
+    "sessionKey": {
+      "type": "string"
+    },
+    "wakeMode": {
+      "type": "string",
+      "enum": [
+        "now",
+        "next-heartbeat"
+      ]
+    },
+    "deliver": {
+      "type": "boolean"
+    },
+    "model": {
+      "type": "string"
+    },
+    "timeoutSeconds": {
+      "type": "number"
+    },
+    "meta": {
+      "type": "object",
+      "required": [
+        "job_id",
+        "root_path",
+        "arabic_v1_path",
+        "arabic_v2_path",
+        "english_v1_path",
+        "review_dir"
+      ],
+      "properties": {
+        "job_id": {
+          "type": "string"
+        },
+        "root_path": {
+          "type": "string"
+        },
+        "arabic_v1_path": {
+          "type": "string"
+        },
+        "arabic_v2_path": {
+          "type": "string"
+        },
+        "english_v1_path": {
+          "type": "string"
+        },
+        "review_dir": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}
