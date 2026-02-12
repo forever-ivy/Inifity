@@ -19,7 +19,7 @@ V4.1 makes **OpenClaw the primary orchestrator**:
 - Approval:
   - WhatsApp commands: `status|approve|reject|rerun`
 
-`n8n` workflows remain in `workflows/` only as legacy fallback.
+`n8n` legacy workflows have been removed from this repository.
 
 ## Directory roles
 
@@ -87,6 +87,22 @@ V4_IMAP_MAILBOX="INBOX"
 V4_IMAP_FROM_FILTER="modeh@eventranz.com"
 V4_IMAP_MAX_MESSAGES=5
 ```
+
+### Mailbox setup notes (163 mail)
+
+- `V4_IMAP_HOST` use `imap.163.com`
+- `V4_IMAP_PORT` use `993`
+- `V4_IMAP_PASSWORD` must be 163 IMAP authorization code (not login password)
+- Keep `V4_IMAP_FROM_FILTER="modeh@eventranz.com"` to only process boss emails
+
+Quick test:
+
+```bash
+cd /Users/Code/workflow/translation
+./scripts/run_v4_email_poll.sh
+```
+
+If the mailbox is configured correctly, output JSON contains `"ok": true`.
 
 ## OpenClaw setup (V4)
 

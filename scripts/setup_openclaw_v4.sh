@@ -29,10 +29,13 @@ ensure_agent() {
 upsert_cron_job() {
   local name="$1"
   shift
-  local existing
-  existing="$(openclaw cron list --json 2>/dev/null | jq -r --arg n "$name" '.items[]? | select(.name==$n) | .id' | head -n1 || true)"
-  if [[ -n "$existing" ]]; then
-    openclaw cron rm --id "$existing" --json >/dev/null || true
+  local existing_ids
+  existing_ids="$(openclaw cron list --json 2>/dev/null | jq -r --arg n "$name" '(.jobs // .items // [])[]? | select(.name==$n) | .id' || true)"
+  if [[ -n "$existing_ids" ]]; then
+    while IFS= read -r id; do
+      [[ -z "$id" ]] && continue
+      openclaw cron rm "$id" --json >/dev/null || true
+    done <<< "$existing_ids"
   fi
   openclaw cron add --name "$name" "$@" --json >/dev/null
   echo "Cron configured: $name"

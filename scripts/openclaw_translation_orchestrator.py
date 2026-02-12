@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Orchestrate full-scenario translation tasks for n8n + OpenClaw."""
+"""Orchestrate full-scenario translation tasks for OpenClaw V4.x."""
 
 from __future__ import annotations
 

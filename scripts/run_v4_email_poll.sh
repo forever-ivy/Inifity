@@ -14,6 +14,11 @@ fi
 : "${V4_IMAP_USER:?V4_IMAP_USER is required in .env.v4.local}"
 : "${V4_IMAP_PASSWORD:?V4_IMAP_PASSWORD is required in .env.v4.local}"
 
+if [[ "${V4_IMAP_PASSWORD}" == "REPLACE_WITH_163_IMAP_AUTH_CODE" ]]; then
+  echo "V4_IMAP_PASSWORD is still placeholder. Set your real IMAP auth code in .env.v4.local." >&2
+  exit 2
+fi
+
 WORK_ROOT="${V4_WORK_ROOT:-/Users/ivy/Library/CloudStorage/OneDrive-Personal/Translation Task}"
 KB_ROOT="${V4_KB_ROOT:-/Users/ivy/Library/CloudStorage/OneDrive-Personal/Knowledge Repository}"
 NOTIFY_TARGET="${OPENCLAW_NOTIFY_TARGET:-+8615071054627}"

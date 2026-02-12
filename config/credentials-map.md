@@ -43,9 +43,4 @@ Check:
 openclaw health --json
 ```
 
-## Legacy (V2 n8n)
-
-If you rollback to V2 workflows, n8n credentials are still:
-- `cred_imap`
-- `cred_onedrive`
-- `cred_whatsapp`
+No n8n credential mapping is required in V4.1.

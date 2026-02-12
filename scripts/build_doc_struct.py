@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a normalized DocStruct payload for n8n WF-10."""
+"""Build a normalized DocStruct payload for local task processing."""
 
 from __future__ import annotations
 

@@ -12,7 +12,7 @@ V4.1 shifts from `n8n-main` to `OpenClaw-main` orchestration:
    - translation execution
    - approval commands
    - pending reminders
-2. n8n workflows remain in repository as legacy rollback assets only.
+2. n8n workflows are removed from repository in V4.1.
 
 ## Paths
 
