@@ -51,6 +51,10 @@ CODEX_AGENT = os.getenv("OPENCLAW_CODEX_AGENT", "translator-core")
 GEMINI_AGENT = os.getenv("OPENCLAW_GEMINI_AGENT", "review-core")
 OPENCLAW_CMD_TIMEOUT = int(os.getenv("OPENCLAW_AGENT_CALL_TIMEOUT_SECONDS", "700"))
 DOC_CONTEXT_CHARS = int(os.getenv("OPENCLAW_DOC_CONTEXT_CHARS", "45000"))
+VALID_THINKING_LEVELS = {"off", "minimal", "low", "medium", "high"}
+OPENCLAW_TRANSLATION_THINKING = os.getenv("OPENCLAW_TRANSLATION_THINKING", "high").strip().lower()
+if OPENCLAW_TRANSLATION_THINKING not in VALID_THINKING_LEVELS:
+    OPENCLAW_TRANSLATION_THINKING = "high"
 
 
 def _normalize_text(text: str) -> str:
@@ -220,6 +224,8 @@ def _agent_call(agent_id: str, message: str, timeout_seconds: int = OPENCLAW_CMD
         "--message",
         message,
         "--json",
+        "--thinking",
+        OPENCLAW_TRANSLATION_THINKING,
         "--timeout",
         str(max(30, int(timeout_seconds))),
     ]
@@ -601,6 +607,8 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
 
     try:
         candidates = _enrich_structures(_collect_candidates(meta))
+        router_mode = str(meta.get("router_mode") or "strict")
+        token_guard_applied = bool(meta.get("token_guard_applied", False))
         if not candidates:
             response = {
                 "ok": False,
@@ -614,6 +622,9 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
                 "runtime_timeout_minutes": 0,
                 "actual_duration_minutes": round((time.time() - started) / 60.0, 3),
                 "status_flags": [],
+                "thinking_level": OPENCLAW_TRANSLATION_THINKING,
+                "router_mode": router_mode,
+                "token_guard_applied": token_guard_applied,
             }
             _write_result(review_dir, response)
             return response
@@ -632,6 +643,9 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
                 "runtime_timeout_minutes": 0,
                 "actual_duration_minutes": round((time.time() - started) / 60.0, 3),
                 "status_flags": ["hard_fail"],
+                "thinking_level": OPENCLAW_TRANSLATION_THINKING,
+                "router_mode": router_mode,
+                "token_guard_applied": token_guard_applied,
                 "debug": intent_result,
             }
             _write_result(review_dir, response)
@@ -648,6 +662,9 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
             "estimated_minutes": estimated_minutes,
             "complexity_score": complexity_score,
             "time_budget_minutes": runtime_timeout_minutes,
+            "thinking_level": OPENCLAW_TRANSLATION_THINKING,
+            "router_mode": router_mode,
+            "token_guard_applied": token_guard_applied,
         }
 
         missing_inputs = list(intent.get("missing_inputs") or [])
@@ -665,6 +682,9 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
                 "runtime_timeout_minutes": runtime_timeout_minutes,
                 "actual_duration_minutes": round((time.time() - started) / 60.0, 3),
                 "status_flags": status_flags + ["missing_inputs"],
+                "thinking_level": OPENCLAW_TRANSLATION_THINKING,
+                "router_mode": router_mode,
+                "token_guard_applied": token_guard_applied,
                 "errors": [f"missing:{x}" for x in missing_inputs],
             }
             _write_result(review_dir, response)
@@ -684,6 +704,9 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
                 "runtime_timeout_minutes": runtime_timeout_minutes,
                 "actual_duration_minutes": round((time.time() - started) / 60.0, 3),
                 "status_flags": status_flags,
+                "thinking_level": OPENCLAW_TRANSLATION_THINKING,
+                "router_mode": router_mode,
+                "token_guard_applied": token_guard_applied,
                 "errors": [],
             }
             _write_result(review_dir, response)
@@ -794,6 +817,9 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
             "rounds": rounds,
             "convergence_reached": bool(rounds and rounds[-1].get("pass")),
             "stop_reason": "double_pass" if rounds and rounds[-1].get("pass") else ("max_rounds" if rounds else "hard_fail"),
+            "thinking_level": OPENCLAW_TRANSLATION_THINKING,
+            "router_mode": router_mode,
+            "token_guard_applied": token_guard_applied,
         }
 
         last_round = rounds[-1] if rounds else {"metrics": {}}
@@ -828,7 +854,18 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
             candidate_files=candidates,
             review_questions=[str(x) for x in current_draft.get("review_brief_points", [])],
             draft_payload=current_draft,
-            plan_payload={"intent": intent, "plan": plan},
+            plan_payload={
+                "intent": intent,
+                "plan": plan,
+                "meta": {
+                    "sender": meta.get("sender", ""),
+                    "message_id": meta.get("message_id", ""),
+                    "raw_message_ref": meta.get("raw_message_ref", ""),
+                    "thinking_level": OPENCLAW_TRANSLATION_THINKING,
+                    "router_mode": router_mode,
+                    "token_guard_applied": token_guard_applied,
+                },
+            },
         )
 
         response = {
@@ -847,6 +884,9 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
             "runtime_timeout_minutes": runtime_timeout_minutes,
             "actual_duration_minutes": round((time.time() - started) / 60.0, 3),
             "status_flags": status_flags,
+            "thinking_level": OPENCLAW_TRANSLATION_THINKING,
+            "router_mode": router_mode,
+            "token_guard_applied": token_guard_applied,
             "errors": errors if errors else ([] if status == "review_ready" else ["double_pass_not_reached"]),
         }
         _write_result(review_dir, response)
@@ -865,6 +905,9 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
             "runtime_timeout_minutes": 0,
             "actual_duration_minutes": round((time.time() - started) / 60.0, 3),
             "status_flags": ["hard_fail"],
+            "thinking_level": OPENCLAW_TRANSLATION_THINKING,
+            "router_mode": str(meta.get("router_mode") or "strict"),
+            "token_guard_applied": bool(meta.get("token_guard_applied", False)),
         }
         _write_result(review_dir, response)
         return response

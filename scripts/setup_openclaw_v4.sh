@@ -60,6 +60,7 @@ upsert_cron_job "v4-email-poll" \
   --agent "task-router" \
   --every "2m" \
   --message "$EMAIL_CMD" \
+  --no-deliver \
   --wake "now" \
   --timeout-seconds "120"
 
@@ -68,6 +69,7 @@ upsert_cron_job "v4-pending-reminder-am" \
   --cron "0 9 * * *" \
   --tz "${OPENCLAW_CRON_TZ:-Asia/Shanghai}" \
   --message "$REMINDER_CMD" \
+  --no-deliver \
   --wake "now" \
   --timeout-seconds "120"
 
@@ -76,6 +78,7 @@ upsert_cron_job "v4-pending-reminder-pm" \
   --cron "0 19 * * *" \
   --tz "${OPENCLAW_CRON_TZ:-Asia/Shanghai}" \
   --message "$REMINDER_CMD" \
+  --no-deliver \
   --wake "now" \
   --timeout-seconds "120"
 
@@ -84,5 +87,5 @@ echo "V4 setup complete."
 echo "Next:"
 echo "1) Create $ROOT_DIR/.env.v4.local with IMAP credentials."
 echo "2) chmod +x scripts/run_v4_email_poll.sh scripts/run_v4_pending_reminder.sh scripts/setup_openclaw_v4.sh"
-echo "3) Restart gateway: openclaw gateway --force"
+echo "3) Install strict WhatsApp router skill: ./scripts/install_openclaw_translation_skill.sh"
 echo "4) Check health: openclaw health --json"

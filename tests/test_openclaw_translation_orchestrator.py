@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,7 +9,7 @@ from unittest.mock import patch
 
 from docx import Document
 
-from scripts.openclaw_translation_orchestrator import run
+from scripts.openclaw_translation_orchestrator import _agent_call, run
 
 
 def _make_docx(path: Path, text: str) -> None:
@@ -28,6 +29,20 @@ def _agent_ok(text: dict) -> dict:
 
 
 class OpenClawTranslationOrchestratorTest(unittest.TestCase):
+    @patch("scripts.openclaw_translation_orchestrator.subprocess.run")
+    def test_agent_call_enforces_thinking_level(self, mocked_run):
+        mocked_run.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout='{"result":{"payloads":[{"text":"{}"}]}}',
+            stderr="",
+        )
+        out = _agent_call("translator-core", "ping", timeout_seconds=90)
+        self.assertTrue(out.get("ok"))
+        called_cmd = mocked_run.call_args.args[0]
+        self.assertIn("--thinking", called_cmd)
+        self.assertIn("high", called_cmd)
+
     @patch("scripts.openclaw_translation_orchestrator._agent_call")
     def test_revision_update_reaches_review_ready(self, mocked_call):
         with tempfile.TemporaryDirectory() as tmp:
@@ -143,6 +158,8 @@ class OpenClawTranslationOrchestratorTest(unittest.TestCase):
             self.assertTrue(out["double_pass"])
             self.assertGreaterEqual(out["iteration_count"], 1)
             self.assertLessEqual(out["iteration_count"], 3)
+            self.assertEqual(out["thinking_level"], "high")
+            self.assertEqual((out.get("quality_report") or {}).get("thinking_level"), "high")
             self.assertIn("final_docx", out["artifacts"])
             self.assertTrue(Path(out["artifacts"]["final_docx"]).exists())
 

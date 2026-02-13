@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import json
+import re
+import os
 from pathlib import Path
 from typing import Any
 
@@ -116,6 +118,54 @@ def _build_candidates(job_files: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return candidates
 
 
+def _extract_message_id(payload: dict[str, Any], fallback_text: str = "") -> str:
+    for key in ("message_id", "messageId", "id"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    message = payload.get("message")
+    if isinstance(message, dict):
+        for key in ("message_id", "messageId", "id"):
+            value = message.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    if fallback_text:
+        matched = re.search(r"\[message_id:\s*([^\]]+)\]", fallback_text, flags=re.IGNORECASE)
+        if matched:
+            return matched.group(1).strip()
+    return ""
+
+
+def _latest_whatsapp_meta(inbox_dir: Path) -> dict[str, Any]:
+    payload_files = sorted(inbox_dir.glob("payload_*.json"), key=lambda p: p.stat().st_mtime_ns, reverse=True)
+    if not payload_files:
+        return {"message_id": "", "raw_message_ref": "", "token_guard_applied": False}
+    payload_path = payload_files[0]
+    try:
+        payload = json.loads(payload_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {"message_id": "", "raw_message_ref": str(payload_path.resolve()), "token_guard_applied": False}
+    text_value = ""
+    for key in ("text", "message", "body", "content"):
+        candidate = payload.get(key)
+        if isinstance(candidate, str) and candidate.strip():
+            text_value = candidate
+            break
+    if not text_value and isinstance(payload.get("message"), dict):
+        msg = payload["message"]
+        for key in ("text", "body", "content"):
+            candidate = msg.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                text_value = candidate
+                break
+    token_guard_applied = bool(payload.get("token_guard_applied", False))
+    return {
+        "message_id": _extract_message_id(payload, fallback_text=text_value),
+        "raw_message_ref": str(payload_path.resolve()),
+        "token_guard_applied": token_guard_applied,
+    }
+
+
 def run_job_pipeline(
     *,
     job_id: str,
@@ -158,6 +208,10 @@ def run_job_pipeline(
     candidates = _build_candidates(files)
     review_dir = Path(job["review_dir"]).resolve()
     review_dir.mkdir(parents=True, exist_ok=True)
+    inbox_dir = Path(str(job.get("inbox_dir") or "")).expanduser().resolve()
+    whatsapp_meta = _latest_whatsapp_meta(inbox_dir) if str(job.get("source", "")) == "whatsapp" else {}
+    strict_router_enabled = str(os.getenv("OPENCLAW_WA_STRICT_ROUTER", "1")).strip().lower() not in {"0", "false", "off", "no"}
+    router_mode = "strict" if strict_router_enabled else "hybrid"
 
     if not candidates:
         update_job_status(conn, job_id=job_id, status="incomplete_input", errors=["no_docx_attachments"])
@@ -188,6 +242,8 @@ def run_job_pipeline(
         "review_dir": str(review_dir),
         "source": job.get("source", ""),
         "sender": job.get("sender", ""),
+        "message_id": whatsapp_meta.get("message_id", ""),
+        "raw_message_ref": whatsapp_meta.get("raw_message_ref", ""),
         "subject": job.get("subject", ""),
         "message_text": job.get("message_text", ""),
         "candidate_files": candidates,
@@ -195,6 +251,8 @@ def run_job_pipeline(
         "max_rounds": 3,
         "codex_available": True,
         "gemini_available": True,
+        "router_mode": router_mode,
+        "token_guard_applied": bool(whatsapp_meta.get("token_guard_applied", False)),
     }
 
     plan = run_translation(meta, plan_only=True)

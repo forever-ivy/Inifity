@@ -1,4 +1,4 @@
-# Implementation Notes (V5.2)
+# Implementation Notes (V5.3)
 
 ## Core changes from V4.1
 
@@ -16,6 +16,17 @@
 6. Contextual command interface:
    - `run | status | ok | no {reason} | rerun`
 7. Sender-active-job mapping is persisted in SQLite for no-arg command routing.
+8. WhatsApp strict router mode added:
+   - route inbound task messages to dispatcher, not free-form chat
+   - extract `[media attached: ...]` local file paths
+   - strip inline `<file ...>` blocks to reduce token pressure
+9. Translation model calls now enforce `--thinking high` by default:
+   - env override: `OPENCLAW_TRANSLATION_THINKING`
+10. Execution metadata now includes:
+   - `thinking_level`
+   - `router_mode`
+   - `token_guard_applied`
+11. Cron jobs now use `--no-deliver` to remove noisy `delivery target missing` failures.
 
 ## State model
 
@@ -57,3 +68,16 @@ Legacy command aliases remain:
 ## Known tradeoff
 
 The preserve-mode DOCX writer currently applies sequential text replacement into template paragraphs/cells to keep layout as much as possible. For heavily complex tables, final manual validation is still required (by design of V5.2 human-in-the-loop policy).
+
+## New installer
+
+Use:
+
+- `/Users/Code/workflow/translation/scripts/install_openclaw_translation_skill.sh`
+
+It will:
+
+1. copy `skills/translation-router/SKILL.md` into OpenClaw workspace skills
+2. patch OpenClaw workspace `AGENTS.md` with strict-router policy block
+3. ensure `.env.v4.local` has strict-router + high-reasoning defaults
+4. restart gateway

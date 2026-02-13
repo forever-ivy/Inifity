@@ -61,6 +61,20 @@ def _extract_sender(payload: dict[str, Any]) -> str:
     return "unknown"
 
 
+def _extract_message_id(payload: dict[str, Any]) -> str:
+    for key in ["message_id", "messageId", "id"]:
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    message = payload.get("message")
+    if isinstance(message, dict):
+        for key in ["message_id", "messageId", "id"]:
+            value = message.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
+
 def _collect_attachments(payload: dict[str, Any]) -> list[dict[str, Any]]:
     atts: list[dict[str, Any]] = []
     if isinstance(payload.get("attachments"), list):
@@ -202,6 +216,9 @@ def main() -> int:
     payload = _load_payload(args)
     text = _extract_text(payload)
     sender = _extract_sender(payload)
+    message_id = _extract_message_id(payload)
+    raw_message_ref = str(payload.get("raw_message_ref") or "")
+    token_guard_applied = bool(payload.get("token_guard_applied", False))
     work_root = Path(args.work_root)
     kb_root = Path(args.kb_root)
     reply_target = _resolve_reply_target(sender, args.notify_target)
@@ -312,6 +329,9 @@ def main() -> int:
         "mode": "task_bundle",
         "job_id": job_id,
         "sender": sender,
+        "message_id": message_id,
+        "raw_message_ref": raw_message_ref,
+        "token_guard_applied": token_guard_applied,
         "saved_files": saved_files,
         "docx_count": info.get("docx_count", 0),
         "files_count": info.get("files_count", 0),

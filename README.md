@@ -1,15 +1,17 @@
-# Translation Automation V5.2 (OpenClaw Skill-First)
+# Translation Automation V5.3 (Strict Router + High Reasoning)
 
 ## Scope
 
-V5.2 implements:
+V5.3 implements:
 
 - OpenClaw-first orchestration
 - pure LLM intent classification (`TaskIntentV5`)
 - real Codex + Gemini 3-round review loop
+- default model reasoning level: `high` (`OPENCLAW_TRANSLATION_THINKING`)
 - mandatory `kb_sync_incremental` + `kb_retrieve` before every `run`
 - outputs only in `_VERIFY/{job_id}`
 - no auto-delivery to final folder
+- strict WhatsApp router mode (no long chat fallback)
 - contextual WhatsApp commands:
   - `run`
   - `status`
@@ -78,6 +80,9 @@ V4_IMAP_PASSWORD="your_163_imap_authorization_code"
 V4_IMAP_MAILBOX="INBOX"
 V4_IMAP_FROM_FILTER="modeh@eventranz.com"
 V4_IMAP_MAX_MESSAGES=5
+
+OPENCLAW_WA_STRICT_ROUTER=1
+OPENCLAW_TRANSLATION_THINKING=high
 ```
 
 ## Install
@@ -86,6 +91,7 @@ V4_IMAP_MAX_MESSAGES=5
 cd /Users/Code/workflow/translation
 /Users/Code/workflow/translation/.venv/bin/pip install -r requirements.txt
 chmod +x scripts/setup_openclaw_v4.sh scripts/run_v4_email_poll.sh scripts/run_v4_pending_reminder.sh
+chmod +x scripts/install_openclaw_translation_skill.sh
 ```
 
 ## Setup OpenClaw
@@ -93,9 +99,33 @@ chmod +x scripts/setup_openclaw_v4.sh scripts/run_v4_email_poll.sh scripts/run_v
 ```bash
 cd /Users/Code/workflow/translation
 ./scripts/setup_openclaw_v4.sh
+./scripts/install_openclaw_translation_skill.sh
 openclaw gateway --force
 openclaw health --json
 ```
+
+## Strict WhatsApp Router
+
+Skill template:
+
+- `/Users/Code/workflow/translation/skills/translation-router/SKILL.md`
+
+Installed runtime skill:
+
+- `~/.openclaw/workspace/skills/translation-router/SKILL.md`
+
+Router bridge script:
+
+- `/Users/Code/workflow/translation/scripts/skill_whatsapp_router.py`
+
+What it does:
+
+1. Parses raw WhatsApp message text.
+2. Extracts `[media attached: ...]` file paths.
+3. Removes inline `<file ...>` payload blocks (token guard).
+4. Dispatches to:
+   - `whatsapp-event` for task/file intake
+   - `approval` for command-only messages (`run/status/ok/no/rerun`)
 
 ## Run
 
@@ -139,6 +169,26 @@ cd /Users/Code/workflow/translation
 4. You manually verify files in `_VERIFY/{job_id}`
 5. Send `ok` to mark `verified` (status only, no file move)
 6. You manually move final file to destination folder
+
+## Troubleshooting
+
+1. Check skill is installed:
+
+```bash
+openclaw skills list | rg translation-router
+```
+
+2. Check strict router flags:
+
+```bash
+rg "OPENCLAW_WA_STRICT_ROUTER|OPENCLAW_TRANSLATION_THINKING" /Users/Code/workflow/translation/.env.v4.local
+```
+
+3. Check cron delivery noise is gone:
+
+```bash
+openclaw cron list --json | jq '.jobs[] | {name, lastStatus: .state.lastStatus, lastError: .state.lastError}'
+```
 
 ## Tests
 
