@@ -19,6 +19,7 @@ DEFAULT_WORK_ROOT = Path("/Users/ivy/Library/CloudStorage/OneDrive-Personal/Tran
 DEFAULT_NOTIFY_TARGET = os.getenv("OPENCLAW_NOTIFY_TARGET") or os.getenv("WHATSAPP_TO") or "+8615071054627"
 DEFAULT_NOTIFY_CHANNEL = os.getenv("OPENCLAW_NOTIFY_CHANNEL") or "whatsapp"
 DEFAULT_NOTIFY_ACCOUNT = os.getenv("OPENCLAW_NOTIFY_ACCOUNT") or "default"
+DEFAULT_LOCAL_STATE_DB = Path("~/.openclaw/runtime/translation/state.sqlite").expanduser()
 
 KB_SUPPORTED_EXTENSIONS = {".docx", ".pdf", ".md", ".txt", ".xlsx", ".csv"}
 TASK_DOC_EXTENSIONS = {".docx"}
@@ -76,6 +77,19 @@ def ensure_runtime_paths(work_root: Path | str = DEFAULT_WORK_ROOT) -> RuntimePa
     for p in [jobs_root, kb_system_root, logs_root, inbox_email, inbox_whatsapp, review_root, translated_root]:
         p.mkdir(parents=True, exist_ok=True)
 
+    # SQLite on cloud-sync placeholders (e.g., OneDrive File Provider) is prone to "disk I/O error".
+    # Keep runtime DB local by default when work root is cloud-backed, unless explicitly overridden.
+    db_override = str(os.getenv("OPENCLAW_STATE_DB_PATH", "")).strip()
+    if db_override:
+        db_path = Path(db_override).expanduser().resolve()
+    else:
+        root_text = str(root)
+        if "/Library/CloudStorage/" in root_text or "OneDrive" in root_text:
+            db_path = DEFAULT_LOCAL_STATE_DB.resolve()
+        else:
+            db_path = jobs_root / "state.sqlite"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
     return RuntimePaths(
         work_root=root,
         inbox_email=inbox_email,
@@ -86,7 +100,7 @@ def ensure_runtime_paths(work_root: Path | str = DEFAULT_WORK_ROOT) -> RuntimePa
         jobs_root=jobs_root,
         kb_root=DEFAULT_KB_ROOT,
         kb_system_root=kb_system_root,
-        db_path=jobs_root / "state.sqlite",
+        db_path=db_path,
         logs_root=logs_root,
     )
 

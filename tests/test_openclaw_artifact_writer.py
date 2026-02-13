@@ -60,6 +60,44 @@ class OpenClawArtifactWriterTest(unittest.TestCase):
             self.assertTrue(Path(manifest["execution_plan_json"]).exists())
             self.assertTrue(Path(manifest["quality_report_json"]).exists())
 
+    def test_write_artifacts_can_emit_final_xlsx(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            review = Path(tmp) / "_VERIFY" / "job_xlsx"
+            template = Path(tmp) / "english_v1.docx"
+            _make_docx(template, "Baseline text")
+
+            manifest = write_artifacts(
+                review_dir=str(review),
+                draft_a_template_path=str(template),
+                delta_pack={"added": [], "removed": [], "modified": [], "summary_by_section": [], "stats": {}},
+                model_scores={"judge_margin": 0.12, "term_hit": 0.97},
+                quality={"judge_margin": 0.12, "term_hit": 0.97, "expansion_used": False},
+                quality_report={"rounds": [], "convergence_reached": True, "stop_reason": "double_pass"},
+                job_id="job_xlsx",
+                task_type="SPREADSHEET_TRANSLATION",
+                confidence=0.9,
+                estimated_minutes=8,
+                runtime_timeout_minutes=10,
+                iteration_count=1,
+                double_pass=True,
+                status_flags=[],
+                candidate_files=[],
+                review_questions=[],
+                draft_payload={
+                    "draft_a_text": "A1\nA2",
+                    "draft_b_text": "B1",
+                    "final_text": "F1\nF2",
+                    "final_reflow_text": "R1",
+                    "review_brief_points": [],
+                    "change_log_points": ["normalized sheet header"],
+                },
+                generate_final_xlsx=True,
+                plan_payload={"intent": {"task_type": "SPREADSHEET_TRANSLATION"}, "plan": {"estimated_minutes": 8}},
+            )
+
+            self.assertIn("final_xlsx", manifest)
+            self.assertTrue(Path(manifest["final_xlsx"]).exists())
+
 
 if __name__ == "__main__":
     unittest.main()

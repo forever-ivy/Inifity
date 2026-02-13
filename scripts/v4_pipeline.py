@@ -11,7 +11,7 @@ from typing import Any
 
 from scripts.openclaw_translation_orchestrator import run as run_translation
 from scripts.task_bundle_builder import infer_language, infer_role, infer_version
-from scripts.v4_kb import retrieve_kb, sync_kb
+from scripts.v4_kb import retrieve_kb_with_fallback, sync_kb_with_rag
 from scripts.v4_runtime import (
     DEFAULT_NOTIFY_TARGET,
     RuntimePaths,
@@ -104,7 +104,7 @@ def _build_candidates(job_files: list[dict[str, Any]]) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     for item in job_files:
         p = Path(item["path"])
-        if p.suffix.lower() != ".docx":
+        if p.suffix.lower() not in {".docx", ".xlsx", ".csv"}:
             continue
         candidates.append(
             {
@@ -116,6 +116,22 @@ def _build_candidates(job_files: list[dict[str, Any]]) -> list[dict[str, Any]]:
             }
         )
     return candidates
+
+
+def _dedupe_hits(hits: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    seen: set[tuple[str, int]] = set()
+    for hit in hits:
+        path = str(hit.get("path") or "")
+        chunk = int(hit.get("chunk_index") or 0)
+        key = (path, chunk)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(hit)
+        if len(out) >= max(1, int(limit)):
+            break
+    return out
 
 
 def _extract_message_id(payload: dict[str, Any], fallback_text: str = "") -> str:
@@ -193,7 +209,16 @@ def run_job_pipeline(
         dry_run=dry_run_notify,
     )
     kb_report_path = paths.kb_system_root / "kb_sync_latest.json"
-    kb_report = sync_kb(conn=conn, kb_root=kb_root, report_path=kb_report_path)
+    kb_sync_result = sync_kb_with_rag(
+        conn=conn,
+        kb_root=kb_root,
+        report_path=kb_report_path,
+        rag_backend=str(os.getenv("OPENCLAW_RAG_BACKEND", "clawrag")).strip().lower(),
+        rag_base_url=str(os.getenv("OPENCLAW_RAG_BASE_URL", "http://127.0.0.1:8080")).strip(),
+        rag_collection=str(os.getenv("OPENCLAW_RAG_COLLECTION", "translation-kb")).strip() or "translation-kb",
+    )
+    kb_report = dict(kb_sync_result.get("local_report") or {})
+    rag_sync_report = dict(kb_sync_result.get("rag_report") or {})
     notify_milestone(
         paths=paths,
         conn=conn,
@@ -203,7 +228,6 @@ def run_job_pipeline(
         target=notify_target,
         dry_run=dry_run_notify,
     )
-
     files = list_job_files(conn, job_id)
     candidates = _build_candidates(files)
     review_dir = Path(job["review_dir"]).resolve()
@@ -214,26 +238,58 @@ def run_job_pipeline(
     router_mode = "strict" if strict_router_enabled else "hybrid"
 
     if not candidates:
-        update_job_status(conn, job_id=job_id, status="incomplete_input", errors=["no_docx_attachments"])
+        update_job_status(conn, job_id=job_id, status="incomplete_input", errors=["no_supported_attachments"])
         notify_milestone(
             paths=paths,
             conn=conn,
             job_id=job_id,
             milestone="failed",
-            message=f"[{job_id}] failed: no DOCX attachments found.",
+            message=f"[{job_id}] failed: no supported input files (.docx/.xlsx/.csv).",
             target=notify_target,
             dry_run=dry_run_notify,
         )
         conn.close()
-        return {"ok": False, "job_id": job_id, "status": "incomplete_input", "errors": ["no_docx_attachments"]}
+        return {"ok": False, "job_id": job_id, "status": "incomplete_input", "errors": ["no_supported_attachments"]}
 
     query = " ".join([job.get("subject", ""), job.get("message_text", "")]).strip()
-    kb_hits = retrieve_kb(conn=conn, query=query, task_type="", top_k=8) if query else []
+    kb_hits: list[dict[str, Any]] = []
+    knowledge_backend = "local"
+    pre_status_flags: list[str] = []
+    if query:
+        rag_fetch = retrieve_kb_with_fallback(
+            conn=conn,
+            query=query,
+            task_type="",
+            rag_backend=str(os.getenv("OPENCLAW_RAG_BACKEND", "clawrag")).strip().lower(),
+            rag_base_url=str(os.getenv("OPENCLAW_RAG_BASE_URL", "http://127.0.0.1:8080")).strip(),
+            rag_collection=str(os.getenv("OPENCLAW_RAG_COLLECTION", "translation-kb")).strip() or "translation-kb",
+            top_k_clawrag=12,
+            top_k_local=8,
+        )
+        kb_hits = _dedupe_hits(list(rag_fetch.get("hits") or []), limit=12 if rag_fetch.get("backend") == "clawrag" else 8)
+        knowledge_backend = str(rag_fetch.get("backend") or "local")
+        pre_status_flags.extend([str(x) for x in (rag_fetch.get("status_flags") or []) if str(x)])
+
     record_event(
         conn,
         job_id=job_id,
-        milestone="kb_retrieve",
-        payload={"query": query, "hit_count": len(kb_hits), "hits": kb_hits[:8]},
+        milestone="kb_retrieve_done",
+        payload={
+            "query": query,
+            "hit_count": len(kb_hits),
+            "backend": knowledge_backend,
+            "hits": kb_hits[:12],
+            "rag_sync_report": rag_sync_report,
+        },
+    )
+    notify_milestone(
+        paths=paths,
+        conn=conn,
+        job_id=job_id,
+        milestone="kb_retrieve_done",
+        message=f"[{job_id}] kb_retrieve_done backend={knowledge_backend} hits={len(kb_hits)}",
+        target=notify_target,
+        dry_run=dry_run_notify,
     )
 
     meta = {
@@ -248,11 +304,13 @@ def run_job_pipeline(
         "message_text": job.get("message_text", ""),
         "candidate_files": candidates,
         "knowledge_context": kb_hits,
+        "knowledge_backend": knowledge_backend,
         "max_rounds": 3,
         "codex_available": True,
         "gemini_available": True,
         "router_mode": router_mode,
         "token_guard_applied": bool(whatsapp_meta.get("token_guard_applied", False)),
+        "status_flags_seed": pre_status_flags,
     }
 
     plan = run_translation(meta, plan_only=True)

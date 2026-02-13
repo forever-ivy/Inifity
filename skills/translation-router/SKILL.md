@@ -1,7 +1,7 @@
 ---
 name: translation-router
-description: Strict router for WhatsApp translation tasks. Always dispatch to local V5.3 pipeline instead of chatting.
-version: 1.0.0
+description: Strict router for WhatsApp translation tasks. Always dispatch to local V6 pipeline instead of chatting.
+version: 1.1.0
 ---
 
 # Translation Router (Strict Mode)
@@ -10,7 +10,7 @@ Use this skill for incoming WhatsApp direct messages related to translation task
 
 ## Goal
 
-Route message + attachments into the local dispatcher pipeline. Do not perform translation in chat.
+Route message + attachments into the local V6 pipeline. Do not perform translation in chat.
 
 ## Required behavior
 
@@ -29,6 +29,7 @@ Route message + attachments into the local dispatcher pipeline. Do not perform t
 
 Supported command messages:
 
+- `new`
 - `run`
 - `status`
 - `ok`
@@ -42,4 +43,4 @@ For command-only messages, route directly to approval handler through the router
 - Return one short status line only.
 - No long explanations.
 - No duplicate confirmations.
-
+- Default flow is mandatory: `new -> (send files/text) -> run`.

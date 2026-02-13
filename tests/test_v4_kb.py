@@ -3,8 +3,9 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from scripts.v4_kb import retrieve_kb, sync_kb
+from scripts.v4_kb import retrieve_kb, retrieve_kb_with_fallback, sync_kb
 from scripts.v4_runtime import db_connect, ensure_runtime_paths
 
 
@@ -39,6 +40,38 @@ class V4KnowledgeBaseTest(unittest.TestCase):
             self.assertGreaterEqual(len(hits), 1)
             self.assertIn("score", hits[0])
             self.assertIn("source_group", hits[0])
+
+            with patch("scripts.v4_kb.clawrag_search") as mocked_clawrag:
+                mocked_clawrag.return_value = {
+                    "ok": True,
+                    "backend": "clawrag",
+                    "hits": [{"path": "/tmp/a", "source_group": "glossary", "chunk_index": 0, "snippet": "AI readiness", "score": 0.9}],
+                }
+                rag = retrieve_kb_with_fallback(
+                    conn=conn,
+                    query="AI readiness",
+                    task_type="REVISION_UPDATE",
+                    rag_backend="clawrag",
+                    rag_base_url="http://127.0.0.1:8080",
+                    rag_collection="translation-kb",
+                )
+                self.assertEqual(rag["backend"], "clawrag")
+                self.assertEqual(len(rag["hits"]), 1)
+                self.assertEqual(rag["status_flags"], [])
+
+            with patch("scripts.v4_kb.clawrag_search") as mocked_clawrag:
+                mocked_clawrag.return_value = {"ok": False, "backend": "clawrag", "hits": [], "errors": ["down"]}
+                rag = retrieve_kb_with_fallback(
+                    conn=conn,
+                    query="AI readiness",
+                    task_type="REVISION_UPDATE",
+                    rag_backend="clawrag",
+                    rag_base_url="http://127.0.0.1:8080",
+                    rag_collection="translation-kb",
+                )
+                self.assertEqual(rag["backend"], "local")
+                self.assertGreaterEqual(len(rag["hits"]), 1)
+                self.assertIn("rag_fallback_local", rag["status_flags"])
             conn.close()
 
 

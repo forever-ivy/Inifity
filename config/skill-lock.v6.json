@@ -1,0 +1,48 @@
+{
+  "version": "v6.0",
+  "generated_at": "2026-02-13T00:00:00Z",
+  "skills": [
+    {
+      "slug": "himalaya",
+      "version": "1.0.0",
+      "sha256": "2265054da976a3d9ec3d55b66888233cb39509ea4703abed8066382e5b4fc14f",
+      "required": true
+    },
+    {
+      "slug": "openclaw-mem",
+      "version": "2.1.0",
+      "sha256": "357850a6e8bd8ea6b73bc86ab4ec0fa5c1112e0518b351b400a4c844f2a69ed5",
+      "required": true
+    },
+    {
+      "slug": "memory-hygiene",
+      "version": "1.0.0",
+      "sha256": "58d9e56da3f96b4191179d092385ccf06335cec615f44d32d9a593f88b126f44",
+      "required": true
+    },
+    {
+      "slug": "sheetsmith",
+      "version": "1.0.1",
+      "sha256": "9659475337f24d50e844c10e025132f3840671a3cd16d4c6aef390c2d58777ab",
+      "required": true
+    },
+    {
+      "slug": "pdf-extract",
+      "version": "1.0.0",
+      "sha256": "d2c589975869355f6694c855206279ad15699c2d77dfb0f6c969530d29050aa7",
+      "required": true
+    },
+    {
+      "slug": "docx-skill",
+      "version": "1.0.2",
+      "sha256": "f276f5c79047cfbf4dfdaf956d181a4b05463462ef5ce19664817d4c4337853e",
+      "required": false
+    },
+    {
+      "slug": "clawrag",
+      "version": "1.2.0",
+      "sha256": "af2d65381e6f91cdc7da30847a6e0c17fe0c3f9678842579943a609731973e60",
+      "required": true
+    }
+  ]
+}

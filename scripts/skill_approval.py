@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import Any
 
 from scripts.v4_pipeline import run_job_pipeline
+from scripts.skill_status_card import build_status_card, no_active_job_hint
 from scripts.v4_runtime import (
     DEFAULT_KB_ROOT,
     DEFAULT_NOTIFY_TARGET,
@@ -17,13 +19,24 @@ from scripts.v4_runtime import (
     ensure_runtime_paths,
     get_job,
     get_sender_active_job,
-    latest_actionable_job,
     list_actionable_jobs_for_sender,
+    list_job_files,
+    make_job_id,
+    latest_actionable_job,
     record_event,
     send_whatsapp_message,
     set_sender_active_job,
     update_job_status,
+    write_job,
 )
+
+ACTIVE_JOB_STATUSES = {"collecting", "received", "missing_inputs", "needs_revision"}
+RUN_ALLOWED_STATUSES = {"collecting", "received", "missing_inputs", "needs_revision"}
+RERUN_ALLOWED_STATUSES = {"collecting", "received", "missing_inputs", "needs_revision", "review_ready", "needs_attention", "failed", "incomplete_input"}
+
+
+def _require_new_enabled() -> bool:
+    return str(os.getenv("OPENCLAW_REQUIRE_NEW", "1")).strip().lower() not in {"0", "false", "off", "no"}
 
 
 def _parse_command(text: str) -> tuple[str, str | None, str]:
@@ -41,8 +54,12 @@ def _parse_command(text: str) -> tuple[str, str | None, str]:
         reason = " ".join(parts[2:]).strip() if len(parts) > 2 else "manual_rejected"
         return "no", explicit_job, reason
 
+    if raw_action == "new":
+        note = " ".join(parts[1:]).strip() if len(parts) > 1 else ""
+        return "new", None, note
+
     action = raw_action
-    if action not in {"run", "status", "ok", "no", "rerun"}:
+    if action not in {"run", "status", "ok", "no", "rerun", "new"}:
         return "", None, ""
 
     explicit_job: str | None = None
@@ -83,6 +100,8 @@ def _resolve_job(
     *,
     sender: str,
     explicit_job_id: str | None,
+    allow_fallback: bool,
+    require_new: bool,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     sender_norm = (sender or "").strip()
     if explicit_job_id:
@@ -93,29 +112,68 @@ def _resolve_job(
         active_job_id = get_sender_active_job(conn, sender=sender_norm)
         if active_job_id:
             job = get_job(conn, active_job_id)
-            if job and job.get("status") not in {"verified", "failed"}:
+            if job and job.get("status") in ACTIVE_JOB_STATUSES.union({"review_ready", "needs_attention", "failed", "incomplete_input", "running"}):
                 return job, {"source": "active_map", "multiple": 0}
 
-        sender_jobs = list_actionable_jobs_for_sender(conn, sender=sender_norm, limit=20)
-        if sender_jobs:
-            selected = sender_jobs[0]
-            return selected, {"source": "sender_latest", "multiple": max(0, len(sender_jobs) - 1)}
+        if allow_fallback and not require_new:
+            sender_jobs = list_actionable_jobs_for_sender(conn, sender=sender_norm, limit=20)
+            if sender_jobs:
+                selected = sender_jobs[0]
+                return selected, {"source": "sender_latest", "multiple": max(0, len(sender_jobs) - 1)}
 
-    latest = latest_actionable_job(conn)
-    if latest:
-        return latest, {"source": "global_latest", "multiple": 0}
+    if allow_fallback and not require_new:
+        latest = latest_actionable_job(conn)
+        if latest:
+            return latest, {"source": "global_latest", "multiple": 0}
     return None, {"source": "none", "multiple": 0}
 
 
-def _status_text(job: dict[str, Any], *, multiple_hint: int = 0) -> str:
-    errors = job.get("errors_json") if isinstance(job.get("errors_json"), list) else []
-    errors_text = ", ".join(errors[:3]) if errors else "none"
-    suffix = ""
-    if multiple_hint > 0:
-        suffix = f" | Note: {multiple_hint} more pending job(s)."
+def _status_text(conn, job: dict[str, Any], *, multiple_hint: int = 0, require_new: bool = True) -> str:
+    files = list_job_files(conn, str(job["job_id"]))
+    files_count = len(files)
+    docx_count = sum(1 for item in files if Path(str(item.get("path", ""))).suffix.lower() == ".docx")
+    return build_status_card(
+        job=job,
+        files_count=files_count,
+        docx_count=docx_count,
+        multiple_hint=multiple_hint,
+        require_new=require_new,
+    )
+
+
+def _create_new_job(conn, *, paths, sender: str, note: str) -> dict[str, Any]:
+    sender_norm = (sender or "").strip() or "unknown"
+    job_id = make_job_id("whatsapp")
+    inbox_dir = paths.inbox_whatsapp / job_id
+    review_dir = paths.review_root / job_id
+    inbox_dir.mkdir(parents=True, exist_ok=True)
+    review_dir.mkdir(parents=True, exist_ok=True)
+
+    write_job(
+        conn,
+        job_id=job_id,
+        source="whatsapp",
+        sender=sender_norm,
+        subject="WhatsApp Task",
+        message_text=note.strip(),
+        status="collecting",
+        inbox_dir=inbox_dir,
+        review_dir=review_dir,
+    )
+    set_sender_active_job(conn, sender=sender_norm, job_id=job_id)
+    record_event(
+        conn,
+        job_id=job_id,
+        milestone="new_created",
+        payload={"sender": sender_norm, "note": note.strip()},
+    )
     return (
-        f"[{job['job_id']}] status={job.get('status')} task_type={job.get('task_type') or 'n/a'} "
-        f"iterations={job.get('iteration_count', 0)} verify_dir={job.get('review_dir')} errors={errors_text}{suffix}"
+        {
+            "job_id": job_id,
+            "status": "collecting",
+            "review_dir": str(review_dir.resolve()),
+            "inbox_dir": str(inbox_dir.resolve()),
+        }
     )
 
 
@@ -130,16 +188,39 @@ def handle_command(
 ) -> dict[str, Any]:
     paths = ensure_runtime_paths(work_root)
     conn = db_connect(paths)
+    require_new = _require_new_enabled()
     action, explicit_job_id, reason = _parse_command(command_text)
     if not action:
         conn.close()
         return {"ok": False, "error": "unsupported_command"}
 
-    job, resolve_meta = _resolve_job(conn, sender=sender, explicit_job_id=explicit_job_id)
+    if action == "new":
+        created = _create_new_job(conn, paths=paths, sender=sender, note=reason)
+        new_job = get_job(conn, created["job_id"]) or {"job_id": created["job_id"], "status": "collecting", "review_dir": created["review_dir"]}
+        msg = _status_text(conn, new_job, multiple_hint=0, require_new=require_new)
+        _send_and_record(
+            conn,
+            job_id=created["job_id"],
+            milestone="collecting_update",
+            target=target,
+            message=msg,
+            dry_run=dry_run_notify,
+        )
+        conn.close()
+        return {"ok": True, "job_id": created["job_id"], "status": "collecting"}
+
+    allow_fallback = action == "status"
+    job, resolve_meta = _resolve_job(
+        conn,
+        sender=sender,
+        explicit_job_id=explicit_job_id,
+        allow_fallback=allow_fallback,
+        require_new=require_new,
+    )
     if action == "status" and not job:
         send_result = send_whatsapp_message(
             target=target,
-            message="No active job found. Send files first, then send: run",
+            message=no_active_job_hint(require_new=require_new),
             dry_run=dry_run_notify,
         )
         conn.close()
@@ -147,7 +228,7 @@ def handle_command(
     if not job:
         send_result = send_whatsapp_message(
             target=target,
-            message="No active job found. Please send files first.",
+            message=no_active_job_hint(require_new=require_new),
             dry_run=dry_run_notify,
         )
         conn.close()
@@ -158,7 +239,7 @@ def handle_command(
         set_sender_active_job(conn, sender=sender.strip(), job_id=job_id)
 
     if action == "status":
-        msg = _status_text(job, multiple_hint=resolve_meta.get("multiple", 0))
+        msg = _status_text(conn, job, multiple_hint=resolve_meta.get("multiple", 0), require_new=require_new)
         _send_and_record(
             conn,
             job_id=job_id,
@@ -169,6 +250,21 @@ def handle_command(
         )
         conn.close()
         return {"ok": True, "job_id": job_id, "status": str(job.get("status")), "resolve": resolve_meta}
+
+    current_status = str(job.get("status") or "")
+    if action == "run" and current_status not in RUN_ALLOWED_STATUSES:
+        msg = (
+            f"[{job_id}] cannot run from status={current_status}. "
+            f"Use rerun or create a new task with: new"
+        )
+        _send_and_record(conn, job_id=job_id, milestone="status", target=target, message=msg, dry_run=dry_run_notify)
+        conn.close()
+        return {"ok": False, "job_id": job_id, "error": "invalid_run_status", "status": current_status}
+    if action == "rerun" and current_status not in RERUN_ALLOWED_STATUSES:
+        msg = f"[{job_id}] rerun is not allowed from status={current_status}. Send: status"
+        _send_and_record(conn, job_id=job_id, milestone="status", target=target, message=msg, dry_run=dry_run_notify)
+        conn.close()
+        return {"ok": False, "job_id": job_id, "error": "invalid_rerun_status", "status": current_status}
 
     if action == "ok":
         update_job_status(conn, job_id=job_id, status="verified", errors=[])
@@ -207,7 +303,7 @@ def handle_command(
             job_id=job_id,
             milestone="run_accepted",
             target=target,
-            message=f"[{job_id}] run_accepted. Starting execution now.",
+            message=f"[{job_id}] run_accepted. Starting execution now...",
             dry_run=dry_run_notify,
         )
         conn.close()
@@ -226,7 +322,7 @@ def handle_command(
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--command", required=True, help="run|status|ok|no {reason}|rerun")
+    parser.add_argument("--command", required=True, help="new|run|status|ok|no {reason}|rerun")
     parser.add_argument("--work-root", default=str(DEFAULT_WORK_ROOT))
     parser.add_argument("--kb-root", default=str(DEFAULT_KB_ROOT))
     parser.add_argument("--target", default=DEFAULT_NOTIFY_TARGET)

@@ -20,6 +20,8 @@ from scripts.v4_runtime import (
     DEFAULT_WORK_ROOT,
     db_connect,
     ensure_runtime_paths,
+    get_job,
+    get_sender_active_job,
     list_job_files,
     make_job_id,
     send_whatsapp_message,
@@ -102,7 +104,11 @@ def _is_command(text: str) -> bool:
     if not lowered:
         return False
     head = lowered.split(" ", 1)[0]
-    return head in {"run", "status", "ok", "no", "rerun", "approve", "reject"}
+    return head in {"new", "run", "status", "ok", "no", "rerun", "approve", "reject"}
+
+
+def _require_new_enabled() -> bool:
+    return str(os.getenv("OPENCLAW_REQUIRE_NEW", "1")).strip().lower() not in {"0", "false", "off", "no"}
 
 
 def _parse_iso(value: str) -> datetime | None:
@@ -140,6 +146,23 @@ def _find_recent_collecting_job(*, work_root: Path, sender: str, window_seconds:
                 continue
             if now - updated <= timedelta(seconds=max(30, window_seconds)):
                 return str(row["job_id"])
+        return None
+    finally:
+        conn.close()
+
+
+def _find_active_collecting_job(*, work_root: Path, sender: str) -> str | None:
+    paths = ensure_runtime_paths(work_root)
+    conn = db_connect(paths)
+    try:
+        active_job_id = get_sender_active_job(conn, sender=sender)
+        if not active_job_id:
+            return None
+        job = get_job(conn, active_job_id)
+        if not job:
+            return None
+        if str(job.get("status") or "") in {"collecting", "received", "missing_inputs", "needs_revision"}:
+            return str(job["job_id"])
         return None
     finally:
         conn.close()
@@ -224,6 +247,22 @@ def main() -> int:
     reply_target = _resolve_reply_target(sender, args.notify_target)
 
     attachments = _collect_attachments(payload)
+    require_new = _require_new_enabled()
+
+    bootstrap_job_id: str | None = None
+    head = text.lower().strip().split(" ", 1)[0] if text.strip() else ""
+    if require_new and attachments and head == "new":
+        bootstrap = handle_command(
+            command_text=text,
+            work_root=work_root,
+            kb_root=kb_root,
+            target=reply_target,
+            sender=sender,
+            dry_run_notify=args.dry_run_notify,
+        )
+        if bootstrap.get("ok") and bootstrap.get("job_id"):
+            bootstrap_job_id = str(bootstrap["job_id"])
+            text = ""
 
     if text and _is_command(text) and not attachments:
         result = handle_command(
@@ -237,11 +276,28 @@ def main() -> int:
         print(json.dumps({"ok": bool(result.get("ok")), "mode": "command", "result": result}, ensure_ascii=False))
         return 0 if result.get("ok") else 1
 
-    existing_job_id = _find_recent_collecting_job(
+    existing_job_id = bootstrap_job_id or (_find_active_collecting_job(work_root=work_root, sender=sender) if require_new else _find_recent_collecting_job(
         work_root=work_root,
         sender=sender,
         window_seconds=args.bundle_window_seconds,
-    )
+    ))
+    if require_new and not existing_job_id:
+        notify_msg = "No active collecting job. Send: new"
+        _notify_target(target=reply_target, message=notify_msg, dry_run=args.dry_run_notify)
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "mode": "needs_new",
+                    "sender": sender,
+                    "message_id": message_id,
+                    "hint": notify_msg,
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 0
+
     if existing_job_id:
         job_id = existing_job_id
         info = _get_job_info(work_root=work_root, job_id=job_id)
@@ -252,7 +308,7 @@ def main() -> int:
         job_id = make_job_id("whatsapp")
         inbox_dir = work_root.expanduser().resolve() / "_INBOX" / "whatsapp" / job_id
         inbox_dir.mkdir(parents=True, exist_ok=True)
-        envelope = create_job(
+        create_job(
             source="whatsapp",
             sender=sender,
             subject="WhatsApp Task",
@@ -319,7 +375,7 @@ def main() -> int:
                 "Send 'run' when done."
             )
         elif text.strip():
-            intake_msg = f"[{job_id}] task note received. You can continue sending files, then send 'run'."
+            intake_msg = f"[{job_id}] task note received. Continue with files/text, then send 'run'."
         else:
             intake_msg = f"[{job_id}] message received. Continue sending files, then send 'run'."
         _notify_target(target=reply_target, message=intake_msg, dry_run=args.dry_run_notify)

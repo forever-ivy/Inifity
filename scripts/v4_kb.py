@@ -12,6 +12,7 @@ from typing import Any
 
 from docx import Document
 
+from scripts.skill_clawrag_bridge import clawrag_search, clawrag_sync
 from scripts.v4_runtime import (
     KB_SUPPORTED_EXTENSIONS,
     SOURCE_GROUP_WEIGHTS,
@@ -268,6 +269,27 @@ def sync_kb(
     return report
 
 
+def sync_kb_with_rag(
+    *,
+    conn: sqlite3.Connection,
+    kb_root: Path,
+    report_path: Path | None = None,
+    rag_backend: str = "clawrag",
+    rag_base_url: str = "http://127.0.0.1:8080",
+    rag_collection: str = "translation-kb",
+) -> dict[str, Any]:
+    local_report = sync_kb(conn=conn, kb_root=kb_root, report_path=report_path)
+    rag_report: dict[str, Any] = {"ok": False, "backend": "local", "mode": "disabled"}
+    if str(rag_backend).strip().lower() == "clawrag":
+        changed_paths = [str(x.get("path")) for x in (local_report.get("files") or []) if str(x.get("path", "")).strip()]
+        rag_report = clawrag_sync(
+            changed_paths=changed_paths,
+            base_url=rag_base_url,
+            collection=rag_collection,
+        )
+    return {"ok": local_report.get("ok", False), "local_report": local_report, "rag_report": rag_report}
+
+
 def retrieve_kb(
     *,
     conn: sqlite3.Connection,
@@ -318,3 +340,45 @@ def retrieve_kb(
 
     scored.sort(key=lambda x: x["score"], reverse=True)
     return scored[: max(1, int(top_k))]
+
+
+def retrieve_kb_with_fallback(
+    *,
+    conn: sqlite3.Connection,
+    query: str,
+    task_type: str = "",
+    rag_backend: str = "clawrag",
+    rag_base_url: str = "http://127.0.0.1:8080",
+    rag_collection: str = "translation-kb",
+    top_k_clawrag: int = 12,
+    top_k_local: int = 8,
+) -> dict[str, Any]:
+    q = (query or "").strip()
+    if not q:
+        return {"backend": "local", "hits": [], "status_flags": [], "rag_result": {"ok": True, "detail": "empty_query"}}
+
+    if str(rag_backend).strip().lower() == "clawrag":
+        rag_result = clawrag_search(
+            query=q,
+            top_k=max(1, int(top_k_clawrag)),
+            base_url=rag_base_url,
+            collection=rag_collection,
+        )
+        rag_hits = list(rag_result.get("hits") or [])
+        if rag_result.get("ok") and rag_hits:
+            return {
+                "backend": "clawrag",
+                "hits": rag_hits[: max(1, int(top_k_clawrag))],
+                "status_flags": [],
+                "rag_result": rag_result,
+            }
+        local_hits = retrieve_kb(conn=conn, query=q, task_type=task_type, top_k=max(1, int(top_k_local)))
+        return {
+            "backend": "local",
+            "hits": local_hits,
+            "status_flags": ["rag_fallback_local"],
+            "rag_result": rag_result,
+        }
+
+    local_hits = retrieve_kb(conn=conn, query=q, task_type=task_type, top_k=max(1, int(top_k_local)))
+    return {"backend": "local", "hits": local_hits, "status_flags": [], "rag_result": {"ok": True, "mode": "local_only"}}

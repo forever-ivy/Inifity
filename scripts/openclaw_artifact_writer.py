@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from docx import Document
+from openpyxl import Workbook
 
 from scripts.compose_docx_from_draft import build_doc
 
@@ -45,6 +46,23 @@ def _write_docx(path: Path, title: str, lines: list[str]) -> None:
             continue
         doc.add_paragraph(stripped)
     doc.save(str(path))
+
+
+def _write_xlsx(path: Path, *, final_text: str, change_log_points: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Final"
+    for idx, line in enumerate([ln for ln in final_text.splitlines() if ln.strip()], start=1):
+        ws.cell(row=idx, column=1, value=line.strip())
+
+    log = wb.create_sheet(title="ChangeLog")
+    if change_log_points:
+        for idx, row in enumerate(change_log_points, start=1):
+            log.cell(row=idx, column=1, value=str(row))
+    else:
+        log.cell(row=1, column=1, value="No explicit change log points were returned by model.")
+    wb.save(str(path))
 
 
 def build_review_brief_lines(
@@ -131,6 +149,7 @@ def write_artifacts(
     candidate_files: list[dict[str, Any]],
     review_questions: list[str],
     draft_payload: dict[str, Any] | None = None,
+    generate_final_xlsx: bool = False,
     plan_payload: dict[str, Any] | None = None,
 ) -> dict[str, str]:
     review = Path(review_dir)
@@ -154,6 +173,7 @@ def write_artifacts(
     final_reflow_docx = review / "Final-Reflow.docx"
     review_brief_docx = review / "Review Brief.docx"
     change_log_md = review / "Change Log.md"
+    final_xlsx = review / "Final.xlsx"
 
     execution_plan_json = system / "execution_plan.json"
     quality_report_json = system / "quality_report.json"
@@ -184,6 +204,8 @@ def write_artifacts(
     _write_docx(review_brief_docx, "Review Brief", review_lines)
 
     _write_text(change_log_md, _ensure_change_log_text(change_log_points, task_type))
+    if generate_final_xlsx:
+        _write_xlsx(final_xlsx, final_text=final_text, change_log_points=change_log_points)
 
     plan_write = {
         "job_id": job_id,
@@ -202,7 +224,7 @@ def write_artifacts(
     _write_json(delta_summary_json, delta_pack)
     _write_json(model_scores_json, model_scores)
 
-    return {
+    manifest = {
         "final_docx": str(final_docx.resolve()),
         "final_reflow_docx": str(final_reflow_docx.resolve()),
         "draft_a_docx": str(draft_a_docx.resolve()),
@@ -214,3 +236,6 @@ def write_artifacts(
         "delta_summary_json": str(delta_summary_json.resolve()),
         "model_scores_json": str(model_scores_json.resolve()),
     }
+    if generate_final_xlsx:
+        manifest["final_xlsx"] = str(final_xlsx.resolve())
+    return manifest

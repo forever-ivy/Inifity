@@ -12,6 +12,53 @@ from scripts.v4_runtime import db_connect, ensure_runtime_paths, get_job
 
 class SkillApprovalTest(unittest.TestCase):
     @patch("scripts.skill_approval.send_whatsapp_message")
+    def test_new_creates_collecting_job(self, mocked_send):
+        mocked_send.return_value = {"ok": True}
+        with tempfile.TemporaryDirectory() as tmp:
+            work_root = Path(tmp) / "Translation Task"
+            kb_root = Path(tmp) / "Knowledge Repository"
+            kb_root.mkdir(parents=True, exist_ok=True)
+
+            result = handle_command(
+                command_text="new teachers survey task",
+                work_root=work_root,
+                kb_root=kb_root,
+                target="+8613",
+                sender="+8613",
+                dry_run_notify=True,
+            )
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["status"], "collecting")
+            self.assertTrue(str(result["job_id"]).startswith("job_"))
+
+            paths = ensure_runtime_paths(work_root)
+            conn = db_connect(paths)
+            job = get_job(conn, str(result["job_id"]))
+            conn.close()
+            self.assertIsNotNone(job)
+            self.assertEqual(job["status"], "collecting")
+
+    @patch("scripts.skill_approval.send_whatsapp_message")
+    def test_run_rejected_without_active_job_when_require_new(self, mocked_send):
+        mocked_send.return_value = {"ok": True}
+        with tempfile.TemporaryDirectory() as tmp:
+            work_root = Path(tmp) / "Translation Task"
+            kb_root = Path(tmp) / "Knowledge Repository"
+            kb_root.mkdir(parents=True, exist_ok=True)
+
+            with patch.dict("os.environ", {"OPENCLAW_REQUIRE_NEW": "1"}, clear=False):
+                result = handle_command(
+                    command_text="run",
+                    work_root=work_root,
+                    kb_root=kb_root,
+                    target="+8613",
+                    sender="+8613",
+                    dry_run_notify=True,
+                )
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["error"], "job_not_found")
+
+    @patch("scripts.skill_approval.send_whatsapp_message")
     def test_ok_marks_verified_without_delivery_copy(self, mocked_send):
         mocked_send.return_value = {"ok": True}
         with tempfile.TemporaryDirectory() as tmp:

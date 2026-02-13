@@ -27,12 +27,13 @@ if [[ -f "$WORKSPACE_AGENTS_MD" ]]; then
   cat >> "$tmp_file" <<'EOF'
 
 <!-- V5.3_STRICT_ROUTER_BEGIN -->
-## WhatsApp Strict Router (V5.3)
+## WhatsApp Strict Router (V6.0)
 
 - For WhatsApp direct inbound task messages, do not translate in chat.
 - Route immediately via:
   `/Users/Code/workflow/translation/.venv/bin/python -m scripts.skill_whatsapp_router --work-root "/Users/ivy/Library/CloudStorage/OneDrive-Personal/Translation Task" --kb-root "/Users/ivy/Library/CloudStorage/OneDrive-Personal/Knowledge Repository" --notify-target "+8615071054627" --raw-text "<RAW_MESSAGE>"`
-- Allowed chat commands: `run`, `status`, `ok`, `no {reason}`, `rerun`.
+- Allowed chat commands: `new`, `run`, `status`, `ok`, `no {reason}`, `rerun`.
+- Mandatory flow: `new -> (send files/text) -> run`.
 - Never ask for files again if attachments were already present.
 - Never echo inline `<file ...>` payload content.
 <!-- V5.3_STRICT_ROUTER_END -->
@@ -50,10 +51,30 @@ if [[ -f "$ENV_FILE" ]]; then
     echo 'OPENCLAW_TRANSLATION_THINKING=high' >> "$ENV_FILE"
     echo "Added OPENCLAW_TRANSLATION_THINKING=high to $ENV_FILE"
   fi
+  if ! grep -q '^OPENCLAW_REQUIRE_NEW=' "$ENV_FILE"; then
+    echo 'OPENCLAW_REQUIRE_NEW=1' >> "$ENV_FILE"
+    echo "Added OPENCLAW_REQUIRE_NEW=1 to $ENV_FILE"
+  fi
+  if ! grep -q '^OPENCLAW_RAG_BACKEND=' "$ENV_FILE"; then
+    echo 'OPENCLAW_RAG_BACKEND=clawrag' >> "$ENV_FILE"
+    echo "Added OPENCLAW_RAG_BACKEND=clawrag to $ENV_FILE"
+  fi
+  if ! grep -q '^OPENCLAW_RAG_BASE_URL=' "$ENV_FILE"; then
+    echo 'OPENCLAW_RAG_BASE_URL=http://127.0.0.1:8080' >> "$ENV_FILE"
+    echo "Added OPENCLAW_RAG_BASE_URL=http://127.0.0.1:8080 to $ENV_FILE"
+  fi
+  if ! grep -q '^OPENCLAW_STATE_DB_PATH=' "$ENV_FILE"; then
+    echo 'OPENCLAW_STATE_DB_PATH=/Users/ivy/.openclaw/runtime/translation/state.sqlite' >> "$ENV_FILE"
+    echo "Added OPENCLAW_STATE_DB_PATH=/Users/ivy/.openclaw/runtime/translation/state.sqlite to $ENV_FILE"
+  fi
 else
   cat >"$ENV_FILE" <<'EOF'
 OPENCLAW_WA_STRICT_ROUTER=1
 OPENCLAW_TRANSLATION_THINKING=high
+OPENCLAW_REQUIRE_NEW=1
+OPENCLAW_RAG_BACKEND=clawrag
+OPENCLAW_RAG_BASE_URL=http://127.0.0.1:8080
+OPENCLAW_STATE_DB_PATH=/Users/ivy/.openclaw/runtime/translation/state.sqlite
 EOF
   echo "Created $ENV_FILE with strict router + high reasoning defaults."
 fi

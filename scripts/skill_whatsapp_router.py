@@ -19,7 +19,7 @@ from typing import Any
 
 from scripts.v4_runtime import DEFAULT_KB_ROOT, DEFAULT_NOTIFY_TARGET, DEFAULT_WORK_ROOT, send_whatsapp_message
 
-COMMAND_HEADS = {"run", "status", "ok", "no", "rerun", "approve", "reject"}
+COMMAND_HEADS = {"new", "run", "status", "ok", "no", "rerun", "approve", "reject"}
 ATTACHED_RE = re.compile(r"\[media attached:\s*(.+?)\s*\(([^)]*)\)\]", re.IGNORECASE)
 WHATSAPP_PREFIX_RE = re.compile(r"^\[WhatsApp\s+([+0-9][^ ]*)[^\]]*\]\s*(?:\[openclaw\]\s*)?(.*)$", re.IGNORECASE)
 MESSAGE_ID_RE = re.compile(r"\[message_id:\s*([^\]]+)\]", re.IGNORECASE)
@@ -144,7 +144,8 @@ def _run_dispatcher(dispatcher_args: list[str]) -> tuple[int, str, str]:
 def _notify_hint(target: str, dry_run: bool = False) -> dict[str, Any]:
     message = (
         "[router] Task mode is strict.\n"
-        "Send files first, then command: run\n"
+        "Start with: new\n"
+        "Then send files/text, and run\n"
         "Other commands: status | ok | no {reason} | rerun"
     )
     return send_whatsapp_message(target=target, message=message, dry_run=dry_run)

@@ -24,6 +24,7 @@ from scripts.build_delta_pack import build_delta, flatten_blocks
 from scripts.extract_docx_structure import extract_structure
 from scripts.openclaw_artifact_writer import write_artifacts
 from scripts.openclaw_quality_gate import QualityThresholds, compute_runtime_timeout, evaluate_quality
+from scripts.v4_kb import extract_text
 
 TASK_TYPES = {
     "REVISION_UPDATE",
@@ -34,6 +35,7 @@ TASK_TYPES = {
     "TERMINOLOGY_ENFORCEMENT",
     "LOW_CONTEXT_TASK",
     "FORMAT_CRITICAL_TASK",
+    "SPREADSHEET_TRANSLATION",
 }
 
 REQUIRED_INPUTS_BY_TASK: dict[str, list[str]] = {
@@ -45,6 +47,7 @@ REQUIRED_INPUTS_BY_TASK: dict[str, list[str]] = {
     "TERMINOLOGY_ENFORCEMENT": ["target_document", "glossary"],
     "LOW_CONTEXT_TASK": [],
     "FORMAT_CRITICAL_TASK": ["source_document"],
+    "SPREADSHEET_TRANSLATION": ["source_document"],
 }
 
 CODEX_AGENT = os.getenv("OPENCLAW_CODEX_AGENT", "translator-core")
@@ -132,7 +135,21 @@ def _enrich_structures(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]
         if item.get("structure"):
             structure = item["structure"]
         else:
-            structure = extract_structure(path)
+            if path.suffix.lower() == ".docx":
+                structure = extract_structure(path)
+            else:
+                parser, text = extract_text(path)
+                lines = [ln.strip() for ln in str(text or "").splitlines() if ln.strip()]
+                blocks = [{"kind": "paragraph", "text": ln} for ln in lines]
+                structure = {
+                    "path": str(path.resolve()),
+                    "name": path.name,
+                    "paragraph_count": len(lines),
+                    "table_count": 1 if parser in {"xlsx", "csv"} else 0,
+                    "block_count": len(blocks),
+                    "blocks": blocks,
+                    "parser": parser,
+                }
         out.append({**item, "structure": structure, "path": str(path.resolve())})
     return out
 
@@ -288,7 +305,7 @@ def _llm_intent(meta: dict[str, Any], candidates: list[dict[str, Any]]) -> dict[
 You are classifying a translation job. Return strict JSON only.
 
 Allowed task_type values:
-REVISION_UPDATE, NEW_TRANSLATION, BILINGUAL_REVIEW, EN_ONLY_EDIT, MULTI_FILE_BATCH, TERMINOLOGY_ENFORCEMENT, LOW_CONTEXT_TASK, FORMAT_CRITICAL_TASK
+REVISION_UPDATE, NEW_TRANSLATION, BILINGUAL_REVIEW, EN_ONLY_EDIT, MULTI_FILE_BATCH, TERMINOLOGY_ENFORCEMENT, LOW_CONTEXT_TASK, FORMAT_CRITICAL_TASK, SPREADSHEET_TRANSLATION
 
 Canonical required_inputs values:
 arabic_old, arabic_new, english_baseline, source_document, target_document, english_document, batch_documents, glossary
@@ -654,7 +671,8 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
         intent = intent_result["intent"]
         estimated_minutes = int(intent_result.get("estimated_minutes", 12))
         complexity_score = float(intent_result.get("complexity_score", 30.0))
-        runtime_timeout_minutes, status_flags = compute_runtime_timeout(estimated_minutes, thresholds)
+        runtime_timeout_minutes, timeout_flags = compute_runtime_timeout(estimated_minutes, thresholds)
+        status_flags = list(meta.get("status_flags_seed") or []) + list(timeout_flags or [])
 
         plan = {
             "task_type": intent.get("task_type", "LOW_CONTEXT_TASK"),
@@ -820,6 +838,7 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
             "thinking_level": OPENCLAW_TRANSLATION_THINKING,
             "router_mode": router_mode,
             "token_guard_applied": token_guard_applied,
+            "knowledge_backend": str(meta.get("knowledge_backend") or "local"),
         }
 
         last_round = rounds[-1] if rounds else {"metrics": {}}
@@ -854,6 +873,7 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
             candidate_files=candidates,
             review_questions=[str(x) for x in current_draft.get("review_brief_points", [])],
             draft_payload=current_draft,
+            generate_final_xlsx=(task_type == "SPREADSHEET_TRANSLATION" or any(Path(c.get("path", "")).suffix.lower() in {".xlsx", ".csv"} for c in candidates)),
             plan_payload={
                 "intent": intent,
                 "plan": plan,
@@ -864,6 +884,7 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
                     "thinking_level": OPENCLAW_TRANSLATION_THINKING,
                     "router_mode": router_mode,
                     "token_guard_applied": token_guard_applied,
+                    "knowledge_backend": str(meta.get("knowledge_backend") or "local"),
                 },
             },
         )

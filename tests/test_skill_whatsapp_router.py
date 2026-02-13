@@ -44,6 +44,7 @@ class SkillWhatsAppRouterTest(unittest.TestCase):
         self.assertEqual(text, "this is task text")
 
     def test_command_detection(self):
+        self.assertTrue(_is_command("new"))
         self.assertTrue(_is_command("run"))
         self.assertTrue(_is_command("status"))
         self.assertTrue(_is_command("no fix numbering"))

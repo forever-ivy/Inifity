@@ -5,6 +5,8 @@ ROOT_DIR="/Users/Code/workflow/translation"
 WORKSPACE_DIR="${OPENCLAW_WORKSPACE_DIR:-$ROOT_DIR}"
 PRIMARY_MODEL="${OPENCLAW_PRIMARY_MODEL:-openai-codex/gpt-5.3-codex}"
 FALLBACK_MODEL="${OPENCLAW_FALLBACK_MODEL:-google/gemini-2.5-pro}"
+OPENCLAW_WORKSPACE_SKILL_ROOT="${OPENCLAW_WORKSPACE_SKILL_ROOT:-$HOME/.openclaw/workspace}"
+SKILL_LOCK_FILE="${SKILL_LOCK_FILE:-$ROOT_DIR/config/skill-lock.v6.json}"
 
 if ! command -v jq >/dev/null 2>&1; then
   echo "ERROR: jq is required" >&2
@@ -41,6 +43,36 @@ upsert_cron_job() {
   echo "Cron configured: $name"
 }
 
+install_community_skills_from_lock() {
+  if [[ ! -f "$SKILL_LOCK_FILE" ]]; then
+    echo "WARN: skill lock not found: $SKILL_LOCK_FILE (skip community skill install)"
+    return 0
+  fi
+  if ! command -v npx >/dev/null 2>&1; then
+    echo "WARN: npx not found, skip community skill install"
+    return 0
+  fi
+
+  echo "Installing community skills from lock: $SKILL_LOCK_FILE"
+  while IFS= read -r item; do
+    local slug version required
+    slug="$(jq -r '.slug' <<<"$item")"
+    version="$(jq -r '.version' <<<"$item")"
+    required="$(jq -r '.required' <<<"$item")"
+    [[ -z "$slug" || -z "$version" ]] && continue
+    echo " - $slug@$version (required=$required)"
+    if npx -y clawhub@latest --workdir "$OPENCLAW_WORKSPACE_SKILL_ROOT" --dir "skills" install "$slug" --version "$version" --force >/dev/null; then
+      echo "   installed: $slug@$version"
+    else
+      if [[ "$required" == "true" ]]; then
+        echo "ERROR: required skill install failed: $slug@$version" >&2
+        exit 2
+      fi
+      echo "WARN: optional skill install failed: $slug@$version"
+    fi
+  done < <(jq -c '.skills[]' "$SKILL_LOCK_FILE")
+}
+
 echo "Ensuring V4 agents..."
 ensure_agent "task-router" "$PRIMARY_MODEL"
 ensure_agent "translator-core" "$PRIMARY_MODEL"
@@ -51,6 +83,8 @@ echo "Configuring model routing..."
 openclaw models set "$PRIMARY_MODEL"
 openclaw models fallbacks clear || true
 openclaw models fallbacks add "$FALLBACK_MODEL" || true
+
+install_community_skills_from_lock
 
 EMAIL_CMD="Execute this shell command exactly once and return only a short status JSON: cd $ROOT_DIR && ./scripts/run_v4_email_poll.sh"
 REMINDER_CMD="Execute this shell command exactly once and return only a short status JSON: cd $ROOT_DIR && ./scripts/run_v4_pending_reminder.sh"

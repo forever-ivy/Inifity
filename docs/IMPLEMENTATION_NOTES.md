@@ -1,32 +1,55 @@
-# Implementation Notes (V5.3)
+# Implementation Notes (V6.0)
 
-## Core changes from V4.1
+## Core changes from V5.3
 
-1. Intent classification is now LLM-first (`TaskIntentV5`) via OpenClaw agent.
-2. Pre-run pipeline is enforced:
+1. Command protocol is now strict `new -> (send text/files) -> run`.
+2. Added `new` command handling in approval/ingest/router paths.
+3. Sender can no longer accidentally run without active collecting job when `OPENCLAW_REQUIRE_NEW=1`.
+4. Pre-run pipeline remains enforced:
    - `kb_sync_incremental`
    - `kb_retrieve`
-3. Execution uses real Codex + Gemini 3-round loop:
+5. Knowledge retrieval backend updated:
+   - primary: `clawrag`
+   - fallback: local sqlite KB retrieval (`rag_fallback_local` flag)
+6. Execution uses real Codex + Gemini 3-round loop:
    - Codex draft
    - Gemini review
    - Codex revision
    - Gemini re-review
-4. Output path is now `_VERIFY/{job_id}` only.
-5. `ok` is status-only (`verified`), no auto-delivery copy.
-6. Contextual command interface:
-   - `run | status | ok | no {reason} | rerun`
-7. Sender-active-job mapping is persisted in SQLite for no-arg command routing.
-8. WhatsApp strict router mode added:
+7. Output path is `_VERIFY/{job_id}` only.
+8. `ok` is still status-only (`verified`), no auto-delivery copy.
+9. Contextual command interface:
+   - `new | run | status | ok | no {reason} | rerun`
+10. Sender-active-job mapping remains persisted in SQLite.
+11. WhatsApp strict router mode remains:
    - route inbound task messages to dispatcher, not free-form chat
    - extract `[media attached: ...]` local file paths
    - strip inline `<file ...>` blocks to reduce token pressure
-9. Translation model calls now enforce `--thinking high` by default:
+12. Translation model calls enforce `--thinking high` by default:
    - env override: `OPENCLAW_TRANSLATION_THINKING`
-10. Execution metadata now includes:
+13. Execution metadata includes:
    - `thinking_level`
    - `router_mode`
    - `token_guard_applied`
-11. Cron jobs now use `--no-deliver` to remove noisy `delivery target missing` failures.
+   - `knowledge_backend`
+14. Added spreadsheet-aware execution:
+   - task type `SPREADSHEET_TRANSLATION`
+   - optional output `Final.xlsx`
+15. Setup script now installs pinned first-batch community skills from:
+   - `config/skill-lock.v6.json`
+16. Cron jobs continue to use `--no-deliver` to avoid noisy delivery-target errors.
+
+## First-batch skill lock
+
+Pinned in `config/skill-lock.v6.json`:
+
+- `himalaya@1.0.0`
+- `openclaw-mem@2.1.0`
+- `memory-hygiene@1.0.0`
+- `sheetsmith@1.0.1`
+- `pdf-extract@1.0.0`
+- `docx-skill@1.0.2` (optional)
+- `clawrag@1.2.0`
 
 ## State model
 
@@ -49,6 +72,7 @@ Table:
 
 Purpose:
 - Resolve contextual commands without explicit `job_id`.
+- Enforce strict `new` flow while preserving per-sender continuity.
 
 ## Output bundle policy
 
@@ -64,6 +88,17 @@ Never auto-copied to:
 Legacy command aliases remain:
 - `approve` -> `ok`
 - `reject` -> `no`
+
+## User-facing status format
+
+`status` now returns a 6-line card:
+
+1. Job
+2. Stage
+3. Task + language pair
+4. Input readiness
+5. Round progress + double pass
+6. Next command
 
 ## Known tradeoff
 

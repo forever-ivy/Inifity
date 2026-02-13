@@ -1,23 +1,24 @@
-# Translation Automation V5.3 (Strict Router + High Reasoning)
+# Translation Automation V6.0 (Skill-First, Strict `new -> run`)
 
 ## Scope
 
-V5.3 implements:
+V6.0 implements:
 
-- OpenClaw-first orchestration
-- pure LLM intent classification (`TaskIntentV5`)
-- real Codex + Gemini 3-round review loop
-- default model reasoning level: `high` (`OPENCLAW_TRANSLATION_THINKING`)
-- mandatory `kb_sync_incremental` + `kb_retrieve` before every `run`
-- outputs only in `_VERIFY/{job_id}`
-- no auto-delivery to final folder
-- strict WhatsApp router mode (no long chat fallback)
-- contextual WhatsApp commands:
-  - `run`
-  - `status`
-  - `ok`
-  - `no {reason}`
-  - `rerun`
+- OpenClaw-first orchestration (`n8n` is not the main flow).
+- Skill-first pipeline with first-batch community skills:
+  - `himalaya@1.0.0`
+  - `openclaw-mem@2.1.0`
+  - `memory-hygiene@1.0.0`
+  - `sheetsmith@1.0.1`
+  - `pdf-extract@1.0.0`
+  - `docx-skill@1.0.2` (optional helper)
+  - `clawrag@1.2.0` (primary RAG backend)
+- Mandatory command protocol: `new -> (send text/files) -> run`.
+- Real Codex + Gemini 3-round review loop, default reasoning `high`.
+- Mandatory `kb_sync_incremental` + `kb_retrieve` before every `run`.
+- Output only to `_VERIFY/{job_id}`.
+- No automatic move to final delivery folder.
+- WhatsApp status replies use user-readable 6-line status cards.
 
 Legacy commands `approve/reject` are kept as compatibility aliases and are internally redirected to `ok/no`.
 
@@ -44,6 +45,17 @@ Legacy commands `approve/reject` are kept as compatibility aliases and are inter
 - KB index cache:
   - `.system/kb/*`
 
+## Command protocol (V6 strict mode)
+
+- `new`: create a fresh collecting job for current sender.
+- `run`: start pipeline for current active collecting job.
+- `status`: return user-readable status card.
+- `ok`: mark job `verified` only (no file move).
+- `no {reason}`: mark `needs_revision`.
+- `rerun`: rerun current active job.
+
+If `OPENCLAW_REQUIRE_NEW=1`, calling `run` before `new` is rejected.
+
 ## Produced artifacts (per job)
 
 Under `_VERIFY/{job_id}`:
@@ -54,6 +66,7 @@ Under `_VERIFY/{job_id}`:
 - `Draft B (Reflow).docx`
 - `Review Brief.docx`
 - `Change Log.md`
+- `Final.xlsx` (only when task type is spreadsheet-related)
 - `.system/execution_plan.json`
 - `.system/quality_report.json`
 - `.system/openclaw_result.json`
@@ -83,6 +96,11 @@ V4_IMAP_MAX_MESSAGES=5
 
 OPENCLAW_WA_STRICT_ROUTER=1
 OPENCLAW_TRANSLATION_THINKING=high
+OPENCLAW_REQUIRE_NEW=1
+OPENCLAW_RAG_BACKEND=clawrag
+OPENCLAW_RAG_BASE_URL=http://127.0.0.1:8080
+OPENCLAW_RAG_COLLECTION=translation-kb
+OPENCLAW_STATE_DB_PATH=/Users/ivy/.openclaw/runtime/translation/state.sqlite
 ```
 
 ## Install
@@ -125,7 +143,7 @@ What it does:
 3. Removes inline `<file ...>` payload blocks (token guard).
 4. Dispatches to:
    - `whatsapp-event` for task/file intake
-   - `approval` for command-only messages (`run/status/ok/no/rerun`)
+   - `approval` for command-only messages (`new/run/status/ok/no/rerun`)
 
 ## Run
 
@@ -156,13 +174,15 @@ cd /Users/Code/workflow/translation
 
 ## Message flow
 
-1. Upload files (email or WhatsApp) -> job enters `collecting`
-2. Send `run`
+1. Send `new` -> job enters `collecting`
+2. Upload files and/or task text (email or WhatsApp)
+3. Send `run`
 3. System emits milestones:
    - `collecting_update`
    - `run_accepted`
    - `kb_sync_started`
    - `kb_sync_done`
+   - `kb_retrieve_done`
    - `intent_classified`
    - `round_1_done` (and round 2/3 if needed)
    - `review_ready` or `needs_attention`
@@ -178,16 +198,30 @@ cd /Users/Code/workflow/translation
 openclaw skills list | rg translation-router
 ```
 
-2. Check strict router flags:
+2. Check strict router + V6 flags:
 
 ```bash
-rg "OPENCLAW_WA_STRICT_ROUTER|OPENCLAW_TRANSLATION_THINKING" /Users/Code/workflow/translation/.env.v4.local
+rg "OPENCLAW_WA_STRICT_ROUTER|OPENCLAW_TRANSLATION_THINKING|OPENCLAW_REQUIRE_NEW|OPENCLAW_RAG_BACKEND" /Users/Code/workflow/translation/.env.v4.local
 ```
 
-3. Check cron delivery noise is gone:
+3. Check clawrag bridge health:
+
+```bash
+/Users/Code/workflow/translation/.venv/bin/python -m scripts.skill_clawrag_bridge --base-url "http://127.0.0.1:8080" health
+```
+
+4. Check cron delivery noise is gone:
 
 ```bash
 openclaw cron list --json | jq '.jobs[] | {name, lastStatus: .state.lastStatus, lastError: .state.lastError}'
+```
+
+5. If `run` says no active job:
+
+```text
+Send: new
+Attach files/text
+Send: run
 ```
 
 ## Tests
