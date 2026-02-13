@@ -24,7 +24,7 @@ from scripts.v4_runtime import (
     make_job_id,
     latest_actionable_job,
     record_event,
-    send_whatsapp_message,
+    send_message,
     set_sender_active_job,
     update_job_status,
     write_job,
@@ -85,7 +85,7 @@ def _send_and_record(
     message: str,
     dry_run: bool,
 ) -> dict[str, Any]:
-    send_result = send_whatsapp_message(target=target, message=message, dry_run=dry_run)
+    send_result = send_message(target=target, message=message, dry_run=dry_run)
     record_event(
         conn,
         job_id=job_id,
@@ -143,8 +143,8 @@ def _status_text(conn, job: dict[str, Any], *, multiple_hint: int = 0, require_n
 
 def _create_new_job(conn, *, paths, sender: str, note: str) -> dict[str, Any]:
     sender_norm = (sender or "").strip() or "unknown"
-    job_id = make_job_id("whatsapp")
-    inbox_dir = paths.inbox_whatsapp / job_id
+    job_id = make_job_id("telegram")
+    inbox_dir = paths.inbox_messaging / job_id
     review_dir = paths.review_root / job_id
     inbox_dir.mkdir(parents=True, exist_ok=True)
     review_dir.mkdir(parents=True, exist_ok=True)
@@ -152,9 +152,9 @@ def _create_new_job(conn, *, paths, sender: str, note: str) -> dict[str, Any]:
     write_job(
         conn,
         job_id=job_id,
-        source="whatsapp",
+        source="telegram",
         sender=sender_norm,
-        subject="WhatsApp Task",
+        subject="Telegram Task",
         message_text=note.strip(),
         status="collecting",
         inbox_dir=inbox_dir,
@@ -196,16 +196,6 @@ def handle_command(
 
     if action == "new":
         created = _create_new_job(conn, paths=paths, sender=sender, note=reason)
-        new_job = get_job(conn, created["job_id"]) or {"job_id": created["job_id"], "status": "collecting", "review_dir": created["review_dir"]}
-        msg = _status_text(conn, new_job, multiple_hint=0, require_new=require_new)
-        _send_and_record(
-            conn,
-            job_id=created["job_id"],
-            milestone="collecting_update",
-            target=target,
-            message=msg,
-            dry_run=dry_run_notify,
-        )
         conn.close()
         return {"ok": True, "job_id": created["job_id"], "status": "collecting"}
 
@@ -218,7 +208,7 @@ def handle_command(
         require_new=require_new,
     )
     if action == "status" and not job:
-        send_result = send_whatsapp_message(
+        send_result = send_message(
             target=target,
             message=no_active_job_hint(require_new=require_new),
             dry_run=dry_run_notify,
@@ -226,7 +216,7 @@ def handle_command(
         conn.close()
         return {"ok": True, "status": "no_active_job", "send_result": send_result}
     if not job:
-        send_result = send_whatsapp_message(
+        send_result = send_message(
             target=target,
             message=no_active_job_hint(require_new=require_new),
             dry_run=dry_run_notify,
@@ -254,14 +244,16 @@ def handle_command(
     current_status = str(job.get("status") or "")
     if action == "run" and current_status not in RUN_ALLOWED_STATUSES:
         msg = (
-            f"[{job_id}] cannot run from status={current_status}. "
-            f"Use rerun or create a new task with: new"
+            f"\u26a0\ufe0f Cannot run\n"
+            f"\U0001f194 {job_id}\n"
+            f"Current stage: {current_status}\n"
+            f"\U0001f4a1 Try: rerun or new"
         )
         _send_and_record(conn, job_id=job_id, milestone="status", target=target, message=msg, dry_run=dry_run_notify)
         conn.close()
         return {"ok": False, "job_id": job_id, "error": "invalid_run_status", "status": current_status}
     if action == "rerun" and current_status not in RERUN_ALLOWED_STATUSES:
-        msg = f"[{job_id}] rerun is not allowed from status={current_status}. Send: status"
+        msg = f"\u26a0\ufe0f Cannot rerun\n\U0001f194 {job_id}\nCurrent stage: {current_status}\n\U0001f4a1 Send: status"
         _send_and_record(conn, job_id=job_id, milestone="status", target=target, message=msg, dry_run=dry_run_notify)
         conn.close()
         return {"ok": False, "job_id": job_id, "error": "invalid_rerun_status", "status": current_status}
@@ -274,8 +266,9 @@ def handle_command(
             milestone="verified",
             target=target,
             message=(
-                f"[{job_id}] verified. Auto-delivery is disabled by policy. "
-                "Please manually move the final file to your destination folder."
+                f"\u2705 Verified\n"
+                f"\U0001f194 {job_id}\n"
+                f"\U0001f4c1 Please manually move files to the final folder"
             ),
             dry_run=dry_run_notify,
         )
@@ -290,7 +283,7 @@ def handle_command(
             job_id=job_id,
             milestone="needs_attention",
             target=target,
-            message=f"[{job_id}] marked needs_revision. Reason: {reason_norm}",
+            message=f"\U0001f527 Marked for revision\n\U0001f194 {job_id}\nReason: {reason_norm}",
             dry_run=dry_run_notify,
         )
         conn.close()
@@ -303,7 +296,7 @@ def handle_command(
             job_id=job_id,
             milestone="run_accepted",
             target=target,
-            message=f"[{job_id}] run_accepted. Starting execution now...",
+            message=f"\U0001f680 Starting execution\n\U0001f194 {job_id}\n\u23f3 Codex+Gemini translating...",
             dry_run=dry_run_notify,
         )
         conn.close()

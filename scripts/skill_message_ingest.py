@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""OpenClaw skill: ingest WhatsApp messages/files and create jobs."""
+"""OpenClaw skill: ingest Telegram messages/files and create jobs."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ from scripts.v4_runtime import (
     get_sender_active_job,
     list_job_files,
     make_job_id,
-    send_whatsapp_message,
+    send_message,
     update_job_status,
     utc_now_iso,
 )
@@ -115,7 +115,6 @@ def _parse_iso(value: str) -> datetime | None:
     if not value:
         return None
     try:
-        # utc_now_iso() stores timezone-aware ISO-8601.
         return datetime.fromisoformat(value)
     except ValueError:
         return None
@@ -129,7 +128,7 @@ def _find_recent_collecting_job(*, work_root: Path, sender: str, window_seconds:
             """
             SELECT job_id, updated_at
             FROM jobs
-            WHERE source='whatsapp'
+            WHERE source IN ('telegram', 'whatsapp')
               AND sender=?
               AND status IN ('collecting', 'received', 'missing_inputs', 'needs_revision')
             ORDER BY updated_at DESC
@@ -220,7 +219,7 @@ def _resolve_reply_target(sender: str, fallback_target: str) -> str:
 
 
 def _notify_target(*, target: str, message: str, dry_run: bool = False) -> dict[str, Any]:
-    return send_whatsapp_message(target=target, message=message, dry_run=dry_run)
+    return send_message(target=target, message=message, dry_run=dry_run)
 
 
 def main() -> int:
@@ -282,7 +281,7 @@ def main() -> int:
         window_seconds=args.bundle_window_seconds,
     ))
     if require_new and not existing_job_id:
-        notify_msg = "No active collecting job. Send: new"
+        notify_msg = "\U0001f4ed No active task. Send: new"
         _notify_target(target=reply_target, message=notify_msg, dry_run=args.dry_run_notify)
         print(
             json.dumps(
@@ -301,17 +300,17 @@ def main() -> int:
     if existing_job_id:
         job_id = existing_job_id
         info = _get_job_info(work_root=work_root, job_id=job_id)
-        inbox_dir = Path(info.get("inbox_dir") or work_root / "_INBOX" / "whatsapp" / job_id)
+        inbox_dir = Path(info.get("inbox_dir") or work_root / "_INBOX" / "telegram" / job_id)
         inbox_dir.mkdir(parents=True, exist_ok=True)
         _append_job_message(work_root=work_root, job_id=job_id, text=text)
     else:
-        job_id = make_job_id("whatsapp")
-        inbox_dir = work_root.expanduser().resolve() / "_INBOX" / "whatsapp" / job_id
+        job_id = make_job_id("telegram")
+        inbox_dir = work_root.expanduser().resolve() / "_INBOX" / "telegram" / job_id
         inbox_dir.mkdir(parents=True, exist_ok=True)
         create_job(
-            source="whatsapp",
+            source="telegram",
             sender=sender,
-            subject="WhatsApp Task",
+            subject="Telegram Task",
             message_text=text,
             inbox_dir=inbox_dir,
             job_id=job_id,
@@ -325,7 +324,7 @@ def main() -> int:
 
     saved_files: list[str] = []
     for idx, item in enumerate(attachments, start=1):
-        file_name = item.get("name") or item.get("fileName") or f"wa_attachment_{idx}"
+        file_name = item.get("name") or item.get("fileName") or f"tg_attachment_{idx}"
         target_path = inbox_dir / file_name
         if target_path.exists():
             stem = target_path.stem
@@ -356,7 +355,7 @@ def main() -> int:
     if should_run:
         _notify_target(
             target=reply_target,
-            message=f"[{job_id}] run accepted. Starting pipeline...",
+            message=f"\U0001f680 Starting execution\n\U0001f194 {job_id}",
             dry_run=args.dry_run_notify,
         )
         run_result = run_job_pipeline(
@@ -366,19 +365,6 @@ def main() -> int:
             notify_target=reply_target,
             dry_run_notify=args.dry_run_notify,
         )
-
-    if not should_run:
-        if saved_files:
-            intake_msg = (
-                f"[{job_id}] collecting update: received {len(saved_files)} file(s). "
-                f"Current totals: docx={info.get('docx_count', 0)}, all_files={info.get('files_count', 0)}. "
-                "Send 'run' when done."
-            )
-        elif text.strip():
-            intake_msg = f"[{job_id}] task note received. Continue with files/text, then send 'run'."
-        else:
-            intake_msg = f"[{job_id}] message received. Continue sending files, then send 'run'."
-        _notify_target(target=reply_target, message=intake_msg, dry_run=args.dry_run_notify)
 
     response = {
         "ok": True if (not should_run or (run_result and run_result.get("ok"))) else False,
@@ -402,3 +388,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

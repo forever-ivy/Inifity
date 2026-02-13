@@ -24,7 +24,7 @@ from scripts.v4_runtime import (
     list_job_files,
     record_event,
     set_sender_active_job,
-    send_whatsapp_message,
+    send_message,
     update_job_plan,
     update_job_result,
     update_job_status,
@@ -43,7 +43,7 @@ def notify_milestone(
     dry_run: bool = False,
 ) -> dict[str, Any]:
     tgt = target or DEFAULT_NOTIFY_TARGET
-    result = send_whatsapp_message(target=tgt, message=message, dry_run=dry_run)
+    result = send_message(target=tgt, message=message, dry_run=dry_run)
     payload = {"target": tgt, "message": message, "send_result": result}
     record_event(conn, job_id=job_id, milestone=milestone, payload=payload)
     append_log(paths, "events.log", f"{milestone}\t{job_id}\t{message}")
@@ -152,7 +152,7 @@ def _extract_message_id(payload: dict[str, Any], fallback_text: str = "") -> str
     return ""
 
 
-def _latest_whatsapp_meta(inbox_dir: Path) -> dict[str, Any]:
+def _latest_message_meta(inbox_dir: Path) -> dict[str, Any]:
     payload_files = sorted(inbox_dir.glob("payload_*.json"), key=lambda p: p.stat().st_mtime_ns, reverse=True)
     if not payload_files:
         return {"message_id": "", "raw_message_ref": "", "token_guard_applied": False}
@@ -204,7 +204,7 @@ def run_job_pipeline(
         conn=conn,
         job_id=job_id,
         milestone="kb_sync_started",
-        message=f"[{job_id}] kb_sync_started",
+        message=f"\U0001f4da KB syncing...\n\U0001f194 {job_id}",
         target=notify_target,
         dry_run=dry_run_notify,
     )
@@ -224,7 +224,7 @@ def run_job_pipeline(
         conn=conn,
         job_id=job_id,
         milestone="kb_sync_done",
-        message=f"[{job_id}] kb_sync_done created={kb_report['created']} updated={kb_report['updated']} skipped={kb_report['skipped']}",
+        message=f"\U0001f4da KB ready\nNew {kb_report['created']} \u00b7 Updated {kb_report['updated']} \u00b7 Skipped {kb_report['skipped']}",
         target=notify_target,
         dry_run=dry_run_notify,
     )
@@ -233,8 +233,10 @@ def run_job_pipeline(
     review_dir = Path(job["review_dir"]).resolve()
     review_dir.mkdir(parents=True, exist_ok=True)
     inbox_dir = Path(str(job.get("inbox_dir") or "")).expanduser().resolve()
-    whatsapp_meta = _latest_whatsapp_meta(inbox_dir) if str(job.get("source", "")) == "whatsapp" else {}
-    strict_router_enabled = str(os.getenv("OPENCLAW_WA_STRICT_ROUTER", "1")).strip().lower() not in {"0", "false", "off", "no"}
+    message_meta = _latest_message_meta(inbox_dir) if str(job.get("source", "")) in ("telegram", "whatsapp") else {}
+    strict_router_enabled = str(
+        os.getenv("OPENCLAW_STRICT_ROUTER") or os.getenv("OPENCLAW_WA_STRICT_ROUTER", "1")
+    ).strip().lower() not in {"0", "false", "off", "no"}
     router_mode = "strict" if strict_router_enabled else "hybrid"
 
     if not candidates:
@@ -244,7 +246,7 @@ def run_job_pipeline(
             conn=conn,
             job_id=job_id,
             milestone="failed",
-            message=f"[{job_id}] failed: no supported input files (.docx/.xlsx/.csv).",
+            message=f"\U0001f4ed No supported files\n\U0001f194 {job_id}\nSupported: .docx .xlsx .csv",
             target=notify_target,
             dry_run=dry_run_notify,
         )
@@ -287,7 +289,7 @@ def run_job_pipeline(
         conn=conn,
         job_id=job_id,
         milestone="kb_retrieve_done",
-        message=f"[{job_id}] kb_retrieve_done backend={knowledge_backend} hits={len(kb_hits)}",
+        message=f"\U0001f50d KB retrieval done \u00b7 {len(kb_hits)} hits",
         target=notify_target,
         dry_run=dry_run_notify,
     )
@@ -298,8 +300,8 @@ def run_job_pipeline(
         "review_dir": str(review_dir),
         "source": job.get("source", ""),
         "sender": job.get("sender", ""),
-        "message_id": whatsapp_meta.get("message_id", ""),
-        "raw_message_ref": whatsapp_meta.get("raw_message_ref", ""),
+        "message_id": message_meta.get("message_id", ""),
+        "raw_message_ref": message_meta.get("raw_message_ref", ""),
         "subject": job.get("subject", ""),
         "message_text": job.get("message_text", ""),
         "candidate_files": candidates,
@@ -309,7 +311,7 @@ def run_job_pipeline(
         "codex_available": True,
         "gemini_available": True,
         "router_mode": router_mode,
-        "token_guard_applied": bool(whatsapp_meta.get("token_guard_applied", False)),
+        "token_guard_applied": bool(message_meta.get("token_guard_applied", False)),
         "status_flags_seed": pre_status_flags,
     }
 
@@ -335,9 +337,9 @@ def run_job_pipeline(
         job_id=job_id,
         milestone="intent_classified",
         message=(
-            f"[{job_id}] intent_classified: {plan.get('plan', {}).get('task_type', 'unknown')} "
-            f"est={plan.get('estimated_minutes', 0)}m timeout={plan.get('runtime_timeout_minutes', 0)}m "
-            f"missing={len(intent.get('missing_inputs', []))}"
+            f"\U0001f9e0 Intent classified\n"
+            f"Type: {plan.get('plan', {}).get('task_type', 'unknown')} \u00b7 "
+            f"Est: {plan.get('estimated_minutes', 0)}m"
         ),
         target=notify_target,
         dry_run=dry_run_notify,
@@ -350,7 +352,7 @@ def run_job_pipeline(
             conn=conn,
             job_id=job_id,
             milestone="missing_inputs",
-            message=f"[{job_id}] missing inputs: {', '.join(missing) if missing else 'unknown'}. Upload files then send 'run'.",
+            message=f"\U0001f4ed Missing inputs: {', '.join(missing) if missing else 'unknown'}\nPlease upload, then send: run",
             target=notify_target,
             dry_run=dry_run_notify,
         )
@@ -368,7 +370,7 @@ def run_job_pipeline(
         conn=conn,
         job_id=job_id,
         milestone="running",
-        message=f"[{job_id}] running: Codex+Gemini up to 3 rounds.",
+        message=f"\U0001f680 Translation started\n\U0001f194 {job_id}\nCodex+Gemini up to 3 rounds",
         target=notify_target,
         dry_run=dry_run_notify,
     )
@@ -396,7 +398,7 @@ def run_job_pipeline(
                 conn=conn,
                 job_id=job_id,
                 milestone=f"round_{rd_no}_done",
-                message=f"[{job_id}] round_{rd_no}_done codex_pass={rd.get('codex_pass')} gemini_pass={rd.get('gemini_pass')}",
+                message=f"\U0001f504 Round {rd_no} done\nCodex: {'\u2705' if rd.get('codex_pass') else '\u274c'} \u00b7 Gemini: {'\u2705' if rd.get('gemini_pass') else '\u274c'}",
                 target=notify_target,
                 dry_run=dry_run_notify,
             )
@@ -406,8 +408,10 @@ def run_job_pipeline(
             job_id=job_id,
             milestone="review_ready",
             message=(
-                f"[{job_id}] review_ready. Verify files in {result.get('review_dir')}. "
-                "After your manual checks, send: ok | no {reason} | rerun"
+                f"\u2705 Translation complete, ready for review\n"
+                f"\U0001f194 {job_id}\n"
+                f"\U0001f4c1 {result.get('review_dir')}\n\n"
+                f"Send: ok \u00b7 no {{reason}} \u00b7 rerun"
             ),
             target=notify_target,
             dry_run=dry_run_notify,
@@ -423,7 +427,7 @@ def run_job_pipeline(
                 conn=conn,
                 job_id=job_id,
                 milestone=f"round_{rd_no}_done",
-                message=f"[{job_id}] round_{rd_no}_done codex_pass={rd.get('codex_pass')} gemini_pass={rd.get('gemini_pass')}",
+                message=f"\U0001f504 Round {rd_no} done\nCodex: {'\u2705' if rd.get('codex_pass') else '\u274c'} \u00b7 Gemini: {'\u2705' if rd.get('gemini_pass') else '\u274c'}",
                 target=notify_target,
                 dry_run=dry_run_notify,
             )
@@ -432,7 +436,7 @@ def run_job_pipeline(
             conn=conn,
             job_id=job_id,
             milestone="needs_attention",
-            message=f"[{job_id}] needs_attention. Send: status | rerun | no {{reason}}",
+            message=f"\u26a0\ufe0f Needs attention\n\U0001f194 {job_id}\nSend: status \u00b7 rerun \u00b7 no {{reason}}",
             target=notify_target,
             dry_run=dry_run_notify,
         )
@@ -442,7 +446,7 @@ def run_job_pipeline(
             conn=conn,
             job_id=job_id,
             milestone="failed",
-            message=f"[{job_id}] failed. Check .system/openclaw_result.json",
+            message=f"\u274c Execution failed\n\U0001f194 {job_id}\n\U0001f4a1 Send: rerun to retry",
             target=notify_target,
             dry_run=dry_run_notify,
         )

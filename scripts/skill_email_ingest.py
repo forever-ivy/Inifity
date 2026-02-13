@@ -193,9 +193,9 @@ def main() -> int:
                     f"[{job_id}] collecting_update from email. "
                     f"Received {len(attachments)} attachment(s). Send 'run' to start."
                 )
-                from scripts.v4_runtime import send_whatsapp_message  # local import to avoid cycles
+                from scripts.v4_runtime import send_message  # local import to avoid cycles
 
-                send_whatsapp_message(target=args.notify_target, message=send_msg, dry_run=False)
+                send_message(target=args.notify_target, message=send_msg, dry_run=False)
 
             jobs.append(envelope)
             mark_mailbox_uid_seen(conn, args.mailbox, uid)

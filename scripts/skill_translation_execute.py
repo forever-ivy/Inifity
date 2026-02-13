@@ -18,7 +18,7 @@ from scripts.v4_runtime import (
     get_job,
     list_job_files,
     record_event,
-    send_whatsapp_message,
+    send_message,
     update_job_result,
 )
 
@@ -42,7 +42,7 @@ def _build_candidates(job_files: list[dict[str, str]]) -> list[dict[str, str]]:
 
 
 def _notify(conn, *, job_id: str, milestone: str, target: str, message: str, dry_run: bool) -> None:
-    send_result = send_whatsapp_message(target=target, message=message, dry_run=dry_run)
+    send_result = send_message(target=target, message=message, dry_run=dry_run)
     record_event(conn, job_id=job_id, milestone=milestone, payload={"target": target, "message": message, "send_result": send_result})
 
 

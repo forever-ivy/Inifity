@@ -16,8 +16,8 @@ from typing import Any
 
 DEFAULT_KB_ROOT = Path("/Users/ivy/Library/CloudStorage/OneDrive-Personal/Knowledge Repository")
 DEFAULT_WORK_ROOT = Path("/Users/ivy/Library/CloudStorage/OneDrive-Personal/Translation Task")
-DEFAULT_NOTIFY_TARGET = os.getenv("OPENCLAW_NOTIFY_TARGET") or os.getenv("WHATSAPP_TO") or "+8615071054627"
-DEFAULT_NOTIFY_CHANNEL = os.getenv("OPENCLAW_NOTIFY_CHANNEL") or "whatsapp"
+DEFAULT_NOTIFY_TARGET = os.getenv("OPENCLAW_NOTIFY_TARGET") or os.getenv("TELEGRAM_CHAT_ID") or ""
+DEFAULT_NOTIFY_CHANNEL = os.getenv("OPENCLAW_NOTIFY_CHANNEL") or "telegram"
 DEFAULT_NOTIFY_ACCOUNT = os.getenv("OPENCLAW_NOTIFY_ACCOUNT") or "default"
 DEFAULT_LOCAL_STATE_DB = Path("~/.openclaw/runtime/translation/state.sqlite").expanduser()
 
@@ -37,7 +37,7 @@ SOURCE_GROUP_WEIGHTS = {
 class RuntimePaths:
     work_root: Path
     inbox_email: Path
-    inbox_whatsapp: Path
+    inbox_messaging: Path
     review_root: Path
     translated_root: Path
     system_root: Path
@@ -70,11 +70,11 @@ def ensure_runtime_paths(work_root: Path | str = DEFAULT_WORK_ROOT) -> RuntimePa
     kb_system_root = system_root / "kb"
     logs_root = system_root / "logs"
     inbox_email = root / "_INBOX" / "email"
-    inbox_whatsapp = root / "_INBOX" / "whatsapp"
+    inbox_messaging = root / "_INBOX" / "telegram"
     review_root = root / "Translated -EN" / "_VERIFY"
     translated_root = root / "Translated -EN"
 
-    for p in [jobs_root, kb_system_root, logs_root, inbox_email, inbox_whatsapp, review_root, translated_root]:
+    for p in [jobs_root, kb_system_root, logs_root, inbox_email, inbox_messaging, review_root, translated_root]:
         p.mkdir(parents=True, exist_ok=True)
 
     # SQLite on cloud-sync placeholders (e.g., OneDrive File Provider) is prone to "disk I/O error".
@@ -93,7 +93,7 @@ def ensure_runtime_paths(work_root: Path | str = DEFAULT_WORK_ROOT) -> RuntimePa
     return RuntimePaths(
         work_root=root,
         inbox_email=inbox_email,
-        inbox_whatsapp=inbox_whatsapp,
+        inbox_messaging=inbox_messaging,
         review_root=review_root,
         translated_root=translated_root,
         system_root=system_root,
@@ -505,7 +505,31 @@ def append_log(paths: RuntimePaths, file_name: str, line: str) -> None:
         f.write(line.rstrip() + "\n")
 
 
-def send_whatsapp_message(
+def send_telegram_direct(*, chat_id: str, message: str, bot_token: str) -> dict[str, Any]:
+    """Send a message directly via Telegram Bot API (no OpenClaw)."""
+    import urllib.error
+    import urllib.request
+
+    if not bot_token:
+        return {"ok": False, "error": "no_bot_token"}
+    text = message
+    if len(text) > 4000:
+        text = text[:4000] + "\n...(truncated)"
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    body = json.dumps({"chat_id": chat_id, "text": text}).encode("utf-8")
+    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return {"ok": data.get("ok", False), "response": data}
+    except urllib.error.HTTPError as exc:
+        err = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
+        return {"ok": False, "error_code": exc.code, "description": err}
+    except (urllib.error.URLError, OSError) as exc:
+        return {"ok": False, "description": str(exc)}
+
+
+def send_message(
     *,
     target: str,
     message: str,
@@ -513,6 +537,16 @@ def send_whatsapp_message(
     account: str = DEFAULT_NOTIFY_ACCOUNT,
     dry_run: bool = False,
 ) -> dict[str, Any]:
+    # Direct Telegram bypass when enabled
+    if (
+        os.getenv("TELEGRAM_DIRECT_MODE") == "1"
+        and channel == "telegram"
+        and not dry_run
+    ):
+        token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+        if token:
+            return send_telegram_direct(chat_id=target, message=message, bot_token=token)
+
     cmd = [
         "openclaw",
         "message",
@@ -537,6 +571,9 @@ def send_whatsapp_message(
         except json.JSONDecodeError:
             pass
     return payload
+
+
+send_whatsapp_message = send_message  # backward compat alias
 
 
 def json_dumps(value: Any) -> str:

@@ -14,7 +14,7 @@ from scripts.v4_runtime import (
     ensure_runtime_paths,
     get_job,
     record_event,
-    send_whatsapp_message,
+    send_message,
 )
 
 
@@ -37,7 +37,7 @@ def main() -> int:
         prefix = f"[{args.job_id}|{job['status']}] "
     message = prefix + args.message
 
-    send_result = send_whatsapp_message(target=args.target, message=message, dry_run=args.dry_run)
+    send_result = send_message(target=args.target, message=message, dry_run=args.dry_run)
     record_event(
         conn,
         job_id=args.job_id or "",

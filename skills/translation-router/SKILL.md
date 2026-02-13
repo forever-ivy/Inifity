@@ -1,12 +1,12 @@
 ---
 name: translation-router
-description: Strict router for WhatsApp translation tasks. Always dispatch to local V6 pipeline instead of chatting.
-version: 1.1.0
+description: Strict router for Telegram translation tasks. Always dispatch to local V6 pipeline instead of chatting.
+version: 2.0.0
 ---
 
 # Translation Router (Strict Mode)
 
-Use this skill for incoming WhatsApp direct messages related to translation tasks.
+Use this skill for incoming Telegram direct messages related to translation tasks.
 
 ## Goal
 
@@ -14,10 +14,10 @@ Route message + attachments into the local V6 pipeline. Do not perform translati
 
 ## Required behavior
 
-1. For any relevant WhatsApp message, run exactly one shell command:
+1. For any relevant Telegram message, run exactly one shell command:
 
 ```bash
-/Users/Code/workflow/translation/.venv/bin/python -m scripts.skill_whatsapp_router --work-root "/Users/ivy/Library/CloudStorage/OneDrive-Personal/Translation Task" --kb-root "/Users/ivy/Library/CloudStorage/OneDrive-Personal/Knowledge Repository" --notify-target "+8615071054627" --raw-text "<RAW_MESSAGE>"
+/Users/Code/workflow/translation/.venv/bin/python -m scripts.skill_message_router --work-root "/Users/ivy/Library/CloudStorage/OneDrive-Personal/Translation Task" --kb-root "/Users/ivy/Library/CloudStorage/OneDrive-Personal/Knowledge Repository" --notify-target "<CHAT_ID>" --raw-text "<RAW_MESSAGE>"
 ```
 
 2. `<RAW_MESSAGE>` must be the full inbound message content.

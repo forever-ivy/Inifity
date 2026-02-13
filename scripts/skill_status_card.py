@@ -34,6 +34,24 @@ def _extract_missing(errors: list[str]) -> list[str]:
     return out
 
 
+_STATUS_LABEL: dict[str, str] = {
+    "collecting": "Collecting",
+    "received": "Received",
+    "running": "Running...",
+    "review_ready": "\u2705 Review ready",
+    "needs_attention": "\u26a0\ufe0f Needs attention",
+    "needs_revision": "\U0001f527 Needs revision",
+    "missing_inputs": "\U0001f4ed Missing inputs",
+    "verified": "\u2705 Verified",
+    "failed": "\u274c Failed",
+    "incomplete_input": "\U0001f4ed Incomplete input",
+}
+
+
+def _status_label(status: str) -> str:
+    return _STATUS_LABEL.get(status, status)
+
+
 def next_action_for_status(status: str, *, require_new: bool = True) -> str:
     status_norm = (status or "").strip().lower()
     if status_norm in {"collecting", "received", "missing_inputs", "needs_revision"}:
@@ -57,33 +75,30 @@ def build_status_card(
 ) -> str:
     job_id = str(job.get("job_id") or "unknown")
     status = str(job.get("status") or "unknown")
-    task_type = str(job.get("task_type") or "unknown")
-    src_lang, tgt_lang = _read_intent_lang(str(job.get("review_dir") or ""))
 
     errors_raw = job.get("errors_json") if isinstance(job.get("errors_json"), list) else []
     missing_inputs = _extract_missing(errors_raw)
     if missing_inputs:
-        inputs_line = f"Inputs: missing {', '.join(missing_inputs)}"
+        files_line = f"\U0001f4ce Missing: {', '.join(missing_inputs)}"
     else:
-        inputs_line = f"Inputs: ready (files={files_count}, docx={docx_count})"
+        files_line = f"\U0001f4ce Files: {files_count} (docx: {docx_count})"
 
     rounds = int(job.get("iteration_count") or 0)
-    double_pass = bool(job.get("double_pass"))
-    progress_line = f"Progress: rounds={rounds} | double_pass={'yes' if double_pass else 'no'}"
-    job_line = f"Job: {job_id}" + (f" (+{multiple_hint} pending)" if multiple_hint > 0 else "")
+    hint = f" (+{multiple_hint} pending)" if multiple_hint > 0 else ""
 
     lines = [
-        job_line,
-        f"Stage: {status}",
-        f"Task: {task_type} ({src_lang}->{tgt_lang})",
-        inputs_line,
-        progress_line,
-        f"Next: {next_action_for_status(status, require_new=require_new)}",
+        "\U0001f4cb Task Status",
+        "",
+        f"\U0001f194 {job_id}{hint}",
+        f"\U0001f4cc Stage: {_status_label(status)}",
+        files_line,
+        f"\U0001f504 Rounds: {rounds}",
+        f"\u23ed\ufe0f Next: {next_action_for_status(status, require_new=require_new)}",
     ]
     return "\n".join(lines)
 
 
 def no_active_job_hint(*, require_new: bool = True) -> str:
     if require_new:
-        return "No active job. Send: new"
-    return "No active job. Send files first, then run."
+        return "\U0001f4ed No active task. Send: new"
+    return "\U0001f4ed No active task. Send files first, then run."

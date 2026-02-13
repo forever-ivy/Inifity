@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Strict WhatsApp router for V5.3.
+"""Strict Telegram router for V6.0.
 
-Parses raw OpenClaw WhatsApp message text, extracts attachment paths + command,
+Parses raw OpenClaw Telegram message text, extracts attachment paths + command,
 and forwards to dispatcher without refeeding large inline file payloads.
 """
 
@@ -17,11 +17,15 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from scripts.v4_runtime import DEFAULT_KB_ROOT, DEFAULT_NOTIFY_TARGET, DEFAULT_WORK_ROOT, send_whatsapp_message
+from scripts.v4_runtime import DEFAULT_KB_ROOT, DEFAULT_NOTIFY_TARGET, DEFAULT_WORK_ROOT, send_message
 
 COMMAND_HEADS = {"new", "run", "status", "ok", "no", "rerun", "approve", "reject"}
 ATTACHED_RE = re.compile(r"\[media attached:\s*(.+?)\s*\(([^)]*)\)\]", re.IGNORECASE)
-WHATSAPP_PREFIX_RE = re.compile(r"^\[WhatsApp\s+([+0-9][^ ]*)[^\]]*\]\s*(?:\[openclaw\]\s*)?(.*)$", re.IGNORECASE)
+# OpenClaw unified prefix: [Telegram <chat_id> <date> <tz>] [openclaw] <text>
+TELEGRAM_PREFIX_RE = re.compile(
+    r"^\[Telegram\s+(\d+)\s+[^\]]*\]\s*(?:\[openclaw\]\s*)?(.*)$",
+    re.IGNORECASE,
+)
 MESSAGE_ID_RE = re.compile(r"\[message_id:\s*([^\]]+)\]", re.IGNORECASE)
 FILE_BLOCK_RE = re.compile(r"<file\b[^>]*>.*?</file>", re.IGNORECASE | re.DOTALL)
 
@@ -41,7 +45,7 @@ def _extract_sender(raw_text: str, fallback_sender: str) -> str:
         line = line.strip()
         if not line:
             continue
-        matched = WHATSAPP_PREFIX_RE.match(line)
+        matched = TELEGRAM_PREFIX_RE.match(line)
         if matched and matched.group(1):
             return matched.group(1).strip()
     return fallback_sender.strip() or "unknown"
@@ -98,7 +102,7 @@ def _extract_text_content(raw_text: str) -> str:
             continue
         if ATTACHED_RE.search(line):
             continue
-        matched = WHATSAPP_PREFIX_RE.match(line)
+        matched = TELEGRAM_PREFIX_RE.match(line)
         if matched:
             body = (matched.group(2) or "").strip()
             if body:
@@ -148,11 +152,11 @@ def _notify_hint(target: str, dry_run: bool = False) -> dict[str, Any]:
         "Then send files/text, and run\n"
         "Other commands: status | ok | no {reason} | rerun"
     )
-    return send_whatsapp_message(target=target, message=message, dry_run=dry_run)
+    return send_message(target=target, message=message, dry_run=dry_run)
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="V5.3 strict WhatsApp router")
+    parser = argparse.ArgumentParser(description="V6.0 strict Telegram router")
     parser.add_argument("--raw-text")
     parser.add_argument("--raw-file")
     parser.add_argument("--work-root", default=str(DEFAULT_WORK_ROOT))
@@ -163,7 +167,9 @@ def main() -> int:
     parser.add_argument("--dry-run-notify", action="store_true")
     args = parser.parse_args()
 
-    strict_router_enabled = str(os.getenv("OPENCLAW_WA_STRICT_ROUTER", "1")).strip().lower() not in {"0", "false", "off", "no"}
+    strict_router_enabled = str(
+        os.getenv("OPENCLAW_STRICT_ROUTER") or os.getenv("OPENCLAW_WA_STRICT_ROUTER", "1")
+    ).strip().lower() not in {"0", "false", "off", "no"}
     raw_text, raw_ref = _load_raw_text(args)
     cleaned_raw, token_guard_applied = _strip_file_blocks(raw_text)
     sender = _extract_sender(cleaned_raw, args.sender)
@@ -235,7 +241,7 @@ def main() -> int:
         tmp.write(json.dumps(payload, ensure_ascii=False))
         tmp_path = Path(tmp.name)
     try:
-        cmd = base_cmd + ["whatsapp-event", "--payload-file", str(tmp_path)]
+        cmd = base_cmd + ["message-event", "--payload-file", str(tmp_path)]
         if args.auto_run:
             cmd.append("--auto-run")
         returncode, stdout, stderr = _run_dispatcher(cmd)
@@ -266,3 +272,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

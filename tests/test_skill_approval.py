@@ -11,7 +11,7 @@ from scripts.v4_runtime import db_connect, ensure_runtime_paths, get_job
 
 
 class SkillApprovalTest(unittest.TestCase):
-    @patch("scripts.skill_approval.send_whatsapp_message")
+    @patch("scripts.skill_approval.send_message")
     def test_new_creates_collecting_job(self, mocked_send):
         mocked_send.return_value = {"ok": True}
         with tempfile.TemporaryDirectory() as tmp:
@@ -38,7 +38,7 @@ class SkillApprovalTest(unittest.TestCase):
             self.assertIsNotNone(job)
             self.assertEqual(job["status"], "collecting")
 
-    @patch("scripts.skill_approval.send_whatsapp_message")
+    @patch("scripts.skill_approval.send_message")
     def test_run_rejected_without_active_job_when_require_new(self, mocked_send):
         mocked_send.return_value = {"ok": True}
         with tempfile.TemporaryDirectory() as tmp:
@@ -58,7 +58,7 @@ class SkillApprovalTest(unittest.TestCase):
             self.assertFalse(result["ok"])
             self.assertEqual(result["error"], "job_not_found")
 
-    @patch("scripts.skill_approval.send_whatsapp_message")
+    @patch("scripts.skill_approval.send_message")
     def test_ok_marks_verified_without_delivery_copy(self, mocked_send):
         mocked_send.return_value = {"ok": True}
         with tempfile.TemporaryDirectory() as tmp:
@@ -66,10 +66,10 @@ class SkillApprovalTest(unittest.TestCase):
             kb_root = Path(tmp) / "Knowledge Repository"
             kb_root.mkdir(parents=True, exist_ok=True)
             job_id = "job_test_ok"
-            inbox = work_root / "_INBOX" / "whatsapp" / job_id
+            inbox = work_root / "_INBOX" / "telegram" / job_id
             inbox.mkdir(parents=True, exist_ok=True)
             create_job(
-                source="whatsapp",
+                source="telegram",
                 sender="+8613",
                 subject="Test",
                 message_text="status",
@@ -97,7 +97,7 @@ class SkillApprovalTest(unittest.TestCase):
             delivered = list((work_root / "Translated -EN").glob("*.docx"))
             self.assertEqual(len(delivered), 0)
 
-    @patch("scripts.skill_approval.send_whatsapp_message")
+    @patch("scripts.skill_approval.send_message")
     def test_no_marks_needs_revision(self, mocked_send):
         mocked_send.return_value = {"ok": True}
         with tempfile.TemporaryDirectory() as tmp:
@@ -105,10 +105,10 @@ class SkillApprovalTest(unittest.TestCase):
             kb_root = Path(tmp) / "Knowledge Repository"
             kb_root.mkdir(parents=True, exist_ok=True)
             job_id = "job_test_no"
-            inbox = work_root / "_INBOX" / "whatsapp" / job_id
+            inbox = work_root / "_INBOX" / "telegram" / job_id
             inbox.mkdir(parents=True, exist_ok=True)
             create_job(
-                source="whatsapp",
+                source="telegram",
                 sender="+8613",
                 subject="Test",
                 message_text="status",

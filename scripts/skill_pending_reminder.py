@@ -16,7 +16,7 @@ from scripts.v4_runtime import (
     ensure_runtime_paths,
     list_jobs_by_status,
     record_event,
-    send_whatsapp_message,
+    send_message,
 )
 
 
@@ -66,14 +66,16 @@ def main() -> int:
             next_cmd = "rerun"
 
         summary = (
-            f"[{job_id}] pending status={job['status']} age={age_hours:.1f}h. "
-            f"Next: {next_cmd}"
+            f"\u23f0 Pending reminder\n"
+            f"\U0001f194 {job_id}\n"
+            f"\U0001f4cc {job['status']} \u00b7 waiting {age_hours:.1f}h\n"
+            f"\u23ed\ufe0f Send: {next_cmd}"
         )
         if slot == "pm" and age_hours >= 24:
-            summary += " | Over 24h pending: please prioritize."
+            summary += "\n\U0001f534 Over 24h, please prioritize"
             overdue_items.append(f"{job_id}({job['status']},{age_hours:.1f}h)")
 
-        send_result = send_whatsapp_message(target=args.target, message=summary, dry_run=args.dry_run)
+        send_result = send_message(target=args.target, message=summary, dry_run=args.dry_run)
         milestone = f"pending_reminder:{date_key}:{slot}"
         record_event(
             conn,
@@ -84,8 +86,8 @@ def main() -> int:
         sent_items.append({"job_id": job_id, "status": job["status"], "message": summary, "send_result": send_result})
 
     if slot == "pm" and overdue_items:
-        brief = "Pending summary (>24h): " + "; ".join(overdue_items[:12])
-        send_result = send_whatsapp_message(target=args.target, message=brief, dry_run=args.dry_run)
+        brief = "\U0001f4ca Overdue tasks (>24h)\n" + "\n".join(overdue_items[:12])
+        send_result = send_message(target=args.target, message=brief, dry_run=args.dry_run)
         record_event(
             conn,
             job_id="",

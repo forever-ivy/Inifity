@@ -21,7 +21,7 @@ from scripts.v4_runtime import (
 )
 
 
-def _parse_whatsapp_payload(payload_file: str) -> dict[str, Any]:
+def _parse_message_payload(payload_file: str) -> dict[str, Any]:
     return json.loads(Path(payload_file).read_text(encoding="utf-8"))
 
 
@@ -59,11 +59,11 @@ def cmd_email_poll(args: argparse.Namespace) -> int:
     return email_main()
 
 
-def cmd_whatsapp_event(args: argparse.Namespace) -> int:
-    from scripts.skill_whatsapp_ingest import main as wa_main  # lazy import
+def cmd_message_event(args: argparse.Namespace) -> int:
+    from scripts.skill_message_ingest import main as msg_main  # lazy import
 
     argv = [
-        "skill_whatsapp_ingest.py",
+        "skill_message_ingest.py",
         "--work-root",
         str(args.work_root),
         "--kb-root",
@@ -78,7 +78,7 @@ def cmd_whatsapp_event(args: argparse.Namespace) -> int:
     if args.auto_run:
         argv.append("--auto-run")
     os.sys.argv = argv
-    return wa_main()
+    return msg_main()
 
 
 def cmd_run_job(args: argparse.Namespace) -> int:
@@ -152,6 +152,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_email.add_argument("--auto-run", action="store_true")
     p_email.add_argument("--mark-seen", action="store_true")
 
+    p_msg = sub.add_parser("message-event")
+    p_msg.add_argument("--payload-json")
+    p_msg.add_argument("--payload-file")
+    p_msg.add_argument("--auto-run", action="store_true")
+
+    # backward compat alias
     p_wa = sub.add_parser("whatsapp-event")
     p_wa.add_argument("--payload-json")
     p_wa.add_argument("--payload-file")
@@ -176,8 +182,8 @@ def main() -> int:
 
     if args.cmd == "email-poll":
         return cmd_email_poll(args)
-    if args.cmd == "whatsapp-event":
-        return cmd_whatsapp_event(args)
+    if args.cmd in ("message-event", "whatsapp-event"):
+        return cmd_message_event(args)
     if args.cmd == "run-job":
         return cmd_run_job(args)
     if args.cmd == "kb-sync":

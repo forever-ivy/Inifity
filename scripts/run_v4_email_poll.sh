@@ -40,4 +40,4 @@ fi
   --mailbox "${V4_IMAP_MAILBOX:-INBOX}" \
   --from-filter "${V4_IMAP_FROM_FILTER:-modeh@eventranz.com}" \
   --max-messages "${V4_IMAP_MAX_MESSAGES:-5}" \
-  "${AUTO_RUN_ARGS[@]}"
+  ${AUTO_RUN_ARGS[@]+"${AUTO_RUN_ARGS[@]}"}

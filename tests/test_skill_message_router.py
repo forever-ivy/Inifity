@@ -2,7 +2,7 @@
 
 import unittest
 
-from scripts.skill_whatsapp_router import (
+from scripts.skill_message_router import (
     _extract_attachment_paths,
     _extract_message_id,
     _extract_sender,
@@ -12,19 +12,19 @@ from scripts.skill_whatsapp_router import (
 )
 
 
-class SkillWhatsAppRouterTest(unittest.TestCase):
+class SkillMessageRouterTest(unittest.TestCase):
     def test_parse_sender_and_message_id(self):
         raw = (
-            "[WhatsApp +8615071054627 Fri 2026-02-13 07:44 GMT+8] [openclaw] run\n"
+            "[Telegram 123456789 Fri 2026-02-13 07:44 GMT+8] [openclaw] run\n"
             "[message_id: 3ADD57E3CD47801E62D1]\n"
         )
-        self.assertEqual(_extract_sender(raw, "unknown"), "+8615071054627")
+        self.assertEqual(_extract_sender(raw, "unknown"), "123456789")
         self.assertEqual(_extract_message_id(raw), "3ADD57E3CD47801E62D1")
 
     def test_extract_attachments_and_strip_file_block(self):
         raw = (
             "[media attached: /tmp/a.docx (application/vnd.openxmlformats-officedocument.wordprocessingml.document)]\n"
-            "<file name=\"a.docx\" mime=\"text/plain\">BINARY</file>\n"
+            '<file name="a.docx" mime="text/plain">BINARY</file>\n'
         )
         cleaned, guarded = _strip_file_blocks(raw)
         self.assertTrue(guarded)
@@ -35,8 +35,8 @@ class SkillWhatsAppRouterTest(unittest.TestCase):
 
     def test_extract_text_content_skips_noise(self):
         raw = (
-            "System: [2026-02-13] WhatsApp connected.\n"
-            "[WhatsApp +8615071054627 Fri 2026-02-13 07:36 GMT+8] [openclaw] this is task text\n"
+            "System: [2026-02-13] Telegram connected.\n"
+            "[Telegram 123456789 Fri 2026-02-13 07:36 GMT+8] [openclaw] this is task text\n"
             "To send an image back, prefer the message tool.\n"
             "[message_id: abc123]\n"
         )
@@ -51,7 +51,7 @@ class SkillWhatsAppRouterTest(unittest.TestCase):
         self.assertFalse(_is_command("this is task text"))
 
     def test_extract_text_with_embedded_message_id(self):
-        raw = "[WhatsApp +8615071054627 Fri] [openclaw] run [message_id: abc]"
+        raw = "[Telegram 123456789 Fri] [openclaw] run [message_id: abc]"
         text = _extract_text_content(raw)
         self.assertEqual(text, "run")
 
