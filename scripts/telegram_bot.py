@@ -226,8 +226,32 @@ def _handle_document(chat_id: str, message: dict[str, Any]) -> None:
 
 def _handle_text(chat_id: str, text: str) -> None:
     """Handle non-command text in strict mode."""
+    stripped = (text or "").strip()
+
+    # Interaction selections (e.g., company menu) are often numeric replies like "1" or "1) Eventranz".
+    # These must not be blocked by the short-text guard.
+    selection_match = re.fullmatch(r"(\d{1,3})", stripped) or re.match(r"^(\d{1,3})\s*[)\.]\s*\S+", stripped)
+    if selection_match:
+        from scripts.skill_approval import handle_interaction_reply
+
+        try:
+            result = handle_interaction_reply(
+                reply_text=selection_match.group(1),
+                work_root=Path(WORK_ROOT),
+                kb_root=Path(KB_ROOT),
+                target=chat_id,
+                sender=chat_id,
+            )
+            # When a selection is pending, handle_interaction_reply will send the relevant message(s).
+            if result.get("ok") or result.get("error") in {"invalid_selection", "expired"}:
+                return
+        except Exception as exc:
+            log.exception("Interaction reply handler error")
+            tg_send(chat_id, f"\u274c Selection error: {exc}")
+            return
+
     # Reject trivially short or punctuation-only text
-    if len(re.sub(r"\W+", "", text or "")) < 2:
+    if len(re.sub(r"\W+", "", stripped)) < 2:
         tg_send(chat_id, "⚠️ Text too short — send a document or longer message")
         return
     require_new = str(os.getenv("OPENCLAW_REQUIRE_NEW", "1")).strip().lower() not in {"0", "false", "off", "no"}
