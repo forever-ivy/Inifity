@@ -25,6 +25,28 @@ def _read_intent_lang(review_dir: str) -> tuple[str, str]:
     return src, tgt
 
 
+def _read_pipeline_version(review_dir: str) -> str:
+    if not review_dir:
+        return ""
+    plan_path = Path(review_dir) / ".system" / "execution_plan.json"
+    if not plan_path.exists():
+        return ""
+    try:
+        payload = json.loads(plan_path.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    version = str(payload.get("pipeline_version") or "").strip()
+    if version:
+        return version
+    plan_payload = payload.get("plan_payload") or {}
+    if isinstance(plan_payload, dict):
+        version = str((plan_payload.get("plan") or {}).get("pipeline_version") or "").strip()
+        if version:
+            return version
+        version = str((plan_payload.get("meta") or {}).get("pipeline_version") or "").strip()
+    return version
+
+
 def _extract_missing(errors: list[str]) -> list[str]:
     out: list[str] = []
     for err in errors:
@@ -72,9 +94,11 @@ def build_status_card(
     docx_count: int,
     multiple_hint: int = 0,
     require_new: bool = True,
+    task_label: str = "",
 ) -> str:
     job_id = str(job.get("job_id") or "unknown")
     status = str(job.get("status") or "unknown")
+    pipeline_version = _read_pipeline_version(str(job.get("review_dir") or ""))
 
     errors_raw = job.get("errors_json") if isinstance(job.get("errors_json"), list) else []
     missing_inputs = _extract_missing(errors_raw)
@@ -89,13 +113,22 @@ def build_status_card(
     lines = [
         "\U0001f4cb Task Status",
         "",
-        f"\U0001f194 {job_id}{hint}",
+    ]
+    if task_label:
+        lines.append(f"\U0001f4cb {task_label}{hint}")
+    elif status in {"collecting", "received"}:
+        lines.append(f"\U0001f4cb New task{hint}")
+    else:
+        lines.append(f"\U0001f194 {job_id}{hint}")
+    lines.extend([
         f"\U0001f4cc Stage: {_status_label(status)}",
+        (f"\U0001f3e2 Company: {job.get('kb_company')}" if str(job.get("kb_company") or "").strip() else ""),
         files_line,
         f"\U0001f504 Rounds: {rounds}",
+        (f"\U0001f3f7\ufe0f Version: {pipeline_version}" if pipeline_version else ""),
         f"\u23ed\ufe0f Next: {next_action_for_status(status, require_new=require_new)}",
-    ]
-    return "\n".join(lines)
+    ])
+    return "\n".join([ln for ln in lines if str(ln).strip()])
 
 
 def no_active_job_hint(*, require_new: bool = True) -> str:

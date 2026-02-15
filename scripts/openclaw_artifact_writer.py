@@ -11,6 +11,8 @@ from docx import Document
 from openpyxl import Workbook
 
 from scripts.compose_docx_from_draft import build_doc
+from scripts.docx_preserver import apply_translation_map as apply_docx_translation_map
+from scripts.xlsx_preserver import apply_translation_map as apply_xlsx_translation_map
 
 SYSTEM_DIR_NAME = ".system"
 
@@ -151,7 +153,7 @@ def write_artifacts(
     draft_payload: dict[str, Any] | None = None,
     generate_final_xlsx: bool = False,
     plan_payload: dict[str, Any] | None = None,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     review = Path(review_dir)
     system = review / SYSTEM_DIR_NAME
     review.mkdir(parents=True, exist_ok=True)
@@ -160,15 +162,23 @@ def write_artifacts(
     draft_payload = draft_payload or {}
     plan_payload = plan_payload or {}
 
-    draft_a_text = str(draft_payload.get("draft_a_text") or draft_payload.get("final_text") or "")
-    draft_b_text = str(draft_payload.get("draft_b_text") or draft_payload.get("final_reflow_text") or "")
-    final_text = str(draft_payload.get("final_text") or draft_a_text)
-    final_reflow_text = str(draft_payload.get("final_reflow_text") or draft_b_text or final_text)
+    final_text = str(
+        draft_payload.get("final_text")
+        or draft_payload.get("draft_a_text")
+        or draft_payload.get("draft_b_text")
+        or ""
+    )
+    final_reflow_text = str(
+        draft_payload.get("final_reflow_text")
+        or draft_payload.get("draft_b_text")
+        or final_text
+        or ""
+    )
     review_points = [str(x) for x in (draft_payload.get("review_brief_points") or [])]
     change_log_points = [str(x) for x in (draft_payload.get("change_log_points") or [])]
+    docx_translation_map = draft_payload.get("docx_translation_map") or []
+    xlsx_translation_map = draft_payload.get("xlsx_translation_map") or []
 
-    draft_a_docx = review / "Draft A (Preserve).docx"
-    draft_b_docx = review / "Draft B (Reflow).docx"
     final_docx = review / "Final.docx"
     final_reflow_docx = review / "Final-Reflow.docx"
     review_brief_docx = review / "Review Brief.docx"
@@ -181,18 +191,13 @@ def write_artifacts(
     model_scores_json = system / "Model Scores.json"
 
     template = Path(draft_a_template_path) if draft_a_template_path else None
-    if template and template.exists():
-        build_doc(template, draft_a_docx, draft_a_text)
+    if template and template.exists() and docx_translation_map:
+        apply_docx_translation_map(template_docx=template, output_docx=final_docx, translation_map_entries=docx_translation_map)
+    elif template and template.exists():
         build_doc(template, final_docx, final_text)
     else:
-        _write_docx(
-            draft_a_docx,
-            "Draft A (Preserve)",
-            _text_to_lines(draft_a_text or "No template was found. Use Draft B for manual formatting."),
-        )
         _write_docx(final_docx, "Final", _text_to_lines(final_text))
 
-    _write_docx(draft_b_docx, "Draft B (Reflow)", _text_to_lines(draft_b_text))
     _write_docx(final_reflow_docx, "Final-Reflow", _text_to_lines(final_reflow_text))
 
     review_lines = build_review_brief_lines(
@@ -204,7 +209,40 @@ def write_artifacts(
     _write_docx(review_brief_docx, "Review Brief", review_lines)
 
     _write_text(change_log_md, _ensure_change_log_text(change_log_points, task_type))
-    if generate_final_xlsx:
+
+    xlsx_sources = [
+        Path(str(item.get("path") or "")).expanduser().resolve()
+        for item in (candidate_files or [])
+        if str(item.get("path") or "") and Path(str(item.get("path") or "")).suffix.lower() == ".xlsx"
+    ]
+
+    beautify_xlsx = str((plan_payload.get("meta") or {}).get("beautify_xlsx", "")).strip()
+    if not beautify_xlsx:
+        beautify_xlsx = "1"
+    beautify_xlsx_enabled = beautify_xlsx not in {"0", "false", "off", "no"}
+
+    xlsx_entries: list[dict[str, Any]] = []
+    if generate_final_xlsx and xlsx_sources and xlsx_translation_map:
+        if len(xlsx_sources) == 1:
+            src = xlsx_sources[0]
+            res = apply_xlsx_translation_map(
+                source_xlsx=src,
+                output_xlsx=final_xlsx,
+                translation_map_entries=xlsx_translation_map,
+                beautify=beautify_xlsx_enabled,
+            )
+            xlsx_entries.append({"name": final_xlsx.name, "path": str(final_xlsx.resolve()), "source_path": str(src), "apply_result": res})
+        else:
+            for src in xlsx_sources:
+                out_path = review / f"{src.stem}_translated.xlsx"
+                res = apply_xlsx_translation_map(
+                    source_xlsx=src,
+                    output_xlsx=out_path,
+                    translation_map_entries=xlsx_translation_map,
+                    beautify=beautify_xlsx_enabled,
+                )
+                xlsx_entries.append({"name": out_path.name, "path": str(out_path.resolve()), "source_path": str(src), "apply_result": res})
+    elif generate_final_xlsx:
         _write_xlsx(final_xlsx, final_text=final_text, change_log_points=change_log_points)
 
     plan_write = {
@@ -217,6 +255,13 @@ def write_artifacts(
         "double_pass": double_pass,
         "status_flags": status_flags,
         "candidate_files": candidate_files,
+        "pipeline_version": str(
+            (plan_payload.get("plan") or {}).get("pipeline_version")
+            or (plan_payload.get("meta") or {}).get("pipeline_version")
+            or ""
+        ).strip(),
+        "markdown_policy": (plan_payload.get("meta") or {}).get("markdown_policy") or {},
+        "vision_policy": (plan_payload.get("meta") or {}).get("vision_policy") or {},
         "plan_payload": plan_payload,
     }
     _write_json(execution_plan_json, plan_write)
@@ -224,11 +269,9 @@ def write_artifacts(
     _write_json(delta_summary_json, delta_pack)
     _write_json(model_scores_json, model_scores)
 
-    manifest = {
+    manifest: dict[str, Any] = {
         "final_docx": str(final_docx.resolve()),
         "final_reflow_docx": str(final_reflow_docx.resolve()),
-        "draft_a_docx": str(draft_a_docx.resolve()),
-        "draft_b_docx": str(draft_b_docx.resolve()),
         "review_brief_docx": str(review_brief_docx.resolve()),
         "change_log_md": str(change_log_md.resolve()),
         "execution_plan_json": str(execution_plan_json.resolve()),
@@ -236,6 +279,11 @@ def write_artifacts(
         "delta_summary_json": str(delta_summary_json.resolve()),
         "model_scores_json": str(model_scores_json.resolve()),
     }
-    if generate_final_xlsx:
+    if xlsx_entries and len(xlsx_entries) == 1 and xlsx_entries[0]["name"] == final_xlsx.name:
+        manifest["final_xlsx"] = str(final_xlsx.resolve())
+        manifest["xlsx_files"] = xlsx_entries
+    elif xlsx_entries:
+        manifest["xlsx_files"] = xlsx_entries
+    elif generate_final_xlsx:
         manifest["final_xlsx"] = str(final_xlsx.resolve())
     return manifest

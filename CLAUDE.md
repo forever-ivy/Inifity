@@ -65,8 +65,8 @@ Both feed into `openclaw_v4_dispatcher.py`, the unified CLI dispatcher with subc
 2. **KB sync** (`v4_kb.sync_kb_with_rag`) — indexes glossary/previously-translated/source docs into local SQLite chunks + ClawRAG vector store
 3. **KB retrieve** (`v4_kb.retrieve_kb_with_fallback`) — queries ClawRAG first, falls back to local weighted search
 4. **Intent classification** (`openclaw_translation_orchestrator.run` with `plan_only=True`) — classifies task type (REVISION_UPDATE, NEW_TRANSLATION, etc.) and checks for missing inputs
-5. **Translation execution** (`openclaw_translation_orchestrator.run`) — up to 3 rounds of Codex translation + Gemini review with quality gating
-6. **Artifact writing** (`openclaw_artifact_writer.write_artifacts`) — produces Final.docx, Draft A/B, Review Brief, Change Log, etc. into `_VERIFY/{job_id}`
+5. **Translation execution** (`openclaw_translation_orchestrator.run`) — up to 3 rounds of GPT-5.2 translation + (optional) GLM second-generator candidate + Gemini review
+6. **Artifact writing** (`openclaw_artifact_writer.write_artifacts`) — produces Final.docx, Final-Reflow.docx, Review Brief, Change Log, etc. into `_VERIFY/{job_id}`
 7. **Quality gate** (`openclaw_quality_gate.evaluate_quality`) — checks terminology hit rate, structure fidelity, purity, numbering against thresholds
 
 ### Command protocol (strict mode)
@@ -92,9 +92,11 @@ SQLite database (kept local at `~/.openclaw/runtime/translation/state.sqlite` wh
 
 ### Environment
 
-Two env files:
-- `.env` — core paths, n8n legacy IDs, OpenClaw connection, notification targets
-- `.env.v4.local` — V4+ specific: work/kb roots, IMAP credentials, RAG backend config, strict router flags
+Primary env file:
+- `.env.v4.local` — work/kb roots, IMAP credentials, RAG backend config, strict router flags (local only; never commit)
+
+Legacy:
+- `.env` is deprecated/ignored (was used for old n8n/WhatsApp wiring)
 
 Key env vars: `OPENCLAW_STRICT_ROUTER`, `OPENCLAW_REQUIRE_NEW`, `OPENCLAW_RAG_BACKEND`, `OPENCLAW_TRANSLATION_THINKING` (reasoning level: off/minimal/low/medium/high), `TELEGRAM_DIRECT_MODE` (1=bypass OpenClaw for Telegram send), `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_CHAT_IDS`.
 

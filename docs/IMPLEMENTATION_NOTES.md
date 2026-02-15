@@ -12,32 +12,41 @@
    - primary: `clawrag`
    - fallback: local sqlite KB retrieval (`rag_fallback_local` flag)
 6. Execution uses real Codex + Gemini 3-round loop:
-   - Codex draft
+   - GPT-5.2 generator (via `OPENCLAW_CODEX_AGENT`, default `translator-core`)
+   - Optional GLM second generator candidate (via `OPENCLAW_GLM_GENERATOR_AGENT`)
    - Gemini review
-   - Codex revision
-   - Gemini re-review
+   - GPT-5.2 revision (only when findings exist)
+   - Gemini re-review (only when a revision was applied)
 7. Output path is `_VERIFY/{job_id}` only.
-8. `ok` is still status-only (`verified`), no auto-delivery copy.
-9. Contextual command interface:
+8. Verify bundle no longer emits Draft artifacts (only `Final.docx` + `Final-Reflow.docx`).
+9. `ok` marks `verified` and archives user-uploaded FINAL file(s) into KB reference (still no auto-delivery copy).
+10. Contextual command interface:
    - `new | run | status | ok | no {reason} | rerun`
-10. Sender-active-job mapping remains persisted in SQLite.
-11. WhatsApp strict router mode remains:
+11. Sender-active-job mapping remains persisted in SQLite.
+12. WhatsApp strict router mode remains:
    - route inbound task messages to dispatcher, not free-form chat
    - extract `[media attached: ...]` local file paths
    - strip inline `<file ...>` blocks to reduce token pressure
-12. Translation model calls enforce `--thinking high` by default:
+13. Translation model calls enforce `--thinking high` by default:
    - env override: `OPENCLAW_TRANSLATION_THINKING`
-13. Execution metadata includes:
+14. Execution metadata includes:
    - `thinking_level`
    - `router_mode`
    - `token_guard_applied`
    - `knowledge_backend`
-14. Added spreadsheet-aware execution:
+15. Added spreadsheet-aware execution:
    - task type `SPREADSHEET_TRANSLATION`
-   - optional output `Final.xlsx`
-15. Setup script now installs pinned first-batch community skills from:
+   - format-preserving `.xlsx` output by applying a cell translation map into a copy of the source workbook
+   - output is:
+     - `Final.xlsx` (single input workbook), or
+     - `*_translated.xlsx` (one per input workbook when multiple `.xlsx` inputs)
+   - optional Gemini Vision format QA (multi-sheet) when `OPENCLAW_FORMAT_QA_ENABLED=1`:
+     - format fidelity gates pass/fail
+     - aesthetics is reported as warnings (fidelity > aesthetics)
+16. Setup script now installs pinned first-batch community skills from:
    - `config/skill-lock.v6.json`
-16. Cron jobs continue to use `--no-deliver` to avoid noisy delivery-target errors.
+17. Cron jobs continue to use `--no-deliver` to avoid noisy delivery-target errors.
+18. Optional DOCX Vision QA (layout + aesthetics) when `OPENCLAW_DOCX_QA_ENABLED=1`.
 
 ## First-batch skill lock
 
@@ -102,7 +111,31 @@ Legacy command aliases remain:
 
 ## Known tradeoff
 
-The preserve-mode DOCX writer currently applies sequential text replacement into template paragraphs/cells to keep layout as much as possible. For heavily complex tables, final manual validation is still required (by design of V5.2 human-in-the-loop policy).
+The preserve-mode DOCX writer replaces paragraph/cell text in-place using a translation map and keeps run formatting best-effort by reusing existing runs. For complex inline styling and deeply nested tables, final manual validation is still required (by design of V5.2 human-in-the-loop policy).
+
+## Vision QA knobs
+
+XLSX Vision QA:
+- `OPENCLAW_FORMAT_QA_ENABLED=1` to enable
+- `OPENCLAW_FORMAT_QA_THRESHOLD` (default `0.85`) for format fidelity pass/fail
+- `OPENCLAW_FORMAT_QA_SHEETS_MAX` (default `6`) limits compared sheets
+- `OPENCLAW_FORMAT_QA_MAX_RETRIES` (default `2`) limits auto-fix retries
+
+DOCX Vision QA:
+- `OPENCLAW_DOCX_QA_ENABLED=1` to enable
+- `OPENCLAW_DOCX_QA_PAGES_MAX` (default `6`) limits compared pages
+- `OPENCLAW_DOCX_QA_THRESHOLD` (defaults to `OPENCLAW_FORMAT_QA_THRESHOLD`) for format fidelity pass/fail
+
+Shared:
+- `OPENCLAW_VISION_AESTHETICS_WARN_THRESHOLD` (default `0.7`) for aesthetics warnings (never blocks by itself)
+- Requires LibreOffice (`soffice`) on PATH and `GOOGLE_API_KEY` (or `GEMINI_API_KEY`) for Gemini Vision.
+
+## Preserve payload caps
+
+- `OPENCLAW_XLSX_TRANSLATION_MAX_CELLS` (default `2000`)
+- `OPENCLAW_XLSX_MAX_CHARS_PER_CELL` (default `400`)
+- `OPENCLAW_DOCX_TRANSLATION_MAX_UNITS` (default `1200`)
+- `OPENCLAW_DOCX_MAX_CHARS_PER_UNIT` (default `800`)
 
 ## New installer
 

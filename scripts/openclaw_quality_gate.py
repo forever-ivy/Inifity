@@ -21,6 +21,8 @@ class QualityThresholds:
     timeout_buffer_ratio: float = 1.3
     timeout_hard_cap_minutes: int = 45
     max_rounds: int = 3
+    format_fidelity_min: float = 0.85
+    format_qa_max_retries: int = 2
 
 
 def _safe_float(value: Any, fallback: float) -> float:
@@ -136,6 +138,7 @@ def evaluate_quality(
     model_scores: dict[str, Any],
     delta_pack: dict[str, Any],
     thresholds: QualityThresholds | None = None,
+    format_qa_results: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     t = thresholds or QualityThresholds()
 
@@ -147,12 +150,23 @@ def evaluate_quality(
         judge_margin < t.judge_margin or term_hit < t.term_hit or critical_changed
     )
 
-    return {
+    # Check format fidelity from QA results
+    if format_qa_results:
+        for _fname, qa in format_qa_results.items():
+            score = _safe_float(qa.get("format_fidelity_score"), 1.0)
+            if score < t.format_fidelity_min:
+                expansion_used = True
+                break
+
+    result: dict[str, Any] = {
         "judge_margin": round(judge_margin, 4),
         "term_hit": round(term_hit, 4),
         "critical_section_changed": critical_changed,
         "expansion_used": expansion_used,
     }
+    if format_qa_results:
+        result["format_qa_results"] = format_qa_results
+    return result
 
 
 def main() -> int:

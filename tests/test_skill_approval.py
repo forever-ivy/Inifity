@@ -7,7 +7,15 @@ from unittest.mock import patch
 
 from scripts.skill_approval import handle_command
 from scripts.v4_pipeline import create_job
-from scripts.v4_runtime import db_connect, ensure_runtime_paths, get_job
+from scripts.v4_runtime import (
+    add_job_final_upload,
+    db_connect,
+    ensure_runtime_paths,
+    get_job,
+    set_job_kb_company,
+    update_job_status,
+    set_sender_active_job,
+)
 
 
 class SkillApprovalTest(unittest.TestCase):
@@ -77,6 +85,16 @@ class SkillApprovalTest(unittest.TestCase):
                 job_id=job_id,
                 work_root=work_root,
             )
+            paths = ensure_runtime_paths(work_root)
+            review_dir = paths.review_root / job_id
+            final_dir = review_dir / "FinalUploads"
+            final_dir.mkdir(parents=True, exist_ok=True)
+            final_file = final_dir / "MyFinal.docx"
+            final_file.write_text("final", encoding="utf-8")
+            conn = db_connect(paths)
+            set_job_kb_company(conn, job_id=job_id, kb_company="Eventranz")
+            add_job_final_upload(conn, job_id=job_id, sender="+8613", path=final_file)
+            conn.close()
 
             result = handle_command(
                 command_text="ok",
@@ -89,13 +107,14 @@ class SkillApprovalTest(unittest.TestCase):
             self.assertTrue(result["ok"])
             self.assertEqual(result["status"], "verified")
 
-            paths = ensure_runtime_paths(work_root)
             conn = db_connect(paths)
             job = get_job(conn, job_id)
             conn.close()
             self.assertEqual(job["status"], "verified")
             delivered = list((work_root / "Translated -EN").glob("*.docx"))
             self.assertEqual(len(delivered), 0)
+            archived = list((kb_root / "30_Reference" / "Eventranz").rglob("MyFinal.docx"))
+            self.assertEqual(len(archived), 1)
 
     @patch("scripts.skill_approval.send_message")
     def test_no_marks_needs_revision(self, mocked_send):
@@ -133,6 +152,81 @@ class SkillApprovalTest(unittest.TestCase):
             job = get_job(conn, job_id)
             conn.close()
             self.assertEqual(job["status"], "needs_revision")
+
+    @patch("scripts.skill_approval.send_message")
+    def test_status_finds_review_ready_job_with_require_new(self, mocked_send):
+        """status should find a review_ready job even when OPENCLAW_REQUIRE_NEW=1."""
+        mocked_send.return_value = {"ok": True}
+        with tempfile.TemporaryDirectory() as tmp:
+            work_root = Path(tmp) / "Translation Task"
+            kb_root = Path(tmp) / "Knowledge Repository"
+            kb_root.mkdir(parents=True, exist_ok=True)
+            job_id = "job_test_status_rr"
+            inbox = work_root / "_INBOX" / "telegram" / job_id
+            inbox.mkdir(parents=True, exist_ok=True)
+            create_job(
+                source="telegram",
+                sender="+8613",
+                subject="Test",
+                message_text="",
+                inbox_dir=inbox,
+                job_id=job_id,
+                work_root=work_root,
+            )
+            paths = ensure_runtime_paths(work_root)
+            conn = db_connect(paths)
+            update_job_status(conn, job_id=job_id, status="review_ready", errors=[])
+            set_sender_active_job(conn, sender="+8613", job_id=job_id)
+            conn.close()
+
+            with patch.dict("os.environ", {"OPENCLAW_REQUIRE_NEW": "1"}, clear=False):
+                result = handle_command(
+                    command_text="status",
+                    work_root=work_root,
+                    kb_root=kb_root,
+                    target="+8613",
+                    sender="+8613",
+                    dry_run_notify=True,
+                )
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["job_id"], job_id)
+            self.assertEqual(result["status"], "review_ready")
+
+    @patch("scripts.skill_approval.send_message")
+    def test_new_cleans_empty_previous_review_folder(self, mocked_send):
+        """Sending 'new' should remove the previous job's empty _VERIFY folder."""
+        mocked_send.return_value = {"ok": True}
+        with tempfile.TemporaryDirectory() as tmp:
+            work_root = Path(tmp) / "Translation Task"
+            kb_root = Path(tmp) / "Knowledge Repository"
+            kb_root.mkdir(parents=True, exist_ok=True)
+
+            # Create first job with an empty review folder
+            first_result = handle_command(
+                command_text="new first task",
+                work_root=work_root,
+                kb_root=kb_root,
+                target="+8613",
+                sender="+8613",
+                dry_run_notify=True,
+            )
+            first_job_id = first_result["job_id"]
+            paths = ensure_runtime_paths(work_root)
+            review_dir = paths.review_root / first_job_id
+            # Ensure review dir exists but has only .system
+            (review_dir / ".system").mkdir(parents=True, exist_ok=True)
+            self.assertTrue(review_dir.is_dir())
+
+            # Create second job — should clean up the empty first review folder
+            handle_command(
+                command_text="new second task",
+                work_root=work_root,
+                kb_root=kb_root,
+                target="+8613",
+                sender="+8613",
+                dry_run_notify=True,
+            )
+            self.assertFalse(review_dir.exists())
 
 
 if __name__ == "__main__":

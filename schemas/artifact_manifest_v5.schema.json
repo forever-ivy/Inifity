@@ -5,19 +5,32 @@
   "required": [
     "final_docx",
     "final_reflow_docx",
-    "draft_a_docx",
-    "draft_b_docx",
     "review_brief_docx",
     "change_log_md"
   ],
   "properties": {
     "final_docx": { "type": "string" },
     "final_reflow_docx": { "type": "string" },
-    "draft_a_docx": { "type": "string" },
-    "draft_b_docx": { "type": "string" },
     "review_brief_docx": { "type": "string" },
     "change_log_md": { "type": "string" },
+    "final_xlsx": { "type": "string" },
+    "xlsx_files": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "path", "source_path"],
+        "properties": {
+          "name": { "type": "string" },
+          "path": { "type": "string" },
+          "source_path": { "type": "string" },
+          "apply_result": { "type": "object" }
+        },
+        "additionalProperties": true
+      }
+    },
     "execution_plan_json": { "type": "string" },
-    "quality_report_json": { "type": "string" }
+    "quality_report_json": { "type": "string" },
+    "delta_summary_json": { "type": "string" },
+    "model_scores_json": { "type": "string" }
   }
 }

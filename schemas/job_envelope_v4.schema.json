@@ -6,7 +6,7 @@
   "required": ["job_id", "source", "status", "created_at"],
   "properties": {
     "job_id": {"type": "string"},
-    "source": {"type": "string", "enum": ["email", "whatsapp"]},
+    "source": {"type": "string", "enum": ["email", "telegram"]},
     "from": {"type": "string"},
     "subject": {"type": "string"},
     "message_text": {"type": "string"},

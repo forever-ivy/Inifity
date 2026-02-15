@@ -9,15 +9,18 @@ from datetime import UTC, datetime, timedelta
 import json
 import os
 import shutil
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Any
 
-from scripts.skill_approval import handle_command
+from scripts.skill_approval import handle_command, handle_interaction_reply
 from scripts.v4_pipeline import attach_file_to_job, create_job, run_job_pipeline
 from scripts.v4_runtime import (
     DEFAULT_KB_ROOT,
     DEFAULT_NOTIFY_TARGET,
     DEFAULT_WORK_ROOT,
+    add_job_final_upload,
     db_connect,
     ensure_runtime_paths,
     get_job,
@@ -128,7 +131,7 @@ def _find_recent_collecting_job(*, work_root: Path, sender: str, window_seconds:
             """
             SELECT job_id, updated_at
             FROM jobs
-            WHERE source IN ('telegram', 'whatsapp')
+            WHERE source IN ('telegram')
               AND sender=?
               AND status IN ('collecting', 'received', 'missing_inputs', 'needs_revision')
             ORDER BY updated_at DESC
@@ -161,6 +164,24 @@ def _find_active_collecting_job(*, work_root: Path, sender: str) -> str | None:
         if not job:
             return None
         if str(job.get("status") or "") in {"collecting", "received", "missing_inputs", "needs_revision"}:
+            return str(job["job_id"])
+        return None
+    finally:
+        conn.close()
+
+
+def _find_active_post_run_job(*, work_root: Path, sender: str) -> str | None:
+    """Allow uploading FINAL files for a job that already finished execution."""
+    paths = ensure_runtime_paths(work_root)
+    conn = db_connect(paths)
+    try:
+        active_job_id = get_sender_active_job(conn, sender=sender)
+        if not active_job_id:
+            return None
+        job = get_job(conn, active_job_id)
+        if not job:
+            return None
+        if str(job.get("status") or "") in {"review_ready", "needs_attention"}:
             return str(job["job_id"])
         return None
     finally:
@@ -222,6 +243,92 @@ def _notify_target(*, target: str, message: str, dry_run: bool = False) -> dict[
     return send_message(target=target, message=message, dry_run=dry_run)
 
 
+def _is_http_url(value: str) -> bool:
+    v = (value or "").strip().lower()
+    return v.startswith("http://") or v.startswith("https://")
+
+
+def _attachment_url(item: dict[str, Any]) -> str:
+    for key in ("mediaUrl", "media_url", "url"):
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _safe_basename(name: str) -> str:
+    base = Path(str(name or "attachment")).name.strip()
+    if base in {"", ".", ".."}:
+        return "attachment"
+    return base
+
+
+def _infer_suffix_from_mime(mime: str) -> str:
+    m = (mime or "").strip().lower()
+    if not m:
+        return ""
+    if "spreadsheetml" in m or "ms-excel" in m:
+        return ".xlsx"
+    if "wordprocessingml" in m:
+        return ".docx"
+    if "text/csv" in m or m.endswith("/csv") or "csv" == m:
+        return ".csv"
+    return ""
+
+
+def _download_to_path(url: str, *, dest: Path, max_bytes: int, timeout_seconds: int) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    req = urllib.request.Request(url, headers={"User-Agent": "openclaw/translation-ingest"})
+    with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+        length = resp.headers.get("Content-Length")
+        if length:
+            try:
+                if int(length) > max_bytes:
+                    raise ValueError("download_too_large")
+            except ValueError:
+                pass
+        total = 0
+        with open(dest, "wb") as fh:
+            while True:
+                chunk = resp.read(1024 * 64)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise ValueError("download_too_large")
+                fh.write(chunk)
+
+
+def _save_attachment_to_path(item: dict[str, Any], *, target_path: Path) -> tuple[bool, str]:
+    if item.get("path"):
+        src = Path(str(item["path"])).expanduser()
+        if not src.exists():
+            return False, "missing_path"
+        shutil.copy2(src, target_path)
+        return True, "copied_path"
+    if item.get("local_path"):
+        src = Path(str(item["local_path"])).expanduser()
+        if not src.exists():
+            return False, "missing_local_path"
+        shutil.copy2(src, target_path)
+        return True, "copied_local_path"
+    if item.get("content_base64"):
+        target_path.write_bytes(base64.b64decode(str(item["content_base64"]).encode("utf-8")))
+        return True, "decoded_base64"
+
+    url = _attachment_url(item)
+    if url and _is_http_url(url):
+        suffix = target_path.suffix.lower()
+        if suffix not in {".xlsx", ".docx", ".csv"}:
+            return False, f"download_blocked_suffix:{suffix or 'none'}"
+        max_mb = int(os.getenv("OPENCLAW_ATTACHMENT_DOWNLOAD_MAX_MB", "35"))
+        timeout_seconds = int(os.getenv("OPENCLAW_ATTACHMENT_DOWNLOAD_TIMEOUT_SECONDS", "60"))
+        max_bytes = max(1, max_mb) * 1024 * 1024
+        _download_to_path(url, dest=target_path, max_bytes=max_bytes, timeout_seconds=timeout_seconds)
+        return True, "downloaded_url"
+    return False, "unsupported_attachment"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--payload-json")
@@ -232,7 +339,8 @@ def main() -> int:
     parser.add_argument("--notify-target", default=DEFAULT_NOTIFY_TARGET)
     parser.add_argument("--auto-run", action="store_true")
     parser.add_argument("--dry-run-notify", action="store_true")
-    parser.add_argument("--bundle-window-seconds", type=int, default=int(os.getenv("V4_WA_BUNDLE_WINDOW_SECONDS", "900")))
+    bundle_window_default = int(os.getenv("V4_BUNDLE_WINDOW_SECONDS", "900"))
+    parser.add_argument("--bundle-window-seconds", type=int, default=bundle_window_default)
     args = parser.parse_args()
 
     payload = _load_payload(args)
@@ -247,6 +355,20 @@ def main() -> int:
 
     attachments = _collect_attachments(payload)
     require_new = _require_new_enabled()
+
+    # Numeric replies may be interaction selections (e.g., company menu).
+    if text.strip().isdigit() and not attachments:
+        interaction = handle_interaction_reply(
+            reply_text=text.strip(),
+            work_root=work_root,
+            kb_root=kb_root,
+            target=reply_target,
+            sender=sender,
+            dry_run_notify=args.dry_run_notify,
+        )
+        if interaction.get("ok") or interaction.get("error") in {"invalid_selection", "expired"}:
+            print(json.dumps({"ok": bool(interaction.get("ok")), "mode": "interaction_reply", "result": interaction}, ensure_ascii=False))
+            return 0 if interaction.get("ok") else 1
 
     bootstrap_job_id: str | None = None
     head = text.lower().strip().split(" ", 1)[0] if text.strip() else ""
@@ -274,6 +396,70 @@ def main() -> int:
         )
         print(json.dumps({"ok": bool(result.get("ok")), "mode": "command", "result": result}, ensure_ascii=False))
         return 0 if result.get("ok") else 1
+
+    # FINAL uploads: allow attaching files to the latest active post-run job.
+    if require_new and attachments:
+        post_run_job_id = _find_active_post_run_job(work_root=work_root, sender=sender)
+        if post_run_job_id:
+            paths = ensure_runtime_paths(work_root)
+            conn = db_connect(paths)
+            job = get_job(conn, post_run_job_id)
+            conn.close()
+            if job:
+                review_dir = Path(str(job.get("review_dir") or "")).expanduser().resolve()
+                dest_dir = review_dir / "FinalUploads"
+                dest_dir.mkdir(parents=True, exist_ok=True)
+
+                saved_files: list[str] = []
+                failures: list[str] = []
+                for idx, item in enumerate(attachments, start=1):
+                    url = _attachment_url(item)
+                    mime_hint = str(item.get("mime_type") or item.get("mimeType") or "")
+                    file_name = _safe_basename(
+                        item.get("name")
+                        or item.get("fileName")
+                        or (Path(urllib.parse.urlparse(url).path).name if url else "")
+                        or f"final_upload_{idx}"
+                    )
+                    if url and not Path(file_name).suffix:
+                        inferred = _infer_suffix_from_mime(mime_hint)
+                        if inferred:
+                            file_name = f"{file_name}{inferred}"
+                    target_path = dest_dir / file_name
+                    if target_path.exists():
+                        stem = target_path.stem
+                        suffix = target_path.suffix
+                        target_path = dest_dir / f"{stem}_{idx}_{int(datetime.now(UTC).timestamp())}{suffix}"
+                    ok, reason = _save_attachment_to_path(item, target_path=target_path)
+                    if not ok:
+                        failures.append(f"{file_name}:{reason}")
+                        continue
+
+                    conn = db_connect(paths)
+                    add_job_final_upload(conn, job_id=post_run_job_id, sender=sender, path=target_path)
+                    conn.close()
+                    saved_files.append(str(target_path.resolve()))
+
+                _notify_target(
+                    target=reply_target,
+                    message=(
+                        f"\U0001f4ce Final file(s) received: {len(saved_files)}\nSend: ok to archive"
+                        + (f"\n\u26a0\ufe0f Failed: {', '.join(failures[:3])}" if failures else "")
+                    ),
+                    dry_run=args.dry_run_notify,
+                )
+                print(
+                    json.dumps(
+                        {
+                            "ok": True,
+                            "mode": "final_uploads",
+                            "job_id": post_run_job_id,
+                            "saved_files": saved_files,
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+                return 0
 
     existing_job_id = bootstrap_job_id or (_find_active_collecting_job(work_root=work_root, sender=sender) if require_new else _find_recent_collecting_job(
         work_root=work_root,
@@ -323,28 +509,28 @@ def main() -> int:
     (inbox_dir / ts_name).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     saved_files: list[str] = []
+    failures: list[str] = []
     for idx, item in enumerate(attachments, start=1):
-        file_name = item.get("name") or item.get("fileName") or f"tg_attachment_{idx}"
+        url = _attachment_url(item)
+        mime_hint = str(item.get("mime_type") or item.get("mimeType") or "")
+        file_name = _safe_basename(
+            item.get("name")
+            or item.get("fileName")
+            or (Path(urllib.parse.urlparse(url).path).name if url else "")
+            or f"tg_attachment_{idx}"
+        )
+        if url and not Path(file_name).suffix:
+            inferred = _infer_suffix_from_mime(mime_hint)
+            if inferred:
+                file_name = f"{file_name}{inferred}"
         target_path = inbox_dir / file_name
         if target_path.exists():
             stem = target_path.stem
             suffix = target_path.suffix
             target_path = inbox_dir / f"{stem}_{idx}_{int(datetime.now(UTC).timestamp())}{suffix}"
-        if item.get("path"):
-            src = Path(str(item["path"])).expanduser()
-            if src.exists():
-                shutil.copy2(src, target_path)
-            else:
-                continue
-        elif item.get("local_path"):
-            src = Path(str(item["local_path"])).expanduser()
-            if src.exists():
-                shutil.copy2(src, target_path)
-            else:
-                continue
-        elif item.get("content_base64"):
-            target_path.write_bytes(base64.b64decode(item["content_base64"].encode("utf-8")))
-        else:
+        ok, reason = _save_attachment_to_path(item, target_path=target_path)
+        if not ok:
+            failures.append(f"{file_name}:{reason}")
             continue
         attach_file_to_job(work_root=work_root, job_id=job_id, path=target_path)
         saved_files.append(str(target_path.resolve()))
@@ -355,7 +541,7 @@ def main() -> int:
     if should_run:
         _notify_target(
             target=reply_target,
-            message=f"\U0001f680 Starting execution\n\U0001f194 {job_id}",
+            message=f"\U0001f680 Starting execution\n\u23f3 Codex+Gemini translating\u2026",
             dry_run=args.dry_run_notify,
         )
         run_result = run_job_pipeline(
@@ -375,6 +561,7 @@ def main() -> int:
         "raw_message_ref": raw_message_ref,
         "token_guard_applied": token_guard_applied,
         "saved_files": saved_files,
+        "attachment_failures": failures,
         "docx_count": info.get("docx_count", 0),
         "files_count": info.get("files_count", 0),
         "status": "running" if should_run else "collecting",
@@ -388,4 +575,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

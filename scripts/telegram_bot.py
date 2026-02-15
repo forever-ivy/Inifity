@@ -9,6 +9,7 @@ message-event subcommand.
 from __future__ import annotations
 
 import json
+import re
 import logging
 import os
 import signal
@@ -17,9 +18,15 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
+
+try:  # POSIX-only
+    import fcntl  # type: ignore
+except Exception:  # pragma: no cover
+    fcntl = None
 
 logging.basicConfig(
     level=logging.INFO,
@@ -96,16 +103,21 @@ def tg_download_file(file_id: str, dest_dir: Path, bot_token: str = "") -> Path 
         return None
     file_path = info.get("result", {}).get("file_path", "")
     if not file_path:
+        log.error("getFile returned empty file_path for %s: %s", file_id, info)
         return None
-    download_url = f"https://api.telegram.org/file/bot{token}/{file_path}"
+    encoded_path = urllib.parse.quote(file_path, safe="/")
+    download_url = f"https://api.telegram.org/file/bot{token}/{encoded_path}"
     file_name = Path(file_path).name
     local_path = dest_dir / file_name
-    try:
-        urllib.request.urlretrieve(download_url, str(local_path))
-        return local_path
-    except (urllib.error.URLError, OSError) as exc:
-        log.error("Download failed for %s: %s", file_path, exc)
-        return None
+    for attempt in range(2):
+        try:
+            urllib.request.urlretrieve(download_url, str(local_path))
+            return local_path
+        except (urllib.error.URLError, OSError) as exc:
+            log.error("Download attempt %d failed for %s: %s", attempt + 1, file_path, exc)
+            if attempt == 0:
+                time.sleep(1)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +226,10 @@ def _handle_document(chat_id: str, message: dict[str, Any]) -> None:
 
 def _handle_text(chat_id: str, text: str) -> None:
     """Handle non-command text in strict mode."""
+    # Reject trivially short or punctuation-only text
+    if len(re.sub(r"\W+", "", text or "")) < 2:
+        tg_send(chat_id, "⚠️ Text too short — send a document or longer message")
+        return
     require_new = str(os.getenv("OPENCLAW_REQUIRE_NEW", "1")).strip().lower() not in {"0", "false", "off", "no"}
     if require_new:
         # Check if there's an active collecting job — if so, append text
@@ -305,30 +321,98 @@ def handle_update(update: dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 
 
+PID_FILE = Path(os.getenv(
+    "TELEGRAM_PID_FILE",
+    str(Path("~/.openclaw/runtime/translation/tg_bot.pid").expanduser()),
+))
+
+_pid_lock_handle: Any | None = None
+
+
+def _acquire_pid_lock() -> bool:
+    """Acquire a singleton lock. Returns True if lock acquired.
+
+    Prefer an OS-level file lock (flock) so we can reliably prevent multiple bot
+    instances even if the PID file is missing/stale or running under different
+    supervisors. Fallback to the older PID check if flock isn't available.
+    """
+    global _pid_lock_handle
+    PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if fcntl is not None:
+        handle = PID_FILE.open("a+", encoding="utf-8")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            handle.close()
+            log.error("Another instance is running (lock busy). Exiting.")
+            return False
+        # Keep the handle open for the lifetime of the process (lock is tied to FD).
+        handle.seek(0)
+        handle.truncate()
+        handle.write(str(os.getpid()))
+        handle.flush()
+        _pid_lock_handle = handle
+        return True
+
+    # Fallback: PID file check (less reliable).
+    if PID_FILE.exists():
+        try:
+            old_pid = int(PID_FILE.read_text().strip())
+            os.kill(old_pid, 0)  # Check if process is alive
+            log.error("Another instance is running (PID %d). Exiting.", old_pid)
+            return False
+        except (ValueError, ProcessLookupError, PermissionError):
+            log.info("Removing stale PID file (old PID gone)")
+    PID_FILE.write_text(str(os.getpid()))
+    return True
+
+
+def _release_pid_lock() -> None:
+    """Release the singleton lock on clean shutdown."""
+    global _pid_lock_handle
+    if _pid_lock_handle is not None:
+        try:
+            _pid_lock_handle.close()
+        except Exception:
+            pass
+        _pid_lock_handle = None
+
+
 def poll_loop() -> None:
     """Long-poll Telegram getUpdates in a loop."""
+    if not _acquire_pid_lock():
+        return
+
     offset = _load_offset()
     log.info("Starting Telegram bot poll loop (offset=%d, allowed=%s)", offset, ALLOWED_CHAT_IDS)
 
-    while _running:
-        params: dict[str, Any] = {"timeout": POLL_TIMEOUT, "allowed_updates": ["message"]}
-        if offset:
-            params["offset"] = offset
-        resp = tg_api("getUpdates", **params)
-        if not resp.get("ok"):
-            log.warning("getUpdates failed: %s", resp.get("description", "unknown"))
-            time.sleep(5)
-            continue
+    try:
+        while _running:
+            params: dict[str, Any] = {"timeout": POLL_TIMEOUT, "allowed_updates": ["message"]}
+            if offset:
+                params["offset"] = offset
+            resp = tg_api("getUpdates", **params)
+            if not resp.get("ok"):
+                if int(resp.get("error_code") or 0) == 409:
+                    # Telegram enforces single long-polling consumer. If we see a conflict,
+                    # another instance is alive; exit so we don't spam errors forever.
+                    log.error("getUpdates conflict (409) — another bot instance is running. Exiting.")
+                    return
+                log.warning("getUpdates failed: %s", resp.get("description", "unknown"))
+                time.sleep(5)
+                continue
 
-        updates = resp.get("result", [])
-        for update in updates:
-            update_id = update.get("update_id", 0)
-            try:
-                handle_update(update)
-            except Exception:
-                log.exception("Error handling update %s", update_id)
-            offset = update_id + 1
-            _save_offset(offset)
+            updates = resp.get("result", [])
+            for update in updates:
+                update_id = update.get("update_id", 0)
+                try:
+                    handle_update(update)
+                except Exception:
+                    log.exception("Error handling update %s", update_id)
+                offset = update_id + 1
+                _save_offset(offset)
+    finally:
+        _release_pid_lock()
 
 
 def main() -> int:

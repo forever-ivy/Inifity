@@ -126,6 +126,10 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             inbox_dir TEXT NOT NULL,
             review_dir TEXT NOT NULL,
             task_type TEXT DEFAULT '',
+            task_label TEXT DEFAULT '',
+            kb_company TEXT DEFAULT '',
+            archive_project TEXT DEFAULT '',
+            archived_at TEXT DEFAULT '',
             confidence REAL DEFAULT 0,
             estimated_minutes INTEGER DEFAULT 0,
             runtime_timeout_minutes INTEGER DEFAULT 0,
@@ -195,21 +199,57 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             updated_at TEXT NOT NULL,
             FOREIGN KEY(active_job_id) REFERENCES jobs(job_id) ON DELETE CASCADE
         );
+
+        CREATE TABLE IF NOT EXISTS job_interactions (
+            job_id TEXT PRIMARY KEY,
+            sender TEXT DEFAULT '',
+            pending_action TEXT DEFAULT '',
+            options_json TEXT DEFAULT '[]',
+            created_at TEXT NOT NULL,
+            expires_at TEXT DEFAULT '',
+            final_uploads_json TEXT DEFAULT '[]',
+            FOREIGN KEY(job_id) REFERENCES jobs(job_id) ON DELETE CASCADE
+        );
         """
     )
     conn.commit()
+    # Migrations for existing databases
+    try:
+        conn.execute("ALTER TABLE jobs ADD COLUMN task_label TEXT DEFAULT ''")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # column already exists
+
+    for ddl in [
+        "ALTER TABLE jobs ADD COLUMN kb_company TEXT DEFAULT ''",
+        "ALTER TABLE jobs ADD COLUMN archive_project TEXT DEFAULT ''",
+        "ALTER TABLE jobs ADD COLUMN archived_at TEXT DEFAULT ''",
+    ]:
+        try:
+            conn.execute(ddl)
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass
 
 
 def infer_source_group(path: Path, kb_root: Path | None = None) -> str:
     full = str(path).lower()
-    if "glossery" in full or "glossary" in full:
+    if "/00_glossary/" in full or "glossery" in full or "glossary" in full:
         return "glossary"
+    if "/10_style_guide/" in full:
+        return "glossary"
+    if "/20_domain_knowledge/" in full:
+        return "general"
+    if "/30_reference/" in full:
+        if "/final/" in full:
+            return "previously_translated"
+        return "general"
+    if "/40_templates/" in full:
+        return "general"
     if "previously translated" in full:
         return "previously_translated"
     if "translated -en" in full:
         return "translated_en"
-    if "arabic source" in full:
-        return "arabic_source"
     if kb_root and str(kb_root).lower() in full:
         return "general"
     return "general"
@@ -275,6 +315,7 @@ def write_job(
             now,
         ),
     )
+    ensure_job_interaction(conn, job_id=job_id, sender=sender)
     conn.commit()
 
 
@@ -324,14 +365,15 @@ def update_job_plan(
     confidence: float,
     estimated_minutes: int,
     runtime_timeout_minutes: int,
+    task_label: str = "",
 ) -> None:
     conn.execute(
         """
         UPDATE jobs
-        SET status=?, task_type=?, confidence=?, estimated_minutes=?, runtime_timeout_minutes=?, updated_at=?
+        SET status=?, task_type=?, task_label=?, confidence=?, estimated_minutes=?, runtime_timeout_minutes=?, updated_at=?
         WHERE job_id=?
         """,
-        (status, task_type, confidence, estimated_minutes, runtime_timeout_minutes, utc_now_iso(), job_id),
+        (status, task_type, task_label, confidence, estimated_minutes, runtime_timeout_minutes, utc_now_iso(), job_id),
     )
     conn.commit()
 
@@ -421,6 +463,106 @@ def set_sender_active_job(conn: sqlite3.Connection, *, sender: str, job_id: str)
             updated_at=excluded.updated_at
         """,
         (sender_norm, job_id, utc_now_iso()),
+    )
+    conn.commit()
+
+
+def ensure_job_interaction(conn: sqlite3.Connection, *, job_id: str, sender: str = "") -> None:
+    now = utc_now_iso()
+    conn.execute(
+        """
+        INSERT INTO job_interactions(job_id, sender, created_at)
+        VALUES(?,?,?)
+        ON CONFLICT(job_id) DO UPDATE SET
+            sender=excluded.sender
+        """,
+        (job_id, (sender or "").strip(), now),
+    )
+
+
+def get_job_interaction(conn: sqlite3.Connection, *, job_id: str) -> dict[str, Any] | None:
+    row = conn.execute("SELECT * FROM job_interactions WHERE job_id=?", (job_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def set_job_pending_action(
+    conn: sqlite3.Connection,
+    *,
+    job_id: str,
+    sender: str,
+    pending_action: str,
+    options: list[dict[str, Any]],
+    expires_at: str,
+) -> None:
+    ensure_job_interaction(conn, job_id=job_id, sender=sender)
+    conn.execute(
+        """
+        UPDATE job_interactions
+        SET pending_action=?, options_json=?, expires_at=?
+        WHERE job_id=?
+        """,
+        (pending_action, json.dumps(options, ensure_ascii=False), expires_at, job_id),
+    )
+    conn.commit()
+
+
+def clear_job_pending_action(conn: sqlite3.Connection, *, job_id: str) -> None:
+    conn.execute(
+        "UPDATE job_interactions SET pending_action='', options_json='[]', expires_at='' WHERE job_id=?",
+        (job_id,),
+    )
+    conn.commit()
+
+
+def add_job_final_upload(conn: sqlite3.Connection, *, job_id: str, sender: str, path: Path) -> None:
+    ensure_job_interaction(conn, job_id=job_id, sender=sender)
+    row = conn.execute("SELECT final_uploads_json FROM job_interactions WHERE job_id=?", (job_id,)).fetchone()
+    existing: list[str] = []
+    if row:
+        try:
+            existing = json.loads(str(row["final_uploads_json"] or "[]"))
+        except json.JSONDecodeError:
+            existing = []
+    existing.append(str(path.resolve()))
+    conn.execute(
+        "UPDATE job_interactions SET final_uploads_json=? WHERE job_id=?",
+        (json.dumps(existing, ensure_ascii=False), job_id),
+    )
+    conn.commit()
+
+
+def list_job_final_uploads(conn: sqlite3.Connection, *, job_id: str) -> list[str]:
+    row = conn.execute("SELECT final_uploads_json FROM job_interactions WHERE job_id=?", (job_id,)).fetchone()
+    if not row:
+        return []
+    try:
+        value = json.loads(str(row["final_uploads_json"] or "[]"))
+        return [str(x) for x in value if str(x).strip()]
+    except json.JSONDecodeError:
+        return []
+
+
+def set_job_kb_company(conn: sqlite3.Connection, *, job_id: str, kb_company: str) -> None:
+    conn.execute(
+        "UPDATE jobs SET kb_company=?, updated_at=? WHERE job_id=?",
+        ((kb_company or "").strip(), utc_now_iso(), job_id),
+    )
+    conn.commit()
+
+
+def set_job_archive_project(conn: sqlite3.Connection, *, job_id: str, archive_project: str) -> None:
+    conn.execute(
+        "UPDATE jobs SET archive_project=?, updated_at=? WHERE job_id=?",
+        ((archive_project or "").strip(), utc_now_iso(), job_id),
+    )
+    conn.commit()
+
+
+def mark_job_archived(conn: sqlite3.Connection, *, job_id: str) -> None:
+    now = utc_now_iso()
+    conn.execute(
+        "UPDATE jobs SET archived_at=?, updated_at=? WHERE job_id=?",
+        (now, now, job_id),
     )
     conn.commit()
 
@@ -571,9 +713,6 @@ def send_message(
         except json.JSONDecodeError:
             pass
     return payload
-
-
-send_whatsapp_message = send_message  # backward compat alias
 
 
 def json_dumps(value: Any) -> str:

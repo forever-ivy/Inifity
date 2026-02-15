@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="/Users/Code/workflow/translation"
 WORKSPACE_DIR="${OPENCLAW_WORKSPACE_DIR:-$ROOT_DIR}"
-PRIMARY_MODEL="${OPENCLAW_PRIMARY_MODEL:-openai-codex/gpt-5.3-codex}"
+PRIMARY_MODEL="${OPENCLAW_PRIMARY_MODEL:-openai-codex/gpt-5.2-codex}"
 FALLBACK_MODEL="${OPENCLAW_FALLBACK_MODEL:-google/gemini-2.5-pro}"
 OPENCLAW_WORKSPACE_SKILL_ROOT="${OPENCLAW_WORKSPACE_SKILL_ROOT:-$HOME/.openclaw/workspace}"
 SKILL_LOCK_FILE="${SKILL_LOCK_FILE:-$ROOT_DIR/config/skill-lock.v6.json}"
@@ -79,6 +79,11 @@ ensure_agent "translator-core" "$PRIMARY_MODEL"
 ensure_agent "review-core" "$FALLBACK_MODEL"
 ensure_agent "qa-gate" "$PRIMARY_MODEL"
 
+GLM_MODEL="${OPENCLAW_GLM_MODEL:-zhipu/glm-5}"
+if [[ "${OPENCLAW_GLM_ENABLED:-0}" == "1" ]]; then
+  ensure_agent "glm-reviewer" "$GLM_MODEL"
+fi
+
 echo "Configuring model routing..."
 openclaw models set "$PRIMARY_MODEL"
 openclaw models fallbacks clear || true
@@ -121,5 +126,5 @@ echo "V4 setup complete."
 echo "Next:"
 echo "1) Create $ROOT_DIR/.env.v4.local with IMAP credentials."
 echo "2) chmod +x scripts/run_v4_email_poll.sh scripts/run_v4_pending_reminder.sh scripts/setup_openclaw_v4.sh"
-echo "3) Install strict WhatsApp router skill: ./scripts/install_openclaw_translation_skill.sh"
+echo "3) Install strict Telegram router skill: ./scripts/install_openclaw_translation_skill.sh"
 echo "4) Check health: openclaw health --json"

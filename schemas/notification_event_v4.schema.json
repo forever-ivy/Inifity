@@ -7,7 +7,7 @@
   "properties": {
     "job_id": {"type": "string"},
     "milestone": {"type": "string"},
-    "channel": {"type": "string", "enum": ["whatsapp"]},
+    "channel": {"type": "string", "enum": ["telegram"]},
     "message": {"type": "string"},
     "sent_at": {"type": "string"},
     "meta": {"type": "object"}

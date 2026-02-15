@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from docx import Document
 
-from scripts.openclaw_translation_orchestrator import _agent_call, run
+from scripts.openclaw_translation_orchestrator import _agent_call, _available_slots, run
 
 
 def _make_docx(path: Path, text: str) -> None:
@@ -43,6 +43,32 @@ class OpenClawTranslationOrchestratorTest(unittest.TestCase):
         self.assertIn("--thinking", called_cmd)
         self.assertIn("high", called_cmd)
 
+    @patch("scripts.openclaw_translation_orchestrator.subprocess.run")
+    def test_agent_call_parses_embedded_stdout_with_log_prefix(self, mocked_run):
+        # Newer OpenClaw runtimes may emit a non-JSON log line prefix and return a
+        # top-level payload structure (no "result" wrapper).
+        stdout = (
+            "[agent/embedded] google tool schema snapshot\n"
+            "{\n"
+            "  \"payloads\": [\n"
+            "    {\n"
+            "      \"text\": \"{\\\"hello\\\": \\\"world\\\"}\",\n"
+            "      \"mediaUrl\": null\n"
+            "    }\n"
+            "  ],\n"
+            "  \"meta\": {\"durationMs\": 1}\n"
+            "}\n"
+        )
+        mocked_run.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=stdout,
+            stderr="",
+        )
+        out = _agent_call("translator-core", "ping", timeout_seconds=90)
+        self.assertTrue(out.get("ok"))
+        self.assertEqual(out.get("text"), '{"hello": "world"}')
+
     @patch("scripts.openclaw_translation_orchestrator._agent_call")
     def test_revision_update_reaches_review_ready(self, mocked_call):
         with tempfile.TemporaryDirectory() as tmp:
@@ -60,7 +86,7 @@ class OpenClawTranslationOrchestratorTest(unittest.TestCase):
                         "task_type": "REVISION_UPDATE",
                         "source_language": "ar",
                         "target_language": "en",
-                        "required_inputs": ["arabic_old", "arabic_new", "english_baseline"],
+                        "required_inputs": ["source_old", "source_new", "target_baseline"],
                         "missing_inputs": [],
                         "confidence": 0.97,
                         "reasoning_summary": "Detected AR v1+v2 and EN baseline.",
@@ -68,12 +94,12 @@ class OpenClawTranslationOrchestratorTest(unittest.TestCase):
                         "complexity_score": 34,
                     }
                 ),
+                # Codex candidate
                 _agent_ok(
                     {
-                        "draft_a_text": "Draft A content",
-                        "draft_b_text": "Draft B content",
                         "final_text": "Final content",
                         "final_reflow_text": "Final reflow",
+                        "docx_translation_map": [{"id": "p:1", "text": "Final content"}],
                         "review_brief_points": ["Review numbering."],
                         "change_log_points": ["Applied Arabic V2 changes."],
                         "resolved": [],
@@ -82,9 +108,24 @@ class OpenClawTranslationOrchestratorTest(unittest.TestCase):
                         "reasoning_summary": "Initial draft done.",
                     }
                 ),
+                # GLM candidate
                 _agent_ok(
                     {
-                        "findings": ["none"],
+                        "final_text": "Final content (GLM)",
+                        "final_reflow_text": "Final reflow (GLM)",
+                        "docx_translation_map": [{"id": "p:1", "text": "Final content (GLM)"}],
+                        "review_brief_points": [],
+                        "change_log_points": [],
+                        "resolved": [],
+                        "unresolved": [],
+                        "codex_pass": True,
+                        "reasoning_summary": "GLM candidate done.",
+                    }
+                ),
+                # Gemini review (Codex)
+                _agent_ok(
+                    {
+                        "findings": [],
                         "resolved": [],
                         "unresolved": [],
                         "pass": True,
@@ -95,28 +136,15 @@ class OpenClawTranslationOrchestratorTest(unittest.TestCase):
                         "reasoning_summary": "Looks good.",
                     }
                 ),
-                _agent_ok(
-                    {
-                        "draft_a_text": "Draft A content revised",
-                        "draft_b_text": "Draft B content revised",
-                        "final_text": "Final content revised",
-                        "final_reflow_text": "Final reflow revised",
-                        "review_brief_points": ["Review numbering."],
-                        "change_log_points": ["Applied Arabic V2 changes."],
-                        "resolved": ["none"],
-                        "unresolved": [],
-                        "codex_pass": True,
-                        "reasoning_summary": "Fixed all findings.",
-                    }
-                ),
+                # Gemini review (GLM)
                 _agent_ok(
                     {
                         "findings": [],
-                        "resolved": ["none"],
+                        "resolved": [],
                         "unresolved": [],
                         "pass": True,
-                        "terminology_rate": 0.97,
-                        "structure_complete_rate": 0.97,
+                        "terminology_rate": 0.95,
+                        "structure_complete_rate": 0.95,
                         "target_language_purity": 0.98,
                         "numbering_consistency": 0.98,
                         "reasoning_summary": "Pass.",
@@ -176,8 +204,8 @@ class OpenClawTranslationOrchestratorTest(unittest.TestCase):
                     "task_type": "REVISION_UPDATE",
                     "source_language": "ar",
                     "target_language": "en",
-                    "required_inputs": ["arabic_old", "arabic_new", "english_baseline"],
-                    "missing_inputs": ["arabic_old", "arabic_new"],
+                    "required_inputs": ["source_old", "source_new", "target_baseline"],
+                    "missing_inputs": ["source_old", "source_new"],
                     "confidence": 0.88,
                     "reasoning_summary": "Arabic files missing.",
                     "estimated_minutes": 10,
@@ -204,6 +232,81 @@ class OpenClawTranslationOrchestratorTest(unittest.TestCase):
             )
             self.assertEqual(out["status"], "missing_inputs")
             self.assertFalse(out["ok"])
+
+    @patch("scripts.openclaw_translation_orchestrator._agent_call")
+    def test_bilingual_proofreading_plan_only(self, mocked_call):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "Translation Task"
+            review = root / "Translated -EN" / "_VERIFY" / "job_proof"
+            _make_docx(root / "english_original.docx", "English original text")
+            _make_docx(root / "french_translation.docx", "Texte traduit en français")
+
+            mocked_call.return_value = _agent_ok(
+                {
+                    "task_type": "BILINGUAL_PROOFREADING",
+                    "source_language": "en",
+                    "target_language": "fr",
+                    "required_inputs": ["source_document", "target_document"],
+                    "missing_inputs": [],
+                    "confidence": 0.92,
+                    "reasoning_summary": "Proofreading EN→FR pair.",
+                    "estimated_minutes": 8,
+                    "complexity_score": 20,
+                }
+            )
+
+            out = run(
+                {
+                    "job_id": "job_proof",
+                    "root_path": str(root),
+                    "review_dir": str(review),
+                    "message_text": "could you kindly review the attached paragraphs and proofread the French version",
+                    "candidate_files": [
+                        {
+                            "path": str(root / "english_original.docx"),
+                            "name": "english_original.docx",
+                            "language": "en",
+                            "version": "unknown",
+                            "role": "general",
+                        },
+                        {
+                            "path": str(root / "french_translation.docx"),
+                            "name": "french_translation.docx",
+                            "language": "fr",
+                            "version": "unknown",
+                            "role": "general",
+                        },
+                    ],
+                },
+                plan_only=True,
+            )
+            self.assertEqual(out["status"], "planned")
+            self.assertEqual(out["intent"]["task_type"], "BILINGUAL_PROOFREADING")
+            self.assertGreater(out["intent"]["confidence"], 0.0)
+
+
+class AvailableSlotsTest(unittest.TestCase):
+    def test_french_english_pair(self):
+        candidates = [
+            {"language": "en", "version": "unknown", "role": "general"},
+            {"language": "fr", "version": "unknown", "role": "general"},
+        ]
+        slots = _available_slots(candidates, source_language="en", target_language="fr")
+        self.assertTrue(slots["source_document"])
+        self.assertTrue(slots["target_document"])
+
+    def test_single_arabic_file(self):
+        candidates = [
+            {"language": "ar", "version": "v1", "role": "source"},
+        ]
+        slots = _available_slots(candidates, source_language="ar", target_language="en")
+        self.assertTrue(slots["source_document"])
+        self.assertFalse(slots["target_document"])
+
+    def test_empty_candidates(self):
+        slots = _available_slots([], source_language="en", target_language="fr")
+        self.assertFalse(slots["source_document"])
+        self.assertFalse(slots["target_document"])
 
 
 if __name__ == "__main__":

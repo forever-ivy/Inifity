@@ -4,4 +4,6 @@ __pycache__/
 *.pyc
 .DS_Store
 *.log
+.env
 .env.v4.local
+.claude/settings.local.json

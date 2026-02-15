@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="/Users/Code/workflow/translation"
 cd "$ROOT_DIR"
+export PATH="$HOME/.npm-global/bin:$PATH"
 
 if [[ -f ".env.v4.local" ]]; then
   set -a

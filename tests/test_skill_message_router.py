@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 
 import unittest
+from pathlib import Path
+import tempfile
+import base64
 
 from scripts.skill_message_router import (
     _extract_attachment_paths,
+    _extract_file_block_attachments,
     _extract_message_id,
     _extract_sender,
     _extract_text_content,
@@ -32,6 +36,26 @@ class SkillMessageRouterTest(unittest.TestCase):
         attachments = _extract_attachment_paths(cleaned)
         # path may not exist in test env; parser should return only existing files.
         self.assertIsInstance(attachments, list)
+
+    def test_extract_url_attachment(self):
+        raw = (
+            "[media attached: https://example.com/files/survey.xlsx "
+            "(application/vnd.openxmlformats-officedocument.spreadsheetml.sheet)]\n"
+        )
+        attachments = _extract_attachment_paths(raw)
+        self.assertEqual(len(attachments), 1)
+        self.assertEqual(attachments[0].get("mediaUrl"), "https://example.com/files/survey.xlsx")
+        self.assertEqual(attachments[0].get("name"), "survey.xlsx")
+
+    def test_extract_file_block_to_temp_path(self):
+        payload = base64.b64encode(b"hello").decode("utf-8")
+        raw = f'<file name="x.xlsx" mime="application/vnd.ms-excel">{payload}</file>'
+        with tempfile.TemporaryDirectory() as tmp:
+            atts = _extract_file_block_attachments(raw, temp_dir=Path(tmp))
+            self.assertEqual(len(atts), 1)
+            p = Path(atts[0]["path"])
+            self.assertTrue(p.exists())
+            self.assertEqual(p.read_bytes(), b"hello")
 
     def test_extract_text_content_skips_noise(self):
         raw = (

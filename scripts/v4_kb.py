@@ -7,6 +7,8 @@ import csv
 import json
 import re
 import sqlite3
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +23,94 @@ from scripts.v4_runtime import (
     json_dumps,
     utc_now_iso,
 )
+
+_KB_FTS_AVAILABLE: bool | None = None
+
+
+def _reference_like_filters(*, kb_root: Path, kb_company: str) -> tuple[str, str]:
+    ref_root = (kb_root / "30_Reference").expanduser().resolve()
+    company_root = (ref_root / kb_company).expanduser().resolve()
+    return f"{ref_root}/%", f"{company_root}/%"
+
+
+def _allow_kb_path(
+    path: str,
+    *,
+    kb_root: Path | None,
+    kb_company: str,
+    isolation_mode: str,
+) -> bool:
+    p = str(path or "").strip()
+    if not p:
+        return False
+
+    if kb_root:
+        kb_root_abs = str(kb_root.expanduser().resolve())
+        if not (p.startswith(kb_root_abs + "/") or p == kb_root_abs):
+            return False
+    try:
+        if not Path(p).expanduser().exists():
+            return False
+    except OSError:
+        return False
+
+    if not kb_root or not kb_company.strip():
+        return True
+
+    mode = (isolation_mode or "reference_only").strip().lower()
+    if mode not in {"reference_only", "all"}:
+        mode = "reference_only"
+
+    ref_root = str((kb_root / "30_Reference").expanduser().resolve())
+    company_root = str((kb_root / "30_Reference" / kb_company).expanduser().resolve())
+
+    if mode == "all":
+        return p.startswith(company_root + "/") or p == company_root
+
+    # reference_only: only filter Reference; allow glossary/style/domain/templates globally
+    if p.startswith(ref_root + "/"):
+        return p.startswith(company_root + "/") or p == company_root
+    return True
+
+
+def _ensure_kb_fts(conn: sqlite3.Connection) -> bool:
+    """Best-effort: enable FTS5 BM25 retrieval when supported by SQLite."""
+    global _KB_FTS_AVAILABLE
+    if _KB_FTS_AVAILABLE is False:
+        return False
+
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='kb_chunks_fts'"
+    ).fetchone()
+    if row:
+        _KB_FTS_AVAILABLE = True
+        return True
+
+    try:
+        conn.execute(
+            "CREATE VIRTUAL TABLE kb_chunks_fts USING fts5(text, content='kb_chunks', content_rowid='id', tokenize='unicode61')"
+        )
+        conn.executescript(
+            """
+            CREATE TRIGGER IF NOT EXISTS kb_chunks_ai AFTER INSERT ON kb_chunks BEGIN
+              INSERT INTO kb_chunks_fts(rowid, text) VALUES (new.id, new.text);
+            END;
+            CREATE TRIGGER IF NOT EXISTS kb_chunks_ad AFTER DELETE ON kb_chunks BEGIN
+              INSERT INTO kb_chunks_fts(kb_chunks_fts, rowid, text) VALUES('delete', old.id, old.text);
+            END;
+            CREATE TRIGGER IF NOT EXISTS kb_chunks_au AFTER UPDATE ON kb_chunks BEGIN
+              INSERT INTO kb_chunks_fts(kb_chunks_fts, rowid, text) VALUES('delete', old.id, old.text);
+              INSERT INTO kb_chunks_fts(rowid, text) VALUES (new.id, new.text);
+            END;
+            """
+        )
+        conn.execute("INSERT INTO kb_chunks_fts(kb_chunks_fts) VALUES('rebuild')")
+        conn.commit()
+        _KB_FTS_AVAILABLE = True
+        return True
+    except sqlite3.OperationalError:
+        _KB_FTS_AVAILABLE = False
+        return False
 
 try:  # Optional dependency
     from pypdf import PdfReader
@@ -83,13 +173,24 @@ def _extract_docx(path: Path) -> str:
 
 
 def _extract_pdf(path: Path) -> str:
+    pdftotext_bin = "/opt/homebrew/bin/pdftotext"
+    if Path(pdftotext_bin).exists():
+        try:
+            proc = subprocess.run(
+                [pdftotext_bin, "-layout", str(path), "-"],
+                capture_output=True, text=True, timeout=60,
+            )
+            if proc.returncode == 0 and proc.stdout.strip():
+                return _normalize_text(proc.stdout)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+    # Fallback to pypdf
     if PdfReader is None:
-        raise RuntimeError("pypdf not installed; cannot parse .pdf")
+        raise RuntimeError("Neither pdftotext nor pypdf available for .pdf")
     reader = PdfReader(str(path))
     lines: list[str] = []
     for page in reader.pages:
-        txt = page.extract_text() or ""
-        txt = _normalize_text(txt)
+        txt = _normalize_text(page.extract_text() or "")
         if txt:
             lines.append(txt)
     return "\n".join(lines)
@@ -110,9 +211,23 @@ def _extract_csv(path: Path) -> str:
     return "\n".join(lines)
 
 
+SHEETSMITH_SCRIPT = Path.home() / ".openclaw/workspace/skills/sheetsmith/scripts/sheetsmith.py"
+
+
 def _extract_xlsx(path: Path) -> str:
+    if SHEETSMITH_SCRIPT.exists():
+        try:
+            proc = subprocess.run(
+                [sys.executable, str(SHEETSMITH_SCRIPT), "preview", str(path), "--rows", "9999"],
+                capture_output=True, text=True, timeout=60,
+            )
+            if proc.returncode == 0 and proc.stdout.strip():
+                return _normalize_text(proc.stdout)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+    # Fallback to openpyxl
     if load_workbook is None:
-        raise RuntimeError("openpyxl not installed; cannot parse .xlsx")
+        raise RuntimeError("Neither sheetsmith nor openpyxl available for .xlsx")
     wb = load_workbook(str(path), read_only=True, data_only=True)
     lines: list[str] = []
     for ws in wb.worksheets:
@@ -153,6 +268,10 @@ def discover_kb_files(kb_root: Path) -> list[Path]:
             continue
         if p.name.startswith("~$") or p.name.startswith("."):
             continue
+        low_path = str(p).lower().replace("\\", "/")
+        # Do not index raw source uploads inside Reference projects by default.
+        if "/30_reference/" in low_path and "/source/" in low_path:
+            continue
         if p.suffix.lower() not in KB_SUPPORTED_EXTENSIONS:
             continue
         files.append(p)
@@ -180,6 +299,7 @@ def sync_kb(
         "created": 0,
         "updated": 0,
         "metadata_only": 0,
+        "metadata_only_paths": [],
         "removed": 0,
         "skipped": 0,
         "errors": [],
@@ -208,6 +328,7 @@ def sync_kb(
                     (stat.st_mtime_ns, stat.st_size, utc_now_iso(), ap),
                 )
                 report["metadata_only"] += 1
+                report["metadata_only_paths"].append(ap)
                 continue
 
             parser, text = extract_text(path)
@@ -282,6 +403,8 @@ def sync_kb_with_rag(
     rag_report: dict[str, Any] = {"ok": False, "backend": "local", "mode": "disabled"}
     if str(rag_backend).strip().lower() == "clawrag":
         changed_paths = [str(x.get("path")) for x in (local_report.get("files") or []) if str(x.get("path", "")).strip()]
+        changed_paths.extend([str(p) for p in (local_report.get("metadata_only_paths") or []) if str(p).strip()])
+        changed_paths = sorted(set([str(p).strip() for p in changed_paths if str(p).strip()]))
         rag_report = clawrag_sync(
             changed_paths=changed_paths,
             base_url=rag_base_url,
@@ -296,6 +419,9 @@ def retrieve_kb(
     query: str,
     task_type: str = "",
     top_k: int = 8,
+    kb_root: Path | None = None,
+    kb_company: str = "",
+    isolation_mode: str = "reference_only",
 ) -> list[dict[str, Any]]:
     tokens = [t.lower() for t in re.findall(r"[A-Za-z0-9\u0600-\u06FF_]+", query) if len(t) >= 2]
     if not tokens:
@@ -313,7 +439,69 @@ def retrieve_kb(
         "LOW_CONTEXT_TASK": {"glossary": 1.1},
     }.get(task, {})
 
-    rows = conn.execute("SELECT path, source_group, chunk_index, text FROM kb_chunks").fetchall()
+    if _ensure_kb_fts(conn):
+        match_query = " OR ".join(sorted(set(tokens)))
+        where_sql = ""
+        where_params: list[Any] = []
+        if kb_root and kb_company.strip():
+            ref_like, company_like = _reference_like_filters(kb_root=kb_root, kb_company=kb_company.strip())
+            mode = (isolation_mode or "reference_only").strip().lower()
+            if mode == "all":
+                where_sql = " AND c.path LIKE ?"
+                where_params.append(company_like)
+            else:
+                where_sql = " AND (c.path NOT LIKE ? OR c.path LIKE ?)"
+                where_params.extend([ref_like, company_like])
+
+        rows = conn.execute(
+            f"""
+            SELECT
+              c.path AS path,
+              c.source_group AS source_group,
+              c.chunk_index AS chunk_index,
+              substr(c.text, 1, 700) AS snippet,
+              bm25(kb_chunks_fts) AS rank
+            FROM kb_chunks_fts
+            JOIN kb_chunks c ON c.id = kb_chunks_fts.rowid
+            WHERE kb_chunks_fts MATCH ?{where_sql}
+            LIMIT ?
+            """,
+            [match_query, *where_params, max(10, int(top_k) * 8)],
+        ).fetchall()
+
+        scored: list[dict[str, Any]] = []
+        for row in rows:
+            source_group = row["source_group"] or "general"
+            base = SOURCE_GROUP_WEIGHTS.get(source_group, SOURCE_GROUP_WEIGHTS["general"])
+            boost = task_boosts.get(source_group, 1.0)
+            raw_rank = float(row["rank"] or 0.0)
+            inv = 1.0 / (1.0 + max(0.0, raw_rank))
+            score = round(inv * float(base) * float(boost), 6)
+            scored.append(
+                {
+                    "path": row["path"],
+                    "source_group": source_group,
+                    "chunk_index": int(row["chunk_index"]),
+                    "snippet": str(row["snippet"] or ""),
+                    "score": score,
+                }
+            )
+        scored.sort(key=lambda x: x["score"], reverse=True)
+        return scored[: max(1, int(top_k))]
+
+    where_sql = ""
+    where_params: list[Any] = []
+    if kb_root and kb_company.strip():
+        ref_like, company_like = _reference_like_filters(kb_root=kb_root, kb_company=kb_company.strip())
+        mode = (isolation_mode or "reference_only").strip().lower()
+        if mode == "all":
+            where_sql = " WHERE path LIKE ?"
+            where_params.append(company_like)
+        else:
+            where_sql = " WHERE (path NOT LIKE ? OR path LIKE ?)"
+            where_params.extend([ref_like, company_like])
+
+    rows = conn.execute(f"SELECT path, source_group, chunk_index, text FROM kb_chunks{where_sql}", tuple(where_params)).fetchall()
     scored: list[dict[str, Any]] = []
     for row in rows:
         text = (row["text"] or "").lower()
@@ -347,6 +535,9 @@ def retrieve_kb_with_fallback(
     conn: sqlite3.Connection,
     query: str,
     task_type: str = "",
+    kb_root: Path | None = None,
+    kb_company: str = "",
+    isolation_mode: str = "reference_only",
     rag_backend: str = "clawrag",
     rag_base_url: str = "http://127.0.0.1:8080",
     rag_collection: str = "translation-kb",
@@ -366,19 +557,45 @@ def retrieve_kb_with_fallback(
         )
         rag_hits = list(rag_result.get("hits") or [])
         if rag_result.get("ok") and rag_hits:
-            return {
-                "backend": "clawrag",
-                "hits": rag_hits[: max(1, int(top_k_clawrag))],
-                "status_flags": [],
-                "rag_result": rag_result,
-            }
-        local_hits = retrieve_kb(conn=conn, query=q, task_type=task_type, top_k=max(1, int(top_k_local)))
+            filtered = [
+                h for h in rag_hits
+                if _allow_kb_path(
+                    str(h.get("path") or ""),
+                    kb_root=kb_root,
+                    kb_company=kb_company,
+                    isolation_mode=isolation_mode,
+                )
+            ]
+            if filtered:
+                return {
+                    "backend": "clawrag",
+                    "hits": filtered[: max(1, int(top_k_clawrag))],
+                    "status_flags": [],
+                    "rag_result": rag_result,
+                }
+        local_hits = retrieve_kb(
+            conn=conn,
+            query=q,
+            task_type=task_type,
+            top_k=max(1, int(top_k_local)),
+            kb_root=kb_root,
+            kb_company=kb_company,
+            isolation_mode=isolation_mode,
+        )
         return {
             "backend": "local",
             "hits": local_hits,
-            "status_flags": ["rag_fallback_local"],
+            "status_flags": ["rag_fallback_local"] + (["rag_filtered_empty"] if rag_result.get("ok") and rag_hits else []),
             "rag_result": rag_result,
         }
 
-    local_hits = retrieve_kb(conn=conn, query=q, task_type=task_type, top_k=max(1, int(top_k_local)))
+    local_hits = retrieve_kb(
+        conn=conn,
+        query=q,
+        task_type=task_type,
+        top_k=max(1, int(top_k_local)),
+        kb_root=kb_root,
+        kb_company=kb_company,
+        isolation_mode=isolation_mode,
+    )
     return {"backend": "local", "hits": local_hits, "status_flags": [], "rag_result": {"ok": True, "mode": "local_only"}}

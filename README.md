@@ -18,7 +18,7 @@ V6.0 implements:
 - Mandatory `kb_sync_incremental` + `kb_retrieve` before every `run`.
 - Output only to `_VERIFY/{job_id}`.
 - No automatic move to final delivery folder.
-- WhatsApp status replies use user-readable 6-line status cards.
+- Chat status replies use user-readable 6-line status cards.
 
 Legacy commands `approve/reject` are kept as compatibility aliases and are internally redirected to `ok/no`.
 
@@ -35,7 +35,7 @@ Legacy commands `approve/reject` are kept as compatibility aliases and are inter
 
 - Inbox:
   - `_INBOX/email/{job_id}`
-  - `_INBOX/whatsapp/{job_id}`
+  - `_INBOX/telegram/{job_id}`
 - Verify bundle:
   - `Translated -EN/_VERIFY/{job_id}`
 - State DB:
@@ -50,7 +50,7 @@ Legacy commands `approve/reject` are kept as compatibility aliases and are inter
 - `new`: create a fresh collecting job for current sender.
 - `run`: start pipeline for current active collecting job.
 - `status`: return user-readable status card.
-- `ok`: mark job `verified` only (no file move).
+- `ok`: mark job `verified` and archive your uploaded FINAL file(s) into KB reference (no file move).
 - `no {reason}`: mark `needs_revision`.
 - `rerun`: rerun current active job.
 
@@ -62,11 +62,11 @@ Under `_VERIFY/{job_id}`:
 
 - `Final.docx`
 - `Final-Reflow.docx`
-- `Draft A (Preserve).docx`
-- `Draft B (Reflow).docx`
 - `Review Brief.docx`
 - `Change Log.md`
-- `Final.xlsx` (only when task type is spreadsheet-related)
+- Spreadsheet output (only for spreadsheet tasks):
+  - `Final.xlsx` (single input workbook), or
+  - `*_translated.xlsx` (one per input workbook when multiple `.xlsx` inputs)
 - `.system/execution_plan.json`
 - `.system/quality_report.json`
 - `.system/openclaw_result.json`
@@ -83,7 +83,7 @@ V4_KB_ROOT="/Users/ivy/Library/CloudStorage/OneDrive-Personal/Knowledge Reposito
 V4_PYTHON_BIN="/Users/Code/workflow/translation/.venv/bin/python"
 
 OPENCLAW_NOTIFY_TARGET="+8615071054627"
-OPENCLAW_NOTIFY_CHANNEL="whatsapp"
+OPENCLAW_NOTIFY_CHANNEL="telegram"
 OPENCLAW_NOTIFY_ACCOUNT="default"
 
 V4_IMAP_HOST="imap.163.com"
@@ -94,14 +94,24 @@ V4_IMAP_MAILBOX="INBOX"
 V4_IMAP_FROM_FILTER="modeh@eventranz.com"
 V4_IMAP_MAX_MESSAGES=5
 
-OPENCLAW_WA_STRICT_ROUTER=1
+OPENCLAW_STRICT_ROUTER=1
 OPENCLAW_TRANSLATION_THINKING=high
+OPENCLAW_CODEX_AGENT=translator-core
+OPENCLAW_GLM_GENERATOR_AGENT=glm-reviewer
+OPENCLAW_FORMAT_QA_ENABLED=0
 OPENCLAW_REQUIRE_NEW=1
 OPENCLAW_RAG_BACKEND=clawrag
 OPENCLAW_RAG_BASE_URL=http://127.0.0.1:8080
 OPENCLAW_RAG_COLLECTION=translation-kb
+OPENCLAW_KB_ISOLATION_MODE=reference_only
+OPENCLAW_ARCHIVE_REQUIRE_FINAL_UPLOAD=1
 OPENCLAW_STATE_DB_PATH=/Users/ivy/.openclaw/runtime/translation/state.sqlite
 ```
+
+Notes:
+- `OPENCLAW_CODEX_AGENT` should point to a GPT-5.2-backed OpenClaw agent (e.g. bind `translator-core` to GPT-5.2 in OpenClaw).
+- If `OPENCLAW_FORMAT_QA_ENABLED=1` or `OPENCLAW_DOCX_QA_ENABLED=1`, you also need LibreOffice (`soffice`) on PATH and `GOOGLE_API_KEY` (or `GEMINI_API_KEY`) set for Gemini Vision.
+- Aesthetics warnings are controlled by `OPENCLAW_VISION_AESTHETICS_WARN_THRESHOLD` (default `0.7`); format fidelity remains the blocking gate.
 
 ## Install
 
@@ -122,7 +132,7 @@ openclaw gateway --force
 openclaw health --json
 ```
 
-## Strict WhatsApp Router
+## Strict Telegram Router
 
 Skill template:
 
@@ -134,15 +144,15 @@ Installed runtime skill:
 
 Router bridge script:
 
-- `/Users/Code/workflow/translation/scripts/skill_whatsapp_router.py`
+- `/Users/Code/workflow/translation/scripts/skill_message_router.py`
 
 What it does:
 
-1. Parses raw WhatsApp message text.
+1. Parses raw Telegram message text.
 2. Extracts `[media attached: ...]` file paths.
 3. Removes inline `<file ...>` payload blocks (token guard).
 4. Dispatches to:
-   - `whatsapp-event` for task/file intake
+   - `message-event` for task/file intake
    - `approval` for command-only messages (`new/run/status/ok/no/rerun`)
 
 ## Run
@@ -175,8 +185,8 @@ cd /Users/Code/workflow/translation
 ## Message flow
 
 1. Send `new` -> job enters `collecting`
-2. Upload files and/or task text (email or WhatsApp)
-3. Send `run`
+2. Upload files and/or task text (email or Telegram)
+3. Send `run` -> system asks you to pick a company (reply with a number), then continues the run
 3. System emits milestones:
    - `collecting_update`
    - `run_accepted`
@@ -187,8 +197,9 @@ cd /Users/Code/workflow/translation
    - `round_1_done` (and round 2/3 if needed)
    - `review_ready` or `needs_attention`
 4. You manually verify files in `_VERIFY/{job_id}`
-5. Send `ok` to mark `verified` (status only, no file move)
-6. You manually move final file to destination folder
+5. Upload your FINAL file(s) as Telegram attachments (these are the ones that get archived)
+6. Send `ok` -> marks `verified` and copies your FINAL file(s) into `Knowledge Repository/30_Reference/{Company}/{Project}/final/`
+7. You manually move final file to destination folder (delivery remains manual)
 
 ## Troubleshooting
 
@@ -201,7 +212,7 @@ openclaw skills list | rg translation-router
 2. Check strict router + V6 flags:
 
 ```bash
-rg "OPENCLAW_WA_STRICT_ROUTER|OPENCLAW_TRANSLATION_THINKING|OPENCLAW_REQUIRE_NEW|OPENCLAW_RAG_BACKEND" /Users/Code/workflow/translation/.env.v4.local
+rg "OPENCLAW_STRICT_ROUTER|OPENCLAW_TRANSLATION_THINKING|OPENCLAW_REQUIRE_NEW|OPENCLAW_RAG_BACKEND" /Users/Code/workflow/translation/.env.v4.local
 ```
 
 3. Check clawrag bridge health:

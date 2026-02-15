@@ -4,12 +4,16 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import os
+import subprocess
 from pathlib import Path
 from typing import Any
 
 from scripts.openclaw_translation_orchestrator import run as run_translation
+
+log = logging.getLogger(__name__)
 from scripts.task_bundle_builder import infer_language, infer_role, infer_version
 from scripts.v4_kb import retrieve_kb_with_fallback, sync_kb_with_rag
 from scripts.v4_runtime import (
@@ -182,6 +186,109 @@ def _latest_message_meta(inbox_dir: Path) -> dict[str, Any]:
     }
 
 
+def _recall_cross_job_context(query: str) -> list[dict[str, Any]]:
+    """Recall relevant memories from openclaw-mem."""
+    try:
+        proc = subprocess.run(
+            ["openclaw", "memory", "search", query, "--max-results", "5", "--json"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            result = json.loads(proc.stdout)
+            if isinstance(result, list):
+                return result[:5]
+            return list(result.get("results", result.get("memories", [])))[:5]
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError):
+        pass
+    return []
+
+
+def _read_change_log_points(*, review_dir: Path, limit: int = 12) -> list[str]:
+    path = Path(review_dir) / "Change Log.md"
+    if not path.exists():
+        return []
+    try:
+        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return []
+    points = []
+    for line in lines:
+        item = line.strip()
+        if not item.startswith("- "):
+            continue
+        cleaned = item[2:].strip()
+        if cleaned:
+            points.append(cleaned)
+        if len(points) >= max(1, int(limit)):
+            break
+    return points
+
+
+def _summarize_kb_hits(kb_hits: list[dict[str, Any]], *, limit: int = 6) -> list[str]:
+    out: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    for hit in kb_hits:
+        if not isinstance(hit, dict):
+            continue
+        source_group = str(hit.get("source_group") or "general").strip() or "general"
+        name = str(Path(str(hit.get("path") or "")).name or "").strip()
+        if not name:
+            continue
+        key = (source_group, name)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(f"{source_group}:{name}")
+        if len(out) >= max(1, int(limit)):
+            break
+    return out
+
+
+def _store_job_memory(
+    *,
+    job_id: str,
+    task_type: str,
+    rounds_count: int,
+    review_dir: Path,
+    kb_company: str,
+    task_label: str,
+    kb_hits: list[dict[str, Any]],
+) -> None:
+    """Store durable translation decision and constraints in openclaw-mem."""
+    company_norm = (kb_company or "").strip()
+    task_label_norm = (task_label or "").strip()
+
+    lines = []
+    if company_norm:
+        lines.append(f"Company: {company_norm}")
+    if task_label_norm:
+        lines.append(f"Task: {task_label_norm}")
+    lines.append(f"Job: {job_id}")
+    lines.append(f"Type: {task_type}")
+
+    change_points = _read_change_log_points(review_dir=review_dir)
+    if change_points:
+        lines.append("Decisions:")
+        lines.extend([f"- {x}" for x in change_points[:12]])
+
+    kb_summary = _summarize_kb_hits(kb_hits)
+    if kb_summary:
+        lines.append("KB sources:")
+        lines.extend([f"- {x}" for x in kb_summary])
+
+    lines.append(f"Convergence: {rounds_count} round(s)")
+    text = "\n".join(lines).strip()
+    if len(text) > 1800:
+        text = text[:1800] + "\n...(truncated)"
+    try:
+        subprocess.run(
+            ["openclaw", "memory", "store", text],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+
 def run_job_pipeline(
     *,
     job_id: str,
@@ -196,15 +303,20 @@ def run_job_pipeline(
     if not job:
         raise ValueError(f"Job not found: {job_id}")
 
+    if str(job.get("status", "")) == "running":
+        log.warning("Job %s is already running — skipping duplicate", job_id)
+        conn.close()
+        return {"ok": False, "job_id": job_id, "status": "already_running", "skipped": True}
+
     update_job_status(conn, job_id=job_id, status="running", errors=[])
-    set_sender_active_job(conn, sender=job.get("sender", ""), job_id=job_id)
+    set_sender_active_job(conn, sender=str(job.get("sender", "")).strip(), job_id=job_id)
 
     notify_milestone(
         paths=paths,
         conn=conn,
         job_id=job_id,
         milestone="kb_sync_started",
-        message=f"\U0001f4da KB syncing...\n\U0001f194 {job_id}",
+        message="\U0001f4da Syncing knowledge base\u2026",
         target=notify_target,
         dry_run=dry_run_notify,
     )
@@ -224,7 +336,7 @@ def run_job_pipeline(
         conn=conn,
         job_id=job_id,
         milestone="kb_sync_done",
-        message=f"\U0001f4da KB ready\nNew {kb_report['created']} \u00b7 Updated {kb_report['updated']} \u00b7 Skipped {kb_report['skipped']}",
+        message=f"\U0001f4da KB ready \u00b7 {kb_report['created']} new \u00b7 {kb_report['updated']} updated",
         target=notify_target,
         dry_run=dry_run_notify,
     )
@@ -233,9 +345,10 @@ def run_job_pipeline(
     review_dir = Path(job["review_dir"]).resolve()
     review_dir.mkdir(parents=True, exist_ok=True)
     inbox_dir = Path(str(job.get("inbox_dir") or "")).expanduser().resolve()
-    message_meta = _latest_message_meta(inbox_dir) if str(job.get("source", "")) in ("telegram", "whatsapp") else {}
+    source = str(job.get("source", ""))
+    message_meta = _latest_message_meta(inbox_dir) if source == "telegram" else {}
     strict_router_enabled = str(
-        os.getenv("OPENCLAW_STRICT_ROUTER") or os.getenv("OPENCLAW_WA_STRICT_ROUTER", "1")
+        os.getenv("OPENCLAW_STRICT_ROUTER", "1")
     ).strip().lower() not in {"0", "false", "off", "no"}
     router_mode = "strict" if strict_router_enabled else "hybrid"
 
@@ -246,7 +359,7 @@ def run_job_pipeline(
             conn=conn,
             job_id=job_id,
             milestone="failed",
-            message=f"\U0001f4ed No supported files\n\U0001f194 {job_id}\nSupported: .docx .xlsx .csv",
+            message=f"\U0001f4ed No supported files\nSupported: .docx .xlsx .csv",
             target=notify_target,
             dry_run=dry_run_notify,
         )
@@ -254,6 +367,8 @@ def run_job_pipeline(
         return {"ok": False, "job_id": job_id, "status": "incomplete_input", "errors": ["no_supported_attachments"]}
 
     query = " ".join([job.get("subject", ""), job.get("message_text", "")]).strip()
+    kb_company = str(job.get("kb_company") or "").strip()
+    isolation_mode = str(os.getenv("OPENCLAW_KB_ISOLATION_MODE", "reference_only")).strip().lower() or "reference_only"
     kb_hits: list[dict[str, Any]] = []
     knowledge_backend = "local"
     pre_status_flags: list[str] = []
@@ -262,6 +377,9 @@ def run_job_pipeline(
             conn=conn,
             query=query,
             task_type="",
+            kb_root=kb_root,
+            kb_company=kb_company,
+            isolation_mode=isolation_mode,
             rag_backend=str(os.getenv("OPENCLAW_RAG_BACKEND", "clawrag")).strip().lower(),
             rag_base_url=str(os.getenv("OPENCLAW_RAG_BASE_URL", "http://127.0.0.1:8080")).strip(),
             rag_collection=str(os.getenv("OPENCLAW_RAG_COLLECTION", "translation-kb")).strip() or "translation-kb",
@@ -271,6 +389,8 @@ def run_job_pipeline(
         kb_hits = _dedupe_hits(list(rag_fetch.get("hits") or []), limit=12 if rag_fetch.get("backend") == "clawrag" else 8)
         knowledge_backend = str(rag_fetch.get("backend") or "local")
         pre_status_flags.extend([str(x) for x in (rag_fetch.get("status_flags") or []) if str(x)])
+
+    cross_job_memories = _recall_cross_job_context(query) if query else []
 
     record_event(
         conn,
@@ -289,7 +409,7 @@ def run_job_pipeline(
         conn=conn,
         job_id=job_id,
         milestone="kb_retrieve_done",
-        message=f"\U0001f50d KB retrieval done \u00b7 {len(kb_hits)} hits",
+        message=f"\U0001f50d KB retrieval \u00b7 {len(kb_hits)} hits",
         target=notify_target,
         dry_run=dry_run_notify,
     )
@@ -313,10 +433,12 @@ def run_job_pipeline(
         "router_mode": router_mode,
         "token_guard_applied": bool(message_meta.get("token_guard_applied", False)),
         "status_flags_seed": pre_status_flags,
+        "cross_job_memories": cross_job_memories,
     }
 
     plan = run_translation(meta, plan_only=True)
     intent = plan.get("intent") or {}
+    task_label = str(intent.get("task_label") or "")
     if plan.get("plan"):
         p = plan["plan"]
         update_job_plan(
@@ -327,23 +449,31 @@ def run_job_pipeline(
             confidence=float(p.get("confidence", 0.0)),
             estimated_minutes=int(p.get("estimated_minutes", 0)),
             runtime_timeout_minutes=int(p.get("time_budget_minutes", 0)),
+            task_label=task_label,
         )
     plan_file = review_dir / ".system" / "execution_plan.json"
     plan_file.parent.mkdir(parents=True, exist_ok=True)
     plan_file.write_text(json_dumps(plan), encoding="utf-8")
-    notify_milestone(
-        paths=paths,
-        conn=conn,
-        job_id=job_id,
-        milestone="intent_classified",
-        message=(
-            f"\U0001f9e0 Intent classified\n"
-            f"Type: {plan.get('plan', {}).get('task_type', 'unknown')} \u00b7 "
-            f"Est: {plan.get('estimated_minutes', 0)}m"
-        ),
-        target=notify_target,
-        dry_run=dry_run_notify,
-    )
+    _task_name = task_label or "Translation task"
+    _task_type = str(intent.get("task_type") or plan.get("plan", {}).get("task_type") or "").replace("_", " ").title() or "Unknown"
+    _src_lang = str(intent.get("source_language") or "").strip()
+    _tgt_lang = str(intent.get("target_language") or "").strip()
+    _lang_line = f"{_src_lang} \u2192 {_tgt_lang}" if _src_lang and _tgt_lang and _src_lang != "unknown" else ""
+    if plan.get("status") == "failed":
+        errors = plan.get("errors") or ["intent_classification_failed"]
+        update_job_status(conn, job_id=job_id, status="failed", errors=errors)
+        notify_milestone(
+            paths=paths,
+            conn=conn,
+            job_id=job_id,
+            milestone="failed",
+            message=f"\u274c Classification failed\n\U0001f4cb {_task_name}\nSend: rerun to retry",
+            target=notify_target,
+            dry_run=dry_run_notify,
+        )
+        conn.close()
+        return {"ok": False, "job_id": job_id, "status": "failed", "errors": errors}
+
     if plan.get("status") == "missing_inputs":
         missing = intent.get("missing_inputs") or []
         update_job_status(conn, job_id=job_id, status="missing_inputs", errors=[f"missing:{x}" for x in missing])
@@ -352,7 +482,7 @@ def run_job_pipeline(
             conn=conn,
             job_id=job_id,
             milestone="missing_inputs",
-            message=f"\U0001f4ed Missing inputs: {', '.join(missing) if missing else 'unknown'}\nPlease upload, then send: run",
+            message=f"\U0001f4ed Missing inputs\n\U0001f4cb {_task_name}\n\U0001f4ce {', '.join(missing) if missing else 'unknown'}\nUpload files, then: run",
             target=notify_target,
             dry_run=dry_run_notify,
         )
@@ -369,8 +499,24 @@ def run_job_pipeline(
         paths=paths,
         conn=conn,
         job_id=job_id,
+        milestone="intent_classified",
+        message=(
+            f"\U0001f9e0 Intent classified\n"
+            f"\U0001f4cb {_task_name}\n"
+            f"{_task_type}"
+            + (f" \u00b7 {_lang_line}" if _lang_line else "")
+            + f" \u00b7 ~{plan.get('estimated_minutes', 0)}m"
+        ),
+        target=notify_target,
+        dry_run=dry_run_notify,
+    )
+
+    notify_milestone(
+        paths=paths,
+        conn=conn,
+        job_id=job_id,
         milestone="running",
-        message=f"\U0001f680 Translation started\n\U0001f194 {job_id}\nCodex+Gemini up to 3 rounds",
+        message=f"\U0001f680 Translating\n\U0001f4cb {_task_name}\n\u23f3 Codex+Gemini \u00b7 up to 3 rounds",
         target=notify_target,
         dry_run=dry_run_notify,
     )
@@ -408,13 +554,23 @@ def run_job_pipeline(
             job_id=job_id,
             milestone="review_ready",
             message=(
-                f"\u2705 Translation complete, ready for review\n"
-                f"\U0001f194 {job_id}\n"
+                f"\u2705 Translation complete\n"
+                f"\U0001f4cb {_task_name}\n"
                 f"\U0001f4c1 {result.get('review_dir')}\n\n"
                 f"Send: ok \u00b7 no {{reason}} \u00b7 rerun"
             ),
             target=notify_target,
             dry_run=dry_run_notify,
+        )
+        task_type = (result.get("intent") or {}).get("task_type", "unknown")
+        _store_job_memory(
+            job_id=job_id,
+            task_type=str(task_type),
+            rounds_count=int(result.get("iteration_count", 0)),
+            review_dir=review_dir,
+            kb_company=kb_company,
+            task_label=str(job.get("task_label") or ""),
+            kb_hits=kb_hits,
         )
     elif result.get("status") in {"needs_attention", "failed"}:
         rounds = (((result.get("quality_report") or {}).get("rounds")) or [])
@@ -436,7 +592,7 @@ def run_job_pipeline(
             conn=conn,
             job_id=job_id,
             milestone="needs_attention",
-            message=f"\u26a0\ufe0f Needs attention\n\U0001f194 {job_id}\nSend: status \u00b7 rerun \u00b7 no {{reason}}",
+            message=f"\u26a0\ufe0f Needs attention\n\U0001f4cb {_task_name}\nSend: status \u00b7 rerun \u00b7 no {{reason}}",
             target=notify_target,
             dry_run=dry_run_notify,
         )
@@ -446,7 +602,7 @@ def run_job_pipeline(
             conn=conn,
             job_id=job_id,
             milestone="failed",
-            message=f"\u274c Execution failed\n\U0001f194 {job_id}\n\U0001f4a1 Send: rerun to retry",
+            message=f"\u274c Failed\n\U0001f4cb {_task_name}\nSend: rerun to retry",
             target=notify_target,
             dry_run=dry_run_notify,
         )

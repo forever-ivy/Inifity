@@ -22,6 +22,8 @@ if [[ -f "$WORKSPACE_AGENTS_MD" ]]; then
     BEGIN {skip=0}
     /<!-- V5\.3_STRICT_ROUTER_BEGIN -->/ {skip=1; next}
     /<!-- V5\.3_STRICT_ROUTER_END -->/ {skip=0; next}
+    /<!-- V6_SKILL_TOOLS_BEGIN -->/ {skip=1; next}
+    /<!-- V6_SKILL_TOOLS_END -->/ {skip=0; next}
     skip==0 {print}
   ' "$WORKSPACE_AGENTS_MD" > "$tmp_file"
   cat >> "$tmp_file" <<'EOF'
@@ -37,6 +39,14 @@ if [[ -f "$WORKSPACE_AGENTS_MD" ]]; then
 - Never ask for files again if attachments were already present.
 - Never echo inline `<file ...>` payload content.
 <!-- V5.3_STRICT_ROUTER_END -->
+
+<!-- V6_SKILL_TOOLS_BEGIN -->
+## Available Skill Tools (V6.0)
+
+- **pdf-extract**: `/opt/homebrew/bin/pdftotext -layout <input.pdf> -` — layout-aware PDF text extraction
+- **sheetsmith**: `python ~/.openclaw/workspace/skills/sheetsmith/scripts/sheetsmith.py preview <file> --rows 9999` — spreadsheet preview
+- **openclaw-mem**: `openclaw memory search "<query>" --max-results 5 --json` / `openclaw memory store "<text>"` — cross-job terminology memory
+<!-- V6_SKILL_TOOLS_END -->
 EOF
   mv "$tmp_file" "$WORKSPACE_AGENTS_MD"
   echo "Patched strict-router rule into $WORKSPACE_AGENTS_MD"
@@ -63,6 +73,14 @@ if [[ -f "$ENV_FILE" ]]; then
     echo 'OPENCLAW_RAG_BASE_URL=http://127.0.0.1:8080' >> "$ENV_FILE"
     echo "Added OPENCLAW_RAG_BASE_URL=http://127.0.0.1:8080 to $ENV_FILE"
   fi
+  if ! grep -q '^OPENCLAW_KB_ISOLATION_MODE=' "$ENV_FILE"; then
+    echo 'OPENCLAW_KB_ISOLATION_MODE=reference_only' >> "$ENV_FILE"
+    echo "Added OPENCLAW_KB_ISOLATION_MODE=reference_only to $ENV_FILE"
+  fi
+  if ! grep -q '^OPENCLAW_ARCHIVE_REQUIRE_FINAL_UPLOAD=' "$ENV_FILE"; then
+    echo 'OPENCLAW_ARCHIVE_REQUIRE_FINAL_UPLOAD=1' >> "$ENV_FILE"
+    echo "Added OPENCLAW_ARCHIVE_REQUIRE_FINAL_UPLOAD=1 to $ENV_FILE"
+  fi
   if ! grep -q '^OPENCLAW_STATE_DB_PATH=' "$ENV_FILE"; then
     echo 'OPENCLAW_STATE_DB_PATH=/Users/ivy/.openclaw/runtime/translation/state.sqlite' >> "$ENV_FILE"
     echo "Added OPENCLAW_STATE_DB_PATH=/Users/ivy/.openclaw/runtime/translation/state.sqlite to $ENV_FILE"
@@ -74,6 +92,8 @@ OPENCLAW_TRANSLATION_THINKING=high
 OPENCLAW_REQUIRE_NEW=1
 OPENCLAW_RAG_BACKEND=clawrag
 OPENCLAW_RAG_BASE_URL=http://127.0.0.1:8080
+OPENCLAW_KB_ISOLATION_MODE=reference_only
+OPENCLAW_ARCHIVE_REQUIRE_FINAL_UPLOAD=1
 OPENCLAW_STATE_DB_PATH=/Users/ivy/.openclaw/runtime/translation/state.sqlite
 EOF
   echo "Created $ENV_FILE with strict router + high reasoning defaults."

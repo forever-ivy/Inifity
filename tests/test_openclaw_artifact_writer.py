@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from docx import Document
+from openpyxl import Workbook
 
 from scripts.openclaw_artifact_writer import write_artifacts
 
@@ -14,6 +15,16 @@ def _make_docx(path: Path, text: str) -> None:
     doc.add_paragraph(text)
     path.parent.mkdir(parents=True, exist_ok=True)
     doc.save(path)
+
+
+def _make_xlsx(path: Path, text: str) -> None:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    ws["A1"] = text
+    path.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(path)
+    wb.close()
 
 
 class OpenClawArtifactWriterTest(unittest.TestCase):
@@ -41,8 +52,6 @@ class OpenClawArtifactWriterTest(unittest.TestCase):
                 candidate_files=[],
                 review_questions=["Check table numbering."],
                 draft_payload={
-                    "draft_a_text": "Draft A line 1",
-                    "draft_b_text": "Draft B line 1",
                     "final_text": "Final line 1",
                     "final_reflow_text": "Final reflow line 1",
                     "review_brief_points": ["Focus on Arabic V2 additions."],
@@ -53,8 +62,6 @@ class OpenClawArtifactWriterTest(unittest.TestCase):
 
             self.assertTrue(Path(manifest["final_docx"]).exists())
             self.assertTrue(Path(manifest["final_reflow_docx"]).exists())
-            self.assertTrue(Path(manifest["draft_a_docx"]).exists())
-            self.assertTrue(Path(manifest["draft_b_docx"]).exists())
             self.assertTrue(Path(manifest["review_brief_docx"]).exists())
             self.assertTrue(Path(manifest["change_log_md"]).exists())
             self.assertTrue(Path(manifest["execution_plan_json"]).exists())
@@ -84,8 +91,6 @@ class OpenClawArtifactWriterTest(unittest.TestCase):
                 candidate_files=[],
                 review_questions=[],
                 draft_payload={
-                    "draft_a_text": "A1\nA2",
-                    "draft_b_text": "B1",
                     "final_text": "F1\nF2",
                     "final_reflow_text": "R1",
                     "review_brief_points": [],
@@ -97,6 +102,57 @@ class OpenClawArtifactWriterTest(unittest.TestCase):
 
             self.assertIn("final_xlsx", manifest)
             self.assertTrue(Path(manifest["final_xlsx"]).exists())
+
+    def test_write_artifacts_emits_per_source_translated_xlsx_when_multiple_sources(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            review = Path(tmp) / "_VERIFY" / "job_multi_xlsx"
+            template = Path(tmp) / "template.docx"
+            _make_docx(template, "Baseline text")
+
+            src1 = Path(tmp) / "one.xlsx"
+            src2 = Path(tmp) / "two.xlsx"
+            _make_xlsx(src1, "Hello")
+            _make_xlsx(src2, "Hello 2")
+
+            manifest = write_artifacts(
+                review_dir=str(review),
+                draft_a_template_path=str(template),
+                delta_pack={"added": [], "removed": [], "modified": [], "summary_by_section": [], "stats": {}},
+                model_scores={"judge_margin": 0.12, "term_hit": 0.97},
+                quality={"judge_margin": 0.12, "term_hit": 0.97, "expansion_used": False},
+                quality_report={"rounds": [], "convergence_reached": True, "stop_reason": "double_pass"},
+                job_id="job_multi_xlsx",
+                task_type="SPREADSHEET_TRANSLATION",
+                confidence=0.9,
+                estimated_minutes=8,
+                runtime_timeout_minutes=10,
+                iteration_count=1,
+                double_pass=True,
+                status_flags=[],
+                candidate_files=[
+                    {"path": str(src1), "name": src1.name},
+                    {"path": str(src2), "name": src2.name},
+                ],
+                review_questions=[],
+                draft_payload={
+                    "final_text": "ignored",
+                    "final_reflow_text": "ignored",
+                    "review_brief_points": [],
+                    "change_log_points": [],
+                    "xlsx_translation_map": [
+                        {"file": src1.name, "sheet": "Sheet1", "cell": "A1", "text": "Bonjour"},
+                        {"file": src2.name, "sheet": "Sheet1", "cell": "A1", "text": "Salut"},
+                    ],
+                },
+                generate_final_xlsx=True,
+                plan_payload={"intent": {"task_type": "SPREADSHEET_TRANSLATION"}, "plan": {"estimated_minutes": 8}},
+            )
+
+            self.assertIn("xlsx_files", manifest)
+            self.assertEqual(len(manifest["xlsx_files"]), 2)
+            for entry in manifest["xlsx_files"]:
+                self.assertTrue(Path(entry["path"]).exists())
+            self.assertNotIn("final_xlsx", manifest)
 
 
 if __name__ == "__main__":

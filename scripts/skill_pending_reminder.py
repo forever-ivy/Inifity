@@ -65,9 +65,11 @@ def main() -> int:
         elif job["status"] in {"needs_attention", "running_timeout", "needs_revision"}:
             next_cmd = "rerun"
 
+        _task_name = str(job.get("task_label") or "") or job_id
+
         summary = (
             f"\u23f0 Pending reminder\n"
-            f"\U0001f194 {job_id}\n"
+            f"\U0001f4cb {_task_name}\n"
             f"\U0001f4cc {job['status']} \u00b7 waiting {age_hours:.1f}h\n"
             f"\u23ed\ufe0f Send: {next_cmd}"
         )

@@ -22,6 +22,16 @@ def is_arabic_name(name: str) -> bool:
     return bool(re.search(r"[\u0600-\u06ff]", name))
 
 
+_LANG_TOKENS: list[tuple[str, list[str]]] = [
+    ("fr", ["french", "français", "francais", "fr_", "_fr", "fr-", "-fr"]),
+    ("es", ["spanish", "español", "espanol", "es_", "_es", "es-", "-es"]),
+    ("de", ["german", "deutsch", "de_", "_de", "de-", "-de"]),
+    ("pt", ["portuguese", "português", "portugues", "pt_", "_pt", "pt-", "-pt"]),
+    ("zh", ["chinese", "中文", "zh_", "_zh", "zh-", "-zh"]),
+    ("tr", ["turkish", "türkçe", "turkce", "tr_", "_tr", "tr-", "-tr"]),
+]
+
+
 def infer_language(path: Path) -> str:
     name = path.name
     lowered = name.lower()
@@ -29,6 +39,9 @@ def infer_language(path: Path) -> str:
         return "ar"
     if any(token in lowered for token in ("arabic", "ar_", "_ar", "ar-")):
         return "ar"
+    for lang_code, tokens in _LANG_TOKENS:
+        if any(token in lowered for token in tokens):
+            return lang_code
     return "en"
 
 
@@ -133,10 +146,10 @@ def build_bundle(root: Path, job_id: str) -> dict[str, Any]:
         else:
             bundle_files[key] = None
 
-    language_counts = {
-        "ar": sum(1 for x in candidate_files if x["language"] == "ar"),
-        "en": sum(1 for x in candidate_files if x["language"] == "en"),
-    }
+    language_counts: dict[str, int] = {}
+    for item in candidate_files:
+        lang = item["language"]
+        language_counts[lang] = language_counts.get(lang, 0) + 1
 
     role_counts: dict[str, int] = {}
     for item in candidate_files:

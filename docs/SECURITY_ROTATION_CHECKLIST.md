@@ -25,14 +25,14 @@ Complete before enabling V4.1 in production.
 
 ## 4) Env hygiene
 
-- [ ] Remove model keys from n8n `.env` (if legacy workflows still exist)
+- [ ] Remove any legacy `.env` files with tokens from version control (keep only local `.env.v4.local`)
 - [ ] Keep provider keys only in OpenClaw profile/runtime
 - [ ] Keep IMAP password only in local `.env.v4.local` (never commit)
-- [ ] Ensure `.env` / `.env.v4.local` are not shared publicly
+- [ ] Ensure `.env.v4.local` is not shared publicly
 
 ## 5) Verify after rotation
 
 - [ ] `openclaw health --json` returns `ok: true`
-- [ ] WhatsApp channel shows `running=true` and `connected=true`
+- [ ] Telegram bot can receive + send a test message (direct mode if enabled)
 - [ ] Email poll runner executes without exposing secrets in logs
 - [ ] `openclaw_result.json` is generated for a sample job

@@ -8,6 +8,7 @@ import base64
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -21,15 +22,76 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.build_delta_pack import build_delta, flatten_blocks
+from scripts.docx_preserver import extract_units as extract_docx_units
+from scripts.docx_preserver import units_to_payload as docx_units_to_payload
 from scripts.extract_docx_structure import extract_structure
 from scripts.openclaw_artifact_writer import write_artifacts
 from scripts.openclaw_quality_gate import QualityThresholds, compute_runtime_timeout, evaluate_quality
+from scripts.output_sanity import scan_markdown_in_translation_maps
 from scripts.v4_kb import extract_text
+from scripts.xlsx_preserver import extract_translatable_cells
+from scripts.xlsx_preserver import units_to_payload as xlsx_units_to_payload
+
+
+def _resolve_openclaw_bin() -> str:
+    """Find the openclaw binary, checking PATH and known install locations."""
+    found = shutil.which("openclaw")
+    if found:
+        return found
+    # Common npm-global install location on macOS
+    npm_global = Path.home() / ".npm-global" / "bin" / "openclaw"
+    if npm_global.exists():
+        return str(npm_global)
+    # Fallback: let subprocess try and fail with a clear error
+    return "openclaw"
+
+
+OPENCLAW_BIN = _resolve_openclaw_bin()
+FORMAT_QA_ENABLED = os.getenv("OPENCLAW_FORMAT_QA_ENABLED", "0").strip() == "1"
+DOCX_QA_ENABLED = os.getenv("OPENCLAW_DOCX_QA_ENABLED", "0").strip() == "1"
+
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    return str(os.getenv(name, default)).strip().lower() not in {"0", "false", "off", "no", ""}
+
+
+def _pipeline_version() -> str:
+    override = str(os.getenv("OPENCLAW_PIPELINE_VERSION", "")).strip()
+    if override:
+        return override
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(PROJECT_ROOT),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        sha = proc.stdout.strip() if proc.returncode == 0 else ""
+        if not sha:
+            return "unknown"
+        dirty = ""
+        proc2 = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=str(PROJECT_ROOT),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        if proc2.returncode == 0 and proc2.stdout.strip():
+            dirty = "+dirty"
+        return f"{sha}{dirty}"
+    except Exception:
+        return "unknown"
+
 
 TASK_TYPES = {
     "REVISION_UPDATE",
     "NEW_TRANSLATION",
     "BILINGUAL_REVIEW",
+    "BILINGUAL_PROOFREADING",
     "EN_ONLY_EDIT",
     "MULTI_FILE_BATCH",
     "TERMINOLOGY_ENFORCEMENT",
@@ -39,10 +101,11 @@ TASK_TYPES = {
 }
 
 REQUIRED_INPUTS_BY_TASK: dict[str, list[str]] = {
-    "REVISION_UPDATE": ["arabic_old", "arabic_new", "english_baseline"],
+    "REVISION_UPDATE": ["source_old", "source_new", "target_baseline"],
     "NEW_TRANSLATION": ["source_document"],
     "BILINGUAL_REVIEW": ["source_document", "target_document"],
-    "EN_ONLY_EDIT": ["english_document"],
+    "BILINGUAL_PROOFREADING": ["source_document", "target_document"],
+    "EN_ONLY_EDIT": ["target_document"],
     "MULTI_FILE_BATCH": ["batch_documents"],
     "TERMINOLOGY_ENFORCEMENT": ["target_document", "glossary"],
     "LOW_CONTEXT_TASK": [],
@@ -51,6 +114,59 @@ REQUIRED_INPUTS_BY_TASK: dict[str, list[str]] = {
 }
 
 CODEX_AGENT = os.getenv("OPENCLAW_CODEX_AGENT", "translator-core")
+
+TASK_TOOL_INSTRUCTIONS: dict[str, str] = {
+    "REVISION_UPDATE": (
+        "Compare the old and new source documents side by side. "
+        "Preserve unchanged target-language wording exactly. Only update target-language segments "
+        "that correspond to changed source-language paragraphs. Flag any ambiguous changes."
+    ),
+    "NEW_TRANSLATION": (
+        "Translate the source document from scratch. Maintain paragraph and heading structure. "
+        "Use formal register unless context indicates otherwise. Preserve all numbering, "
+        "bullet formatting, and table layouts."
+    ),
+    "BILINGUAL_PROOFREADING": (
+        "Compare the source document against the target translation. Correct errors in the "
+        "target language only — do not alter the source. Fix grammar, terminology, and "
+        "mistranslations while preserving the target language throughout."
+    ),
+    "BILINGUAL_REVIEW": (
+        "Evaluate translation quality by comparing source and target. Produce a detailed "
+        "review with specific findings: mistranslations, omissions, terminology issues, "
+        "and style inconsistencies. Suggest concrete improvements."
+    ),
+    "EN_ONLY_EDIT": (
+        "Edit the target-language document for grammar, clarity, and consistency. Do not translate. "
+        "Preserve the original meaning and structure. Fix punctuation, spelling, and "
+        "awkward phrasing."
+    ),
+    "SPREADSHEET_TRANSLATION": (
+        "Translate cell by cell, preserving the spreadsheet structure exactly. Do not alter "
+        "numbers, formulas, or cell references. Keep column/row alignment intact. "
+        "Translate headers and text cells only."
+    ),
+    "FORMAT_CRITICAL_TASK": (
+        "Structural fidelity is the top priority. Preserve all headings, numbering, "
+        "bullet hierarchies, table structures, and page breaks exactly. Translation "
+        "accuracy is secondary to format preservation."
+    ),
+    "TERMINOLOGY_ENFORCEMENT": (
+        "Apply the provided glossary strictly. Every glossary term must be translated "
+        "using the specified equivalent — no synonyms or alternatives. Flag any source "
+        "terms not covered by the glossary."
+    ),
+    "MULTI_FILE_BATCH": (
+        "Process each file independently but maintain cross-file consistency for shared "
+        "terminology and style. Use the same translation choices across all files. "
+        "Report per-file status."
+    ),
+    "LOW_CONTEXT_TASK": (
+        "Best-effort translation with limited context. Flag any uncertainties or ambiguous "
+        "passages explicitly. Prefer literal translation when context is insufficient "
+        "to determine intent."
+    ),
+}
 GEMINI_AGENT = os.getenv("OPENCLAW_GEMINI_AGENT", "review-core")
 OPENCLAW_CMD_TIMEOUT = int(os.getenv("OPENCLAW_AGENT_CALL_TIMEOUT_SECONDS", "700"))
 DOC_CONTEXT_CHARS = int(os.getenv("OPENCLAW_DOC_CONTEXT_CHARS", "45000"))
@@ -59,11 +175,125 @@ OPENCLAW_TRANSLATION_THINKING = os.getenv("OPENCLAW_TRANSLATION_THINKING", "high
 if OPENCLAW_TRANSLATION_THINKING not in VALID_THINKING_LEVELS:
     OPENCLAW_TRANSLATION_THINKING = "high"
 
+GLM_AGENT = os.getenv("OPENCLAW_GLM_AGENT", "glm-reviewer")
+GLM_GENERATOR_AGENT = os.getenv("OPENCLAW_GLM_GENERATOR_AGENT", GLM_AGENT)
+GLM_ENABLED = os.getenv("OPENCLAW_GLM_ENABLED", "0").strip() == "1"
+GLM_API_KEY = os.getenv("GLM_API_KEY", "")
+GLM_API_BASE_URL = os.getenv("GLM_API_BASE_URL", "https://open.bigmodel.cn/api/paas/v4")
+GLM_MODEL = os.getenv("OPENCLAW_GLM_MODEL", "zhipu/glm-5")
+
 
 def _normalize_text(text: str) -> str:
     text = text.replace("\u00a0", " ")
     text = re.sub(r"\s+", " ", text)
     return text.strip()
+
+
+def _normalize_docx_translation_map_ids(entries: Any) -> set[str]:
+    ids: set[str] = set()
+    if not entries:
+        return ids
+    if isinstance(entries, dict):
+        for k in entries.keys():
+            key = str(k or "").strip()
+            if key:
+                ids.add(key)
+        return ids
+    if not isinstance(entries, list):
+        return ids
+    for item in entries:
+        if not isinstance(item, dict):
+            continue
+        unit_id = str(item.get("id") or item.get("unit_id") or item.get("block_id") or item.get("cell_id") or "").strip()
+        if unit_id:
+            ids.add(unit_id)
+    return ids
+
+
+def _normalize_xlsx_translation_map_keys(entries: Any, *, xlsx_files: list[str]) -> set[tuple[str, str, str]]:
+    keys: set[tuple[str, str, str]] = set()
+    if not entries:
+        return keys
+
+    # Convenience shape for single-file jobs: {"Sheet!B2": "..."}
+    if isinstance(entries, dict) and len(xlsx_files) == 1:
+        file_name = xlsx_files[0]
+        for k in entries.keys():
+            raw = str(k or "")
+            if "!" not in raw:
+                continue
+            sheet, cell = raw.split("!", 1)
+            sheet = sheet.strip()
+            cell = cell.strip().upper()
+            if sheet and cell:
+                keys.add((file_name, sheet, cell))
+        return keys
+
+    if not isinstance(entries, list):
+        return keys
+    for item in entries:
+        if not isinstance(item, dict):
+            continue
+        file_name = str(item.get("file") or "").strip()
+        sheet = str(item.get("sheet") or "").strip()
+        cell = str(item.get("cell") or "").strip().upper()
+        if file_name and sheet and cell:
+            keys.add((file_name, sheet, cell))
+    return keys
+
+
+def _validate_format_preserve_coverage(context: dict[str, Any], draft: dict[str, Any]) -> tuple[list[str], dict[str, Any]]:
+    """Return (findings, meta) for missing/incomplete preserve maps."""
+    findings: list[str] = []
+    meta: dict[str, Any] = {}
+    preserve = (context.get("format_preserve") or {}) if isinstance(context.get("format_preserve"), dict) else {}
+
+    docx = preserve.get("docx_template") if isinstance(preserve.get("docx_template"), dict) else None
+    if docx and isinstance(docx.get("units"), list):
+        expected = {str(u.get("id") or "").strip() for u in docx.get("units") if isinstance(u, dict) and str(u.get("id") or "").strip()}
+        got = _normalize_docx_translation_map_ids(draft.get("docx_translation_map"))
+        missing = sorted(expected - got)
+        meta["docx_expected"] = len(expected)
+        meta["docx_got"] = len(got)
+        if expected and not got:
+            findings.append("docx_translation_map_missing")
+        elif missing:
+            findings.append(f"docx_translation_map_incomplete:missing={len(missing)}")
+            meta["docx_missing_sample"] = missing[:8]
+
+    xlsx_sources = preserve.get("xlsx_sources") if isinstance(preserve.get("xlsx_sources"), list) else []
+    if xlsx_sources:
+        expected_keys: set[tuple[str, str, str]] = set()
+        xlsx_files: list[str] = []
+        for src in xlsx_sources:
+            if not isinstance(src, dict):
+                continue
+            file_name = str(src.get("file") or "").strip()
+            if file_name:
+                xlsx_files.append(file_name)
+            for unit in (src.get("cell_units") or []):
+                if not isinstance(unit, dict):
+                    continue
+                sheet = str(unit.get("sheet") or "").strip()
+                cell = str(unit.get("cell") or "").strip().upper()
+                file_val = str(unit.get("file") or file_name).strip()
+                if file_val and sheet and cell:
+                    expected_keys.add((file_val, sheet, cell))
+
+        got_keys = _normalize_xlsx_translation_map_keys(draft.get("xlsx_translation_map"), xlsx_files=xlsx_files)
+        missing = sorted(expected_keys - got_keys)
+        meta["xlsx_expected"] = len(expected_keys)
+        meta["xlsx_got"] = len(got_keys)
+        if expected_keys and not got_keys:
+            findings.append("xlsx_translation_map_missing")
+        elif missing:
+            findings.append(f"xlsx_translation_map_incomplete:missing={len(missing)}")
+            meta["xlsx_missing_sample"] = [
+                {"file": f, "sheet": s, "cell": c}
+                for (f, s, c) in missing[:8]
+            ]
+
+    return findings, meta
 
 
 def _load_meta(args: argparse.Namespace) -> dict[str, Any]:
@@ -164,6 +394,25 @@ def _pick_file(candidates: list[dict[str, Any]], *, language: str, version: str 
     return None
 
 
+def _select_docx_template(candidates: list[dict[str, Any]], *, target_language: str) -> str | None:
+    target_lang = str(target_language or "").strip().lower()
+    template_path: str | None = None
+    if target_lang and target_lang not in {"unknown", "multi"}:
+        template_path = _pick_file(candidates, language=target_lang, version="v1") or _pick_file(candidates, language=target_lang)
+
+    if template_path and Path(template_path).suffix.lower() == ".docx":
+        return template_path
+
+    return next(
+        (
+            str(item.get("path"))
+            for item in candidates
+            if str(item.get("path") or "").lower().endswith(".docx")
+        ),
+        None,
+    )
+
+
 def _structure_text(struct: dict[str, Any], max_chars: int = DOC_CONTEXT_CHARS) -> str:
     lines: list[str] = []
     for block in struct.get("blocks", []):
@@ -232,9 +481,64 @@ def _extract_json_from_text(text: str) -> dict[str, Any]:
     raise ValueError("no JSON object in model output")
 
 
+def _iter_json_candidates(raw: str, *, limit: int = 12) -> list[Any]:
+    """Extract JSON values from mixed stdout that may contain log lines.
+
+    We scan for the first few JSON objects/arrays that `json.JSONDecoder.raw_decode`
+    can parse starting at a `{` or `[` character. This is more robust than
+    slicing `first_brace:last_brace` because OpenClaw may emit extra braces in
+    strings or append additional debug output after the JSON blob.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return []
+    decoder = json.JSONDecoder()
+    out: list[Any] = []
+    for idx, ch in enumerate(text):
+        if ch not in "{[":
+            continue
+        try:
+            value, _end = decoder.raw_decode(text[idx:])
+        except json.JSONDecodeError:
+            continue
+        out.append(value)
+        if len(out) >= max(1, int(limit)):
+            break
+    return out
+
+
+def _extract_openclaw_payload_text(payload: Any) -> str:
+    """Best-effort extraction of the first text payload from OpenClaw agent output."""
+    if isinstance(payload, dict):
+        # Common gateway format: {"result": {"payloads": [{"text": "..."}]}}
+        result = payload.get("result")
+        for container in (result, payload):
+            if not isinstance(container, dict):
+                continue
+            items = container.get("payloads")
+            if isinstance(items, list):
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    text = item.get("text")
+                    if isinstance(text, str) and text.strip():
+                        return text
+        # Fallback: some runtimes may return a direct text field.
+        direct = payload.get("text")
+        if isinstance(direct, str) and direct.strip():
+            return direct
+
+    if isinstance(payload, list):
+        for item in payload:
+            text = _extract_openclaw_payload_text(item)
+            if text:
+                return text
+    return ""
+
+
 def _agent_call(agent_id: str, message: str, timeout_seconds: int = OPENCLAW_CMD_TIMEOUT) -> dict[str, Any]:
     cmd = [
-        "openclaw",
+        OPENCLAW_BIN,
         "agent",
         "--agent",
         agent_id,
@@ -255,38 +559,104 @@ def _agent_call(agent_id: str, message: str, timeout_seconds: int = OPENCLAW_CMD
             "stdout": proc.stdout.strip(),
             "returncode": proc.returncode,
         }
+
+    payload: Any | None = None
     try:
         payload = json.loads(proc.stdout)
-    except json.JSONDecodeError as exc:
-        return {
-            "ok": False,
-            "error": f"agent_json_invalid:{agent_id}",
-            "detail": str(exc),
-            "stdout": proc.stdout[:2000],
-        }
-    text = ""
-    if isinstance(payload, dict):
-        result = payload.get("result") or {}
-        pay = result.get("payloads") or []
-        if pay and isinstance(pay, list):
-            text = str((pay[0] or {}).get("text") or "")
+    except json.JSONDecodeError:
+        # OpenClaw may emit non-JSON log lines before/after the actual JSON blob
+        # (e.g. "[agent/embedded] ..."). Extract the first decodable JSON value.
+        candidates = _iter_json_candidates(proc.stdout, limit=12)
+        if not candidates:
+            return {
+                "ok": False,
+                "error": f"agent_json_invalid:{agent_id}",
+                "detail": "no JSON value found in stdout",
+                "stdout": proc.stdout[:2000],
+            }
+
+        # Prefer the candidate that actually contains payload text.
+        payload = candidates[0]
+        for cand in candidates:
+            if _extract_openclaw_payload_text(cand):
+                payload = cand
+                break
+
+    text = _extract_openclaw_payload_text(payload)
     return {"ok": True, "agent_id": agent_id, "payload": payload, "text": text}
 
 
-def _available_slots(candidates: list[dict[str, Any]]) -> dict[str, bool]:
-    has_ar = any((x.get("language") == "ar") for x in candidates)
-    has_en = any((x.get("language") == "en") for x in candidates)
-    has_ar_v1 = any((x.get("language") == "ar" and x.get("version") == "v1") for x in candidates)
-    has_ar_v2 = any((x.get("language") == "ar" and x.get("version") == "v2") for x in candidates)
-    has_en_v1 = any((x.get("language") == "en" and x.get("version") == "v1") for x in candidates)
+LEGACY_REQUIRED_INPUTS_MAP = {
+    "arabic_old": "source_old",
+    "arabic_new": "source_new",
+    "english_baseline": "target_baseline",
+    "english_document": "target_document",
+}
+
+
+def _normalize_required_inputs(values: list[Any]) -> list[str]:
+    out: list[str] = []
+    for raw in values or []:
+        text = str(raw or "").strip().lower()
+        if not text:
+            continue
+        out.append(LEGACY_REQUIRED_INPUTS_MAP.get(text, text))
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for item in out:
+        if item in seen:
+            continue
+        seen.add(item)
+        deduped.append(item)
+    return deduped
+
+
+def _available_slots(
+    candidates: list[dict[str, Any]],
+    *,
+    source_language: str,
+    target_language: str,
+) -> dict[str, bool]:
+    has_any_file = len(candidates) > 0
+    languages = {str(x.get("language") or "").strip().lower() for x in candidates if str(x.get("language") or "").strip()}
+    has_multiple_langs = len(languages) >= 2
     has_glossary = any((x.get("role") == "glossary") for x in candidates)
+
+    src = str(source_language or "unknown").strip().lower()
+    tgt = str(target_language or "unknown").strip().lower()
+
+    def _has_lang(lang: str) -> bool:
+        if not lang or lang in {"unknown", "multi"}:
+            return False
+        return any((str(x.get("language") or "").strip().lower() == lang) for x in candidates)
+
+    def _has_lang_version(lang: str, version: str) -> bool:
+        if not lang or lang in {"unknown", "multi"}:
+            return False
+        return any(
+            (
+                str(x.get("language") or "").strip().lower() == lang
+                and str(x.get("version") or "").strip().lower() == version
+            )
+            for x in candidates
+        )
+
+    has_source = _has_lang(src)
+    has_target = _has_lang(tgt)
+    has_source_v1 = _has_lang_version(src, "v1")
+    has_source_v2 = _has_lang_version(src, "v2")
+    has_target_v1 = _has_lang_version(tgt, "v1")
+
+    source_document = has_any_file if src in {"unknown", "multi"} else (has_source or has_any_file)
+    target_document = has_target if tgt not in {"unknown", "multi"} else has_multiple_langs
+    target_baseline = has_target_v1 or has_target
+
     return {
-        "arabic_old": has_ar_v1,
-        "arabic_new": has_ar_v2,
-        "english_baseline": has_en_v1 or has_en,
-        "source_document": has_ar or has_en,
-        "target_document": has_en,
-        "english_document": has_en,
+        "source_old": has_source_v1,
+        "source_new": has_source_v2,
+        "target_baseline": target_baseline,
+        "source_document": source_document,
+        "target_document": target_document,
         "batch_documents": len(candidates) >= 2,
         "glossary": has_glossary,
     }
@@ -305,10 +675,10 @@ def _llm_intent(meta: dict[str, Any], candidates: list[dict[str, Any]]) -> dict[
 You are classifying a translation job. Return strict JSON only.
 
 Allowed task_type values:
-REVISION_UPDATE, NEW_TRANSLATION, BILINGUAL_REVIEW, EN_ONLY_EDIT, MULTI_FILE_BATCH, TERMINOLOGY_ENFORCEMENT, LOW_CONTEXT_TASK, FORMAT_CRITICAL_TASK, SPREADSHEET_TRANSLATION
+REVISION_UPDATE, NEW_TRANSLATION, BILINGUAL_REVIEW, BILINGUAL_PROOFREADING, EN_ONLY_EDIT, MULTI_FILE_BATCH, TERMINOLOGY_ENFORCEMENT, LOW_CONTEXT_TASK, FORMAT_CRITICAL_TASK, SPREADSHEET_TRANSLATION
 
 Canonical required_inputs values:
-arabic_old, arabic_new, english_baseline, source_document, target_document, english_document, batch_documents, glossary
+source_old, source_new, target_baseline, source_document, target_document, batch_documents, glossary
 
 Given:
 - subject/message: {message_blob}
@@ -317,8 +687,9 @@ Given:
 Output JSON schema:
 {{
   "task_type": "...",
-  "source_language": "ar|en|multi|unknown",
-  "target_language": "en|ar|multi|unknown",
+  "task_label": "Brief human-friendly task description, e.g. 'Proofread French → English translation of Teachers Survey'",
+  "source_language": "ar|en|fr|es|de|pt|zh|tr|multi|unknown",
+  "target_language": "ar|en|fr|es|de|pt|zh|tr|multi|unknown",
   "required_inputs": ["..."],
   "missing_inputs": ["..."],
   "confidence": 0.0,
@@ -332,6 +703,10 @@ Rules:
 - estimated_minutes must be integer.
 - If information is insufficient, choose LOW_CONTEXT_TASK.
 - missing_inputs must be inferred from files.
+- For proofreading/review tasks where user provides source + translation in any language pair, use BILINGUAL_PROOFREADING.
+- If any file is .xlsx or .csv, strongly prefer SPREADSHEET_TRANSLATION.
+- Infer source_language and target_language from the user message (e.g. "translate French to English" → source_language: "fr", target_language: "en").
+- task_label must always be a short human-readable description of the task, never empty.
 """.strip()
     call = _agent_call(CODEX_AGENT, prompt)
     if not call.get("ok"):
@@ -350,17 +725,22 @@ Rules:
     estimated_minutes = max(1, estimated_minutes)
     complexity_score = float(parsed.get("complexity_score", 30.0) or 30.0)
     complexity_score = max(1.0, min(100.0, complexity_score))
-    required = [str(x) for x in (parsed.get("required_inputs") or []) if str(x)]
+    required = _normalize_required_inputs(list(parsed.get("required_inputs") or []))
     if not required:
         required = REQUIRED_INPUTS_BY_TASK.get(task_type, [])
 
-    slots = _available_slots(candidates)
+    slots = _available_slots(
+        candidates,
+        source_language=str(parsed.get("source_language") or "unknown"),
+        target_language=str(parsed.get("target_language") or "unknown"),
+    )
     missing = [x for x in required if not slots.get(x, False)]
 
     return {
         "ok": True,
         "intent": {
             "task_type": task_type,
+            "task_label": str(parsed.get("task_label") or ""),
             "source_language": str(parsed.get("source_language") or "unknown"),
             "target_language": str(parsed.get("target_language") or "unknown"),
             "required_inputs": required,
@@ -374,13 +754,27 @@ Rules:
     }
 
 
-def _build_delta_pack(*, job_id: str, task_type: str, candidates: list[dict[str, Any]]) -> dict[str, Any]:
+def _build_delta_pack(
+    *,
+    job_id: str,
+    task_type: str,
+    candidates: list[dict[str, Any]],
+    source_language: str = "unknown",
+) -> dict[str, Any]:
     if task_type == "REVISION_UPDATE":
-        ar_v1 = _pick_file(candidates, language="ar", version="v1")
-        ar_v2 = _pick_file(candidates, language="ar", version="v2")
-        if ar_v1 and ar_v2:
-            s1 = next((x["structure"] for x in candidates if x["path"] == ar_v1), {})
-            s2 = next((x["structure"] for x in candidates if x["path"] == ar_v2), {})
+        lang = str(source_language or "unknown").strip().lower()
+
+        v1_path = _pick_file(candidates, language=lang, version="v1") if lang not in {"unknown", "multi"} else None
+        v2_path = _pick_file(candidates, language=lang, version="v2") if lang not in {"unknown", "multi"} else None
+
+        if not v1_path:
+            v1_path = next((x.get("path") for x in candidates if x.get("version") == "v1"), None)
+        if not v2_path:
+            v2_path = next((x.get("path") for x in candidates if x.get("version") == "v2"), None)
+
+        if v1_path and v2_path:
+            s1 = next((x["structure"] for x in candidates if x["path"] == v1_path), {})
+            s2 = next((x["structure"] for x in candidates if x["path"] == v2_path), {})
             return build_delta(
                 job_id=job_id,
                 v1_rows=flatten_blocks(s1),
@@ -419,13 +813,16 @@ def _build_delta_pack(*, job_id: str, task_type: str, candidates: list[dict[str,
 
 
 def _build_execution_context(meta: dict[str, Any], candidates: list[dict[str, Any]], intent: dict[str, Any], kb_hits: list[dict[str, Any]]) -> dict[str, Any]:
+    task_type = str(intent.get("task_type", "LOW_CONTEXT_TASK"))
     return {
         "job_id": meta.get("job_id"),
         "subject": meta.get("subject", ""),
         "message_text": meta.get("message_text", ""),
         "task_intent": intent,
+        "selected_tool": task_type,
         "candidate_files": _candidate_payload(candidates, include_text=True),
         "knowledge_context": kb_hits[:12],
+        "cross_job_memories": list(meta.get("cross_job_memories") or []),
         "rules": {
             "preserve_structure_first": True,
             "keep_unmodified_content": True,
@@ -436,6 +833,9 @@ def _build_execution_context(meta: dict[str, Any], candidates: list[dict[str, An
 
 
 def _codex_generate(context: dict[str, Any], previous_draft: dict[str, Any] | None, findings: list[str], round_index: int) -> dict[str, Any]:
+    task_type = str((context.get("task_intent") or {}).get("task_type", "LOW_CONTEXT_TASK"))
+    tool_instructions = TASK_TOOL_INSTRUCTIONS.get(task_type, TASK_TOOL_INSTRUCTIONS["LOW_CONTEXT_TASK"])
+
     prompt = f"""
 You are Codex translator. Work on this translation job and return strict JSON only.
 
@@ -450,10 +850,10 @@ Previous draft (if any):
 
 Output JSON:
 {{
-  "draft_a_text": "string",
-  "draft_b_text": "string",
   "final_text": "string",
   "final_reflow_text": "string",
+  "docx_translation_map": [{{"id": "p:12", "text": "..."}}],
+  "xlsx_translation_map": [{{"file": "file.xlsx", "sheet": "Sheet1", "cell": "B2", "text": "..."}}],
   "review_brief_points": ["..."],
   "change_log_points": ["..."],
   "resolved": ["..."],
@@ -462,9 +862,16 @@ Output JSON:
   "reasoning_summary": "string"
 }}
 
+Task type: {task_type}
+Tool instructions: {tool_instructions}
+
 Rules:
+- Follow the tool instructions above for this specific task type.
 - Produce complete output text for the selected task.
-- For REVISION_UPDATE: preserve unchanged English wording when possible.
+- If execution_context.format_preserve.docx_template is present, you MUST fill docx_translation_map for every unit id provided.
+- If execution_context.format_preserve.xlsx_sources is present, you MUST fill xlsx_translation_map for every provided (file, sheet, cell).
+- Do NOT output Markdown anywhere (no ``` fenced blocks, no **bold**, no headings like #/##, no "- " markdown bullets, no [text](url)).
+  Use plain text only. For lists use "• " or "1) " style, not Markdown.
 - If context is insufficient, keep "codex_pass": false and explain in unresolved.
 - JSON only.
 """.strip()
@@ -479,10 +886,16 @@ Rules:
     return {
         "ok": True,
         "data": {
-            "draft_a_text": str(parsed.get("draft_a_text") or ""),
-            "draft_b_text": str(parsed.get("draft_b_text") or ""),
-            "final_text": str(parsed.get("final_text") or ""),
-            "final_reflow_text": str(parsed.get("final_reflow_text") or ""),
+            "final_text": str(parsed.get("final_text") or parsed.get("draft_a_text") or parsed.get("draft_b_text") or ""),
+            "final_reflow_text": str(
+                parsed.get("final_reflow_text")
+                or parsed.get("draft_b_text")
+                or parsed.get("final_text")
+                or parsed.get("draft_a_text")
+                or ""
+            ),
+            "docx_translation_map": parsed.get("docx_translation_map") or parsed.get("docx_translation_blocks") or parsed.get("docx_table_cells") or [],
+            "xlsx_translation_map": parsed.get("xlsx_translation_map") or [],
             "review_brief_points": [str(x) for x in (parsed.get("review_brief_points") or [])],
             "change_log_points": [str(x) for x in (parsed.get("change_log_points") or [])],
             "resolved": [str(x) for x in (parsed.get("resolved") or [])],
@@ -495,10 +908,12 @@ Rules:
 
 
 def _gemini_review(context: dict[str, Any], draft: dict[str, Any], round_index: int) -> dict[str, Any]:
+    task_type = str((context.get("task_intent") or {}).get("task_type", "LOW_CONTEXT_TASK"))
     prompt = f"""
 You are Gemini reviewer. Validate translation quality and return strict JSON only.
 
 Round: {round_index}
+Task type: {task_type}
 Context:
 {json.dumps(context, ensure_ascii=False)}
 
@@ -555,6 +970,171 @@ Rules:
     }
 
 
+def _glm_direct_api_call(prompt: str) -> dict[str, Any]:
+    """Fallback: call Zhipu GLM API directly when OpenClaw agent unavailable."""
+    import urllib.request
+    if not GLM_API_KEY:
+        return {"ok": False, "error": "glm_api_key_not_set"}
+    url = f"{GLM_API_BASE_URL}/chat/completions"
+    body = json.dumps({
+        "model": GLM_MODEL.split("/")[-1] if "/" in GLM_MODEL else GLM_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.3,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {GLM_API_KEY}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        text = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+        return {"ok": True, "text": text, "source": "direct_api"}
+    except Exception as exc:
+        return {"ok": False, "error": f"glm_direct_api_failed: {exc}"}
+
+
+def _glm_generate(context: dict[str, Any], previous_draft: dict[str, Any] | None, findings: list[str], round_index: int) -> dict[str, Any]:
+    task_type = str((context.get("task_intent") or {}).get("task_type", "LOW_CONTEXT_TASK"))
+    tool_instructions = TASK_TOOL_INSTRUCTIONS.get(task_type, TASK_TOOL_INSTRUCTIONS["LOW_CONTEXT_TASK"])
+
+    prompt = f"""
+You are a translation generator (GLM). Work on this translation job and return strict JSON only.
+
+Round: {round_index}
+Previous unresolved findings: {json.dumps(findings, ensure_ascii=False)}
+
+Execution context:
+{json.dumps(context, ensure_ascii=False)}
+
+Previous draft (if any):
+{json.dumps(previous_draft or {}, ensure_ascii=False)}
+
+Output JSON:
+{{
+  "final_text": "string",
+  "final_reflow_text": "string",
+  "docx_translation_map": [{{"id": "p:12", "text": "..."}}],
+  "xlsx_translation_map": [{{"file": "file.xlsx", "sheet": "Sheet1", "cell": "B2", "text": "..."}}],
+  "review_brief_points": ["..."],
+  "change_log_points": ["..."],
+  "resolved": ["..."],
+  "unresolved": ["..."],
+  "codex_pass": true,
+  "reasoning_summary": "string"
+}}
+
+Task type: {task_type}
+Tool instructions: {tool_instructions}
+
+Rules:
+- Follow the tool instructions above for this specific task type.
+- Produce complete output text for the selected task.
+- If execution_context.format_preserve.docx_template is present, you MUST fill docx_translation_map for every unit id provided.
+- If execution_context.format_preserve.xlsx_sources is present, you MUST fill xlsx_translation_map for every provided (file, sheet, cell).
+- Do NOT output Markdown anywhere (no ``` fenced blocks, no **bold**, no headings like #/##, no "- " markdown bullets, no [text](url)).
+  Use plain text only. For lists use "• " or "1) " style, not Markdown.
+- If context is insufficient, keep "codex_pass": false and explain in unresolved.
+- JSON only.
+""".strip()
+
+    call = _agent_call(GLM_GENERATOR_AGENT, prompt)
+    if not call.get("ok"):
+        call = _glm_direct_api_call(prompt)
+    if not call.get("ok"):
+        return {"ok": False, "error": call.get("error"), "detail": call}
+
+    try:
+        parsed = _extract_json_from_text(str(call.get("text", "")))
+    except Exception as exc:
+        return {"ok": False, "error": "glm_generate_json_parse_failed", "detail": str(exc), "raw_text": call.get("text", "")}
+
+    return {
+        "ok": True,
+        "data": {
+            "final_text": str(parsed.get("final_text") or parsed.get("draft_a_text") or parsed.get("draft_b_text") or ""),
+            "final_reflow_text": str(
+                parsed.get("final_reflow_text")
+                or parsed.get("draft_b_text")
+                or parsed.get("final_text")
+                or parsed.get("draft_a_text")
+                or ""
+            ),
+            "docx_translation_map": parsed.get("docx_translation_map") or parsed.get("docx_translation_blocks") or parsed.get("docx_table_cells") or [],
+            "xlsx_translation_map": parsed.get("xlsx_translation_map") or [],
+            "review_brief_points": [str(x) for x in (parsed.get("review_brief_points") or [])],
+            "change_log_points": [str(x) for x in (parsed.get("change_log_points") or [])],
+            "resolved": [str(x) for x in (parsed.get("resolved") or [])],
+            "unresolved": [str(x) for x in (parsed.get("unresolved") or [])],
+            "codex_pass": bool(parsed.get("codex_pass")),
+            "reasoning_summary": str(parsed.get("reasoning_summary") or ""),
+        },
+        "raw": parsed,
+    }
+
+
+def _glm_review(context: dict[str, Any], draft: dict[str, Any], round_index: int) -> dict[str, Any]:
+    """Independent third-party review by GLM-5. Advisory only."""
+    task_type = str((context.get("task_intent") or {}).get("task_type", "LOW_CONTEXT_TASK"))
+    prompt = f"""
+You are an independent third-party translation reviewer (GLM-5). Evaluate this translation for:
+1. Terminology accuracy — are domain-specific terms translated correctly?
+2. Semantic completeness — is any meaning lost or added?
+3. Target language naturalness — does the translation read naturally?
+
+Round: {round_index}
+Task type: {task_type}
+
+Draft:
+{json.dumps(draft, ensure_ascii=False)}
+
+Return strict JSON:
+{{
+  "findings": ["..."],
+  "pass": true,
+  "terminology_score": 0.0,
+  "completeness_score": 0.0,
+  "naturalness_score": 0.0,
+  "reasoning_summary": "string"
+}}
+""".strip()
+
+    call = _agent_call(GLM_AGENT, prompt)
+    if not call.get("ok"):
+        call = _glm_direct_api_call(prompt)
+
+    if not call.get("ok"):
+        return {"ok": False, "error": call.get("error", "glm_review_failed")}
+
+    try:
+        parsed = _extract_json_from_text(str(call.get("text", "")))
+    except Exception as exc:
+        return {"ok": False, "error": "glm_json_parse_failed", "detail": str(exc)}
+
+    def _clamp(v: Any, fallback: float) -> float:
+        try:
+            val = float(v)
+        except (TypeError, ValueError):
+            return fallback
+        return max(0.0, min(1.0, val))
+
+    return {
+        "ok": True,
+        "data": {
+            "findings": [str(x) for x in (parsed.get("findings") or [])],
+            "pass": bool(parsed.get("pass")),
+            "terminology_score": _clamp(parsed.get("terminology_score"), 0.0),
+            "completeness_score": _clamp(parsed.get("completeness_score"), 0.0),
+            "naturalness_score": _clamp(parsed.get("naturalness_score"), 0.0),
+            "reasoning_summary": str(parsed.get("reasoning_summary") or ""),
+        },
+    }
+
+
 def _write_json(path: Path, payload: dict[str, Any]) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -600,16 +1180,244 @@ def _model_scores(job_id: str, last_round: dict[str, Any], gemini_enabled: bool)
         + 0.05 * 0.95
     )
     gemini_total = max(0.0, codex_total - 0.01) if gemini_enabled else 0.0
+    scores = {
+        "codex_primary": {"total": round(codex_total, 4)},
+        "gemini_reviewer": {"total": round(gemini_total, 4)},
+    }
+    glm_scores = last_round.get("glm_scores", {})
+    if glm_scores:
+        glm_total = (
+            0.4 * float(glm_scores.get("terminology", 0.0))
+            + 0.3 * float(glm_scores.get("completeness", 0.0))
+            + 0.3 * float(glm_scores.get("naturalness", 0.0))
+        )
+        scores["glm_reviewer"] = {"total": round(glm_total, 4)}
     return {
         "job_id": job_id,
         "winner": "codex_primary",
         "judge_margin": round(max(0.0, codex_total - gemini_total), 4),
         "term_hit": round(float(m.get("terminology_rate", 0.0)), 4),
-        "scores": {
-            "codex_primary": {"total": round(codex_total, 4)},
-            "gemini_reviewer": {"total": round(gemini_total, 4)},
-        },
+        "scores": scores,
     }
+
+
+def _weighted_review_score(review: dict[str, Any]) -> float:
+    """Compute a comparable score from Gemini review metrics (0..1)."""
+    return (
+        0.45 * float(review.get("terminology_rate", 0.0))
+        + 0.25 * float(review.get("structure_complete_rate", 0.0))
+        + 0.15 * float(review.get("target_language_purity", 0.0))
+        + 0.1 * float(review.get("numbering_consistency", 0.0))
+    )
+
+
+def _markdown_findings_from_sanity(sanity: dict[str, Any]) -> list[str]:
+    if not sanity or not sanity.get("has_markdown"):
+        return []
+    by_field = sanity.get("by_field") if isinstance(sanity.get("by_field"), dict) else {}
+    findings: list[str] = []
+    for field in ["final_text", "final_reflow_text", "docx_translation_map", "xlsx_translation_map"]:
+        field_data = by_field.get(field)
+        if not isinstance(field_data, dict) or not field_data.get("has_markdown"):
+            continue
+        patterns = ",".join([str(p) for p in (field_data.get("patterns") or [])]) or "unknown"
+        example = ""
+        examples = field_data.get("examples") or []
+        if isinstance(examples, list) and examples:
+            ex0 = examples[0]
+            if isinstance(ex0, dict):
+                example = str(ex0.get("example") or "")
+        example = example[:220].strip()
+        if example:
+            findings.append(f"markdown_detected:{field}:patterns={patterns}:example={example}")
+        else:
+            findings.append(f"markdown_detected:{field}:patterns={patterns}")
+
+    if not findings:
+        patterns = ",".join([str(p) for p in (sanity.get("patterns") or [])]) or "unknown"
+        findings.append(f"markdown_detected:patterns={patterns}")
+    return findings[:8]
+
+
+def _vision_findings_from_xlsx_qa(qa_result: dict[str, Any], *, file_name: str) -> tuple[list[str], list[str]]:
+    findings: list[str] = []
+    warnings: list[str] = []
+    status = str(qa_result.get("status") or "")
+    fidelity = float(qa_result.get("format_fidelity_min", qa_result.get("format_fidelity_score", 0.0)) or 0.0)
+    threshold = float(qa_result.get("threshold", 0.85) or 0.85)
+    if status != "passed":
+        findings.append(f"xlsx_format_fidelity_failed:{file_name}:min={round(fidelity,4)}<thr={round(threshold,4)}")
+        if qa_result.get("sheet_count_mismatch"):
+            findings.append(f"xlsx_sheet_count_mismatch:{file_name}")
+        for d in (qa_result.get("discrepancies") or [])[:4]:
+            if not isinstance(d, dict):
+                continue
+            loc = str(d.get("location") or d.get("sheet_index") or "unknown")
+            issue = str(d.get("issue") or "discrepancy")[:140]
+            sev = str(d.get("severity") or "unknown")
+            findings.append(f"xlsx_discrepancy:{file_name}:{sev}:{loc}:{issue}")
+    else:
+        if qa_result.get("aesthetics_warning"):
+            warnings.append(f"xlsx_aesthetics_warning:{file_name}:min={round(float(qa_result.get('aesthetics_min',0.0) or 0.0),4)}")
+    return findings, warnings
+
+
+def _vision_findings_from_docx_qa(qa_result: dict[str, Any], *, file_name: str) -> tuple[list[str], list[str]]:
+    findings: list[str] = []
+    warnings: list[str] = []
+    status = str(qa_result.get("status") or "")
+    fidelity = float(qa_result.get("format_fidelity_min", qa_result.get("format_fidelity_score", 0.0)) or 0.0)
+    threshold = float(qa_result.get("fidelity_threshold", 0.85) or 0.85)
+    if status != "passed":
+        findings.append(f"docx_format_fidelity_failed:{file_name}:min={round(fidelity,4)}<thr={round(threshold,4)}")
+        for d in (qa_result.get("discrepancies") or [])[:4]:
+            if not isinstance(d, dict):
+                continue
+            loc = str(d.get("location") or d.get("page_index") or "unknown")
+            issue = str(d.get("issue") or "discrepancy")[:140]
+            sev = str(d.get("severity") or "unknown")
+            findings.append(f"docx_discrepancy:{file_name}:{sev}:{loc}:{issue}")
+    else:
+        if qa_result.get("aesthetics_warning"):
+            warnings.append(f"docx_aesthetics_warning:{file_name}:min={round(float(qa_result.get('aesthetics_min',0.0) or 0.0),4)}")
+    return findings, warnings
+
+
+def _run_vision_trials(
+    *,
+    review_dir: str,
+    context: dict[str, Any],
+    draft: dict[str, Any],
+    round_idx: int,
+) -> tuple[list[str], list[str], dict[str, Any]]:
+    """Generate temporary preserve outputs and run vision QA. Returns (findings, warnings, results)."""
+    findings: list[str] = []
+    warnings: list[str] = []
+    results: dict[str, Any] = {"round": round_idx, "xlsx": {}, "docx": {}}
+
+    preserve = context.get("format_preserve") if isinstance(context.get("format_preserve"), dict) else {}
+    if not preserve:
+        return findings, warnings, results
+
+    trial_root = Path(review_dir) / ".system" / "vision_trial" / f"round_{round_idx}"
+    trial_root.mkdir(parents=True, exist_ok=True)
+    results["trial_root"] = str(trial_root.resolve())
+
+    # DOCX trial
+    docx_template = preserve.get("docx_template") if isinstance(preserve.get("docx_template"), dict) else None
+    if DOCX_QA_ENABLED and docx_template and docx_template.get("path") and draft.get("docx_translation_map"):
+        try:
+            from scripts.docx_preserver import apply_translation_map as apply_docx_translation_map
+            from scripts.docx_qa_vision import run_docx_qa
+
+            original_docx = Path(str(docx_template["path"])).expanduser().resolve()
+            trial_docx = trial_root / f"{original_docx.stem}_trial.docx"
+            apply_docx_translation_map(
+                template_docx=original_docx,
+                output_docx=trial_docx,
+                translation_map_entries=draft.get("docx_translation_map"),
+            )
+            max_pages = int(os.getenv("OPENCLAW_DOCX_QA_PAGES_MAX", "6"))
+            fidelity_threshold = float(
+                os.getenv(
+                    "OPENCLAW_DOCX_QA_THRESHOLD",
+                    os.getenv("OPENCLAW_FORMAT_QA_THRESHOLD", "0.85"),
+                )
+            )
+            aesthetics_warn = float(os.getenv("OPENCLAW_VISION_AESTHETICS_WARN_THRESHOLD", "0.7"))
+            qa = run_docx_qa(
+                original_docx=original_docx,
+                translated_docx=trial_docx,
+                review_dir=trial_root / "docx_qa",
+                max_pages=max_pages,
+                fidelity_threshold=fidelity_threshold,
+                aesthetics_warn_threshold=aesthetics_warn,
+            )
+            results["docx"][trial_docx.name] = qa
+            f, w = _vision_findings_from_docx_qa(qa, file_name=trial_docx.name)
+            findings.extend(f)
+            warnings.extend(w)
+        except Exception as exc:
+            results["docx_error"] = str(exc)
+
+    # XLSX trials
+    xlsx_sources = preserve.get("xlsx_sources") if isinstance(preserve.get("xlsx_sources"), list) else []
+    if FORMAT_QA_ENABLED and xlsx_sources and draft.get("xlsx_translation_map"):
+        try:
+            from scripts.xlsx_preserver import apply_translation_map as apply_xlsx_translation_map
+            from scripts.format_qa_vision import run_format_qa_loop
+
+            max_retries = int(os.getenv("OPENCLAW_VISION_QA_TRIAL_MAX_RETRIES", "0"))
+            for src in xlsx_sources:
+                if not isinstance(src, dict) or not src.get("path"):
+                    continue
+                original_xlsx = Path(str(src["path"])).expanduser().resolve()
+                trial_xlsx = trial_root / f"{original_xlsx.stem}_trial.xlsx"
+                apply_xlsx_translation_map(
+                    source_xlsx=original_xlsx,
+                    output_xlsx=trial_xlsx,
+                    translation_map_entries=draft.get("xlsx_translation_map"),
+                    beautify=True,
+                )
+                qa = run_format_qa_loop(
+                    original_xlsx,
+                    trial_xlsx,
+                    trial_root / "xlsx_qa" / original_xlsx.stem,
+                    max_retries=max(0, int(max_retries)),
+                )
+                results["xlsx"][trial_xlsx.name] = qa
+                f, w = _vision_findings_from_xlsx_qa(qa, file_name=trial_xlsx.name)
+                findings.extend(f)
+                warnings.extend(w)
+        except Exception as exc:
+            results["xlsx_error"] = str(exc)
+
+    return findings, warnings, results
+
+
+def _compute_hard_gates(
+    *,
+    review_dir: str,
+    context: dict[str, Any],
+    draft: dict[str, Any],
+    round_idx: int,
+    disallow_markdown: bool,
+    vision_in_round: bool,
+) -> tuple[list[str], list[str], dict[str, Any]]:
+    markdown_sanity: dict[str, Any] | None = None
+    markdown_findings: list[str] = []
+    if disallow_markdown:
+        markdown_sanity = scan_markdown_in_translation_maps(draft)
+        if markdown_sanity.get("has_markdown"):
+            markdown_findings = _markdown_findings_from_sanity(markdown_sanity)
+
+    preserve_findings, preserve_meta = _validate_format_preserve_coverage(context, draft)
+
+    findings: list[str] = []
+    findings.extend(markdown_findings)
+    findings.extend(preserve_findings)
+    warnings: list[str] = []
+
+    vision_results: dict[str, Any] = {}
+    if vision_in_round and (FORMAT_QA_ENABLED or DOCX_QA_ENABLED) and not findings:
+        vf, vw, vr = _run_vision_trials(review_dir=review_dir, context=context, draft=draft, round_idx=round_idx)
+        findings.extend(vf)
+        warnings.extend(vw)
+        vision_results = vr
+    else:
+        reason = "vision_disabled"
+        if vision_in_round and (FORMAT_QA_ENABLED or DOCX_QA_ENABLED) and findings:
+            reason = "blocked_by_markdown_or_preserve_coverage"
+        elif vision_in_round and not (FORMAT_QA_ENABLED or DOCX_QA_ENABLED):
+            reason = "qa_disabled"
+        vision_results = {"skipped": True, "reason": reason}
+
+    meta = {
+        "markdown_sanity": markdown_sanity,
+        "preserve_coverage": {"findings": preserve_findings, "meta": preserve_meta},
+        "vision_trial": vision_results,
+    }
+    return findings, warnings, meta
 
 
 def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
@@ -623,6 +1431,7 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
         review_dir = str(Path(root_path) / "Translated -EN" / "_VERIFY" / job_id)
 
     try:
+        pipeline_version = _pipeline_version()
         candidates = _enrich_structures(_collect_candidates(meta))
         router_mode = str(meta.get("router_mode") or "strict")
         token_guard_applied = bool(meta.get("token_guard_applied", False))
@@ -630,6 +1439,7 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
             response = {
                 "ok": False,
                 "job_id": job_id,
+                "pipeline_version": pipeline_version,
                 "status": "incomplete_input",
                 "review_dir": review_dir,
                 "errors": ["no_input_documents_found"],
@@ -651,6 +1461,7 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
             response = {
                 "ok": False,
                 "job_id": job_id,
+                "pipeline_version": pipeline_version,
                 "status": "failed",
                 "review_dir": review_dir,
                 "errors": [str(intent_result.get("error"))],
@@ -680,6 +1491,7 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
             "estimated_minutes": estimated_minutes,
             "complexity_score": complexity_score,
             "time_budget_minutes": runtime_timeout_minutes,
+            "pipeline_version": pipeline_version,
             "thinking_level": OPENCLAW_TRANSLATION_THINKING,
             "router_mode": router_mode,
             "token_guard_applied": token_guard_applied,
@@ -690,6 +1502,7 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
             response = {
                 "ok": False,
                 "job_id": job_id,
+                "pipeline_version": pipeline_version,
                 "status": "missing_inputs",
                 "review_dir": review_dir,
                 "intent": intent,
@@ -712,6 +1525,7 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
             response = {
                 "ok": True,
                 "job_id": job_id,
+                "pipeline_version": pipeline_version,
                 "status": "planned",
                 "review_dir": review_dir,
                 "intent": intent,
@@ -731,9 +1545,58 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
             return response
 
         task_type = str(intent.get("task_type", "LOW_CONTEXT_TASK"))
-        delta_pack = _build_delta_pack(job_id=job_id, task_type=task_type, candidates=candidates)
+        delta_pack = _build_delta_pack(
+            job_id=job_id,
+            task_type=task_type,
+            candidates=candidates,
+            source_language=str(intent.get("source_language") or "unknown"),
+        )
         kb_hits = list(meta.get("knowledge_context") or [])
         execution_context = _build_execution_context(meta, candidates, intent, kb_hits)
+
+        # --- Format-preserving payloads (XLSX/DOCX) ---
+        format_preserve: dict[str, Any] = {}
+        try:
+            # XLSX sources
+            xlsx_sources = [
+                Path(str(c.get("path") or "")).expanduser().resolve()
+                for c in candidates
+                if str(c.get("path") or "") and Path(str(c.get("path") or "")).suffix.lower() == ".xlsx"
+            ]
+            if xlsx_sources:
+                max_cells = int(os.getenv("OPENCLAW_XLSX_TRANSLATION_MAX_CELLS", "2000"))
+                max_chars = int(os.getenv("OPENCLAW_XLSX_MAX_CHARS_PER_CELL", "400"))
+                sources_payload: list[dict[str, Any]] = []
+                for src in xlsx_sources:
+                    units, meta_info = extract_translatable_cells(src, max_cells=max_cells)
+                    sources_payload.append(
+                        {
+                            "file": src.name,
+                            "path": str(src),
+                            "cell_units": xlsx_units_to_payload(units, max_chars_per_cell=max_chars),
+                            "meta": meta_info,
+                        }
+                    )
+                format_preserve["xlsx_sources"] = sources_payload
+
+            # DOCX template units (used for preserve output)
+            template_docx = _select_docx_template(candidates, target_language=str(intent.get("target_language") or ""))
+            if template_docx and Path(template_docx).suffix.lower() == ".docx":
+                max_units = int(os.getenv("OPENCLAW_DOCX_TRANSLATION_MAX_UNITS", "1200"))
+                max_chars = int(os.getenv("OPENCLAW_DOCX_MAX_CHARS_PER_UNIT", "800"))
+                units, meta_info = extract_docx_units(Path(template_docx), max_units=max_units, max_chars_per_unit=max_chars)
+                format_preserve["docx_template"] = {
+                    "file": Path(template_docx).name,
+                    "path": str(Path(template_docx).expanduser().resolve()),
+                    "units": docx_units_to_payload(units),
+                    "meta": meta_info,
+                }
+        except Exception as exc:
+            status_flags.append("format_preserve_payload_error")
+            format_preserve["error"] = str(exc)
+
+        if format_preserve:
+            execution_context["format_preserve"] = format_preserve
 
         rounds: list[dict[str, Any]] = []
         previous_findings: list[str] = []
@@ -741,36 +1604,116 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
         errors: list[str] = []
         gemini_enabled = bool(meta.get("gemini_available", True))
         system_round_root = Path(review_dir) / ".system" / "rounds"
+        disallow_markdown = _env_flag("OPENCLAW_DISALLOW_MARKDOWN", "1")
+        vision_in_round = _env_flag("OPENCLAW_VISION_QA_IN_ROUND", "1")
+        vision_fix_limit = max(0, int(os.getenv("OPENCLAW_VISION_QA_MAX_RETRIES", "2")))
+        vision_fix_used = 0
+        markdown_sanity_by_round: dict[str, Any] = {}
+        preserve_coverage_by_round: dict[str, Any] = {}
+        vision_trials_by_round: dict[str, Any] = {}
 
         for round_idx in range(1, thresholds.max_rounds + 1):
             codex_gen = _codex_generate(execution_context, current_draft, previous_findings, round_idx)
-            if not codex_gen.get("ok"):
-                errors.append(str(codex_gen.get("error", "codex_generation_failed")))
+            glm_gen = _glm_generate(execution_context, current_draft, previous_findings, round_idx)
+
+            codex_data: dict[str, Any] | None = codex_gen.get("data") if codex_gen.get("ok") else None
+            glm_data: dict[str, Any] | None = glm_gen.get("data") if glm_gen.get("ok") else None
+
+            generation_errors: dict[str, str] = {}
+            if not codex_data:
+                generation_errors["codex"] = str(codex_gen.get("error", "codex_generation_failed"))
+            if not glm_data:
+                generation_errors["glm"] = str(glm_gen.get("error", "glm_generation_failed"))
+            if not codex_data and not glm_data:
+                errors.append(f"no_generator_candidates:{generation_errors}")
                 break
-            codex_data = codex_gen["data"]
+
+            codex_review: dict[str, Any] | None = None
+            glm_review: dict[str, Any] | None = None
+            gemini_review_errors: list[str] = []
 
             if gemini_enabled:
-                gemini_rev = _gemini_review(execution_context, codex_data, round_idx)
-                if not gemini_rev.get("ok"):
+                if codex_data:
+                    rev = _gemini_review(execution_context, codex_data, round_idx)
+                    if rev.get("ok"):
+                        codex_review = rev["data"]
+                    else:
+                        gemini_review_errors.append(str(rev.get("error", "gemini_review_failed:codex")))
+                if glm_data:
+                    rev = _gemini_review(execution_context, glm_data, round_idx)
+                    if rev.get("ok"):
+                        glm_review = rev["data"]
+                    else:
+                        gemini_review_errors.append(str(rev.get("error", "gemini_review_failed:glm")))
+
+                if not codex_review and not glm_review:
                     gemini_enabled = False
                     status_flags.append("degraded_single_model")
-                    gemini_data = {
-                        "findings": list(codex_data.get("unresolved") or []),
-                        "resolved": list(codex_data.get("resolved") or []),
-                        "unresolved": list(codex_data.get("unresolved") or []),
-                        "pass": bool(codex_data.get("codex_pass")),
-                        "terminology_rate": 0.9,
-                        "structure_complete_rate": 0.9,
-                        "target_language_purity": 0.9,
-                        "numbering_consistency": 0.9,
-                        "reasoning_summary": "Gemini unavailable; degraded single model path.",
+
+            def _candidate_info(source: str, draft: dict[str, Any] | None, review: dict[str, Any] | None) -> dict[str, Any]:
+                if not draft:
+                    return {
+                        "source": source,
+                        "ok": False,
+                        "generator_pass": False,
+                        "reviewed": False,
+                        "gemini_pass": False,
+                        "pass": False,
+                        "score": -1.0,
                     }
-                else:
-                    review_findings = list(gemini_rev["data"].get("findings") or gemini_rev["data"].get("unresolved") or [])
-                    codex_fix = _codex_generate(execution_context, codex_data, review_findings, round_idx)
-                    if codex_fix.get("ok"):
-                        codex_data = codex_fix["data"]
-                    gemini_final = _gemini_review(execution_context, codex_data, round_idx)
+                generator_pass = bool(draft.get("codex_pass"))
+                reviewed = bool(review)
+                gemini_pass = bool(review.get("pass")) if review else False
+                pass_flag = generator_pass and (gemini_pass if gemini_enabled else True)
+                score = _weighted_review_score(review) if review else -1.0
+                return {
+                    "source": source,
+                    "ok": True,
+                    "generator_pass": generator_pass,
+                    "reviewed": reviewed,
+                    "gemini_pass": gemini_pass,
+                    "pass": pass_flag,
+                    "score": score,
+                }
+
+            codex_info = _candidate_info("codex", codex_data, codex_review)
+            glm_info = _candidate_info("glm", glm_data, glm_review)
+
+            selected_source = "codex" if codex_data else "glm"
+            selected_draft = codex_data or glm_data or {}
+            selected_review = codex_review if selected_source == "codex" else glm_review
+            selection_reason = "fallback"
+
+            if gemini_enabled:
+                scored = [x for x in [codex_info, glm_info] if x.get("ok")]
+                passing = [x for x in scored if x.get("pass")]
+                pool = passing or scored
+                if pool:
+                    best = max(
+                        pool,
+                        key=lambda x: (bool(x.get("pass")), float(x.get("score", -1.0)), 1 if x.get("source") == "codex" else 0),
+                    )
+                    selected_source = str(best.get("source"))
+                    selected_draft = codex_data if selected_source == "codex" else (glm_data or {})
+                    selected_review = codex_review if selected_source == "codex" else glm_review
+                    selection_reason = "pass_and_score" if passing else "score_only"
+
+            review_findings: list[str] = []
+            if selected_review:
+                review_findings = list(selected_review.get("findings") or selected_review.get("unresolved") or [])
+            if not review_findings:
+                review_findings = list(selected_draft.get("unresolved") or [])
+
+            did_fix = False
+            if review_findings:
+                codex_fix = _codex_generate(execution_context, selected_draft, review_findings, round_idx)
+                if codex_fix.get("ok"):
+                    selected_draft = codex_fix["data"]
+                    did_fix = True
+
+            if gemini_enabled:
+                if did_fix:
+                    gemini_final = _gemini_review(execution_context, selected_draft, round_idx)
                     if gemini_final.get("ok"):
                         gemini_data = gemini_final["data"]
                     else:
@@ -778,21 +1721,33 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
                         status_flags.append("degraded_single_model")
                         gemini_data = {
                             "findings": review_findings,
-                            "resolved": list(codex_data.get("resolved") or []),
-                            "unresolved": list(codex_data.get("unresolved") or []),
-                            "pass": bool(codex_data.get("codex_pass")),
+                            "resolved": list(selected_draft.get("resolved") or []),
+                            "unresolved": list(selected_draft.get("unresolved") or []),
+                            "pass": bool(selected_draft.get("codex_pass")),
                             "terminology_rate": 0.9,
                             "structure_complete_rate": 0.9,
                             "target_language_purity": 0.9,
                             "numbering_consistency": 0.9,
                             "reasoning_summary": "Gemini second-pass failed; degraded single model path.",
                         }
+                else:
+                    gemini_data = selected_review or {
+                        "findings": list(selected_draft.get("unresolved") or []),
+                        "resolved": list(selected_draft.get("resolved") or []),
+                        "unresolved": list(selected_draft.get("unresolved") or []),
+                        "pass": bool(selected_draft.get("codex_pass")),
+                        "terminology_rate": 0.9,
+                        "structure_complete_rate": 0.9,
+                        "target_language_purity": 0.9,
+                        "numbering_consistency": 0.9,
+                        "reasoning_summary": "Gemini review unavailable for selected candidate; degraded metrics.",
+                    }
             else:
                 gemini_data = {
-                    "findings": list(codex_data.get("unresolved") or []),
-                    "resolved": list(codex_data.get("resolved") or []),
-                    "unresolved": list(codex_data.get("unresolved") or []),
-                    "pass": bool(codex_data.get("codex_pass")),
+                    "findings": list(selected_draft.get("unresolved") or []),
+                    "resolved": list(selected_draft.get("resolved") or []),
+                    "unresolved": list(selected_draft.get("unresolved") or []),
+                    "pass": bool(selected_draft.get("codex_pass")),
                     "terminology_rate": 0.9,
                     "structure_complete_rate": 0.9,
                     "target_language_purity": 0.9,
@@ -800,21 +1755,142 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
                     "reasoning_summary": "Gemini disabled by runtime settings.",
                 }
 
+            def _fix_findings_for_retry() -> list[str]:
+                items: list[str] = []
+                if isinstance(gemini_data, dict):
+                    items.extend([str(x) for x in (gemini_data.get("unresolved") or [])])
+                    if not items:
+                        items.extend([str(x) for x in (gemini_data.get("findings") or [])])
+                if not items:
+                    items.extend([str(x) for x in (selected_draft.get("unresolved") or [])])
+                return [x for x in items if str(x).strip()]
+
+            hard_fix_attempts: list[dict[str, Any]] = []
+            hard_findings, hard_warnings, hard_meta = _compute_hard_gates(
+                review_dir=review_dir,
+                context=execution_context,
+                draft=selected_draft,
+                round_idx=round_idx,
+                disallow_markdown=disallow_markdown,
+                vision_in_round=vision_in_round,
+            )
+
+            while hard_findings and vision_fix_used < vision_fix_limit:
+                vision_fix_used += 1
+                retry_findings = sorted(set(_fix_findings_for_retry() + hard_findings))
+                retry_findings = [x for x in retry_findings if str(x).strip()][:40]
+                hard_fix_attempts.append({"attempt": vision_fix_used, "findings": retry_findings})
+
+                codex_fix = _codex_generate(execution_context, selected_draft, retry_findings, round_idx)
+                if not codex_fix.get("ok"):
+                    errors.append(f"hard_gate_fix_failed:{codex_fix.get('error')}")
+                    break
+                selected_draft = codex_fix["data"]
+                did_fix = True
+
+                if gemini_enabled:
+                    gemini_final = _gemini_review(execution_context, selected_draft, round_idx)
+                    if gemini_final.get("ok"):
+                        gemini_data = gemini_final["data"]
+                    else:
+                        gemini_enabled = False
+                        status_flags.append("degraded_single_model")
+                        gemini_data = {
+                            "findings": retry_findings,
+                            "resolved": list(selected_draft.get("resolved") or []),
+                            "unresolved": list(selected_draft.get("unresolved") or retry_findings),
+                            "pass": bool(selected_draft.get("codex_pass")),
+                            "terminology_rate": 0.9,
+                            "structure_complete_rate": 0.9,
+                            "target_language_purity": 0.9,
+                            "numbering_consistency": 0.9,
+                            "reasoning_summary": "Gemini unavailable during hard-gate retry; degraded single model path.",
+                        }
+
+                hard_findings, hard_warnings, hard_meta = _compute_hard_gates(
+                    review_dir=review_dir,
+                    context=execution_context,
+                    draft=selected_draft,
+                    round_idx=round_idx,
+                    disallow_markdown=disallow_markdown,
+                    vision_in_round=vision_in_round,
+                )
+
             round_dir = system_round_root / f"round_{round_idx}"
-            codex_ref = _write_json(round_dir / "codex_output.json", codex_data)
-            gemini_ref = _write_json(round_dir / "gemini_review.json", gemini_data)
+            candidate_refs: dict[str, str] = {}
+            review_refs: dict[str, str] = {}
+            if codex_data:
+                candidate_refs["codex"] = _write_json(round_dir / "candidate_codex.json", codex_data)
+            if glm_data:
+                candidate_refs["glm"] = _write_json(round_dir / "candidate_glm.json", glm_data)
+            if codex_review:
+                review_refs["codex"] = _write_json(round_dir / "gemini_review_codex.json", codex_review)
+            if glm_review:
+                review_refs["glm"] = _write_json(round_dir / "gemini_review_glm.json", glm_review)
+
+            selection_meta = {
+                "selected": selected_source,
+                "reason": selection_reason,
+                "did_fix": did_fix,
+                "generation_errors": generation_errors,
+                "gemini_review_errors": gemini_review_errors,
+                "candidates": {
+                    "codex": codex_info,
+                    "glm": glm_info,
+                },
+            }
+            selection_meta["hard_gate"] = {
+                "findings": hard_findings,
+                "warnings": hard_warnings,
+                "attempts": hard_fix_attempts,
+            }
+            _write_json(round_dir / "selection.json", selection_meta)
+
+            selected_ref = _write_json(round_dir / "selected_output.json", selected_draft)
+            gemini_ref = _write_json(round_dir / "gemini_review_selected.json", gemini_data)
             rec = _round_record(
                 round_idx=round_idx,
-                codex_path=codex_ref,
+                codex_path=selected_ref,
                 gemini_path=gemini_ref,
-                codex_data=codex_data,
+                codex_data=selected_draft,
                 gemini_data=gemini_data,
             )
+            rec["selected_candidate"] = selected_source
+            rec["candidate_refs"] = candidate_refs
+            rec["candidate_review_refs"] = review_refs
+            rec["selection"] = selection_meta
+            rec["hard_findings"] = hard_findings
+            rec["warnings"] = hard_warnings
+            rec["hard_fix_attempts"] = hard_fix_attempts
+            rec["metrics"]["hard_fail_items"] = list(hard_findings)
+            if hard_findings:
+                rec["unresolved"] = sorted(set([str(x) for x in (rec.get("unresolved") or [])] + [str(x) for x in hard_findings]))
+                rec["pass"] = False
             rounds.append(rec)
-            current_draft = codex_data
+
+            markdown_sanity_by_round[str(round_idx)] = hard_meta.get("markdown_sanity")
+            preserve_coverage_by_round[str(round_idx)] = hard_meta.get("preserve_coverage")
+            vision_trials_by_round[str(round_idx)] = hard_meta.get("vision_trial")
+
+            current_draft = selected_draft
             previous_findings = list(rec.get("unresolved") or [])
             if rec.get("pass"):
                 break
+
+        # --- GLM-5 advisory review (after rounds loop) ---
+        if GLM_ENABLED and rounds and current_draft:
+            glm_result = _glm_review(execution_context, current_draft, len(rounds))
+            if glm_result.get("ok"):
+                glm_data = glm_result["data"]
+                rounds[-1]["glm_findings"] = glm_data.get("findings", [])
+                rounds[-1]["glm_pass"] = glm_data.get("pass", False)
+                rounds[-1]["glm_scores"] = {
+                    "terminology": glm_data.get("terminology_score", 0.0),
+                    "completeness": glm_data.get("completeness_score", 0.0),
+                    "naturalness": glm_data.get("naturalness_score", 0.0),
+                }
+            else:
+                status_flags.append("glm_review_failed")
 
         if not rounds:
             status = "failed"
@@ -835,10 +1911,21 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
             "rounds": rounds,
             "convergence_reached": bool(rounds and rounds[-1].get("pass")),
             "stop_reason": "double_pass" if rounds and rounds[-1].get("pass") else ("max_rounds" if rounds else "hard_fail"),
+            "pipeline_version": pipeline_version,
+            "markdown_policy": {"disallow_markdown": disallow_markdown},
+            "vision_policy": {
+                "vision_in_round": vision_in_round,
+                "hard_gate_max_retries": vision_fix_limit,
+                "format_qa_enabled": FORMAT_QA_ENABLED,
+                "docx_qa_enabled": DOCX_QA_ENABLED,
+            },
             "thinking_level": OPENCLAW_TRANSLATION_THINKING,
             "router_mode": router_mode,
             "token_guard_applied": token_guard_applied,
             "knowledge_backend": str(meta.get("knowledge_backend") or "local"),
+            "markdown_sanity_by_round": markdown_sanity_by_round,
+            "preserve_coverage_by_round": preserve_coverage_by_round,
+            "vision_trials_by_round": vision_trials_by_round,
         }
 
         last_round = rounds[-1] if rounds else {"metrics": {}}
@@ -847,17 +1934,38 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
 
         if not current_draft:
             current_draft = {
-                "draft_a_text": "",
-                "draft_b_text": "",
                 "final_text": "",
                 "final_reflow_text": "",
                 "review_brief_points": [],
                 "change_log_points": [],
             }
 
+        target_lang = str(intent.get("target_language") or "").strip().lower()
+        _template_candidate = None
+        if target_lang and target_lang not in {"unknown", "multi"}:
+            _template_candidate = _pick_file(candidates, language=target_lang, version="v1") or _pick_file(candidates, language=target_lang)
+        if not _template_candidate:
+            _template_candidate = next(
+                (
+                    str(item.get("path"))
+                    for item in candidates
+                    if str(item.get("path") or "").lower().endswith(".docx")
+                ),
+                None,
+            )
+        # Only use template if it's a .docx — xlsx/csv can't be opened by python-docx
+        if _template_candidate and Path(_template_candidate).suffix.lower() != ".docx":
+            _template_candidate = None
+
+        xlsx_sources = [
+            Path(str(c.get("path") or ""))
+            for c in candidates
+            if str(c.get("path") or "") and Path(str(c.get("path") or "")).suffix.lower() == ".xlsx"
+        ]
+
         artifacts = write_artifacts(
             review_dir=review_dir,
-            draft_a_template_path=_pick_file(candidates, language="en", version="v1") or _pick_file(candidates, language="en"),
+            draft_a_template_path=_template_candidate,
             delta_pack=delta_pack,
             model_scores=model_scores,
             quality=quality,
@@ -881,6 +1989,16 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
                     "sender": meta.get("sender", ""),
                     "message_id": meta.get("message_id", ""),
                     "raw_message_ref": meta.get("raw_message_ref", ""),
+                    "pipeline_version": pipeline_version,
+                    "markdown_policy": {
+                        "disallow_markdown": disallow_markdown,
+                    },
+                    "vision_policy": {
+                        "vision_in_round": vision_in_round,
+                        "hard_gate_max_retries": vision_fix_limit,
+                        "format_qa_enabled": FORMAT_QA_ENABLED,
+                        "docx_qa_enabled": DOCX_QA_ENABLED,
+                    },
                     "thinking_level": OPENCLAW_TRANSLATION_THINKING,
                     "router_mode": router_mode,
                     "token_guard_applied": token_guard_applied,
@@ -889,9 +2007,134 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
             },
         )
 
+        # --- Optional format QA (Gemini Vision) for spreadsheet outputs ---
+        if FORMAT_QA_ENABLED:
+            format_qa_results: dict[str, Any] = {}
+            xlsx_jobs: list[tuple[Path, Path]] = []
+            for entry in (artifacts.get("xlsx_files") or []):
+                if not isinstance(entry, dict):
+                    continue
+                src = str(entry.get("source_path") or "").strip()
+                out = str(entry.get("path") or "").strip()
+                if not src or not out:
+                    continue
+                src_path = Path(src).expanduser()
+                out_path = Path(out).expanduser()
+                if src_path.suffix.lower() != ".xlsx" or out_path.suffix.lower() != ".xlsx":
+                    continue
+                xlsx_jobs.append((src_path, out_path))
+
+            # Back-compat: single Final.xlsx without xlsx_files entries.
+            final_xlsx_path = str(artifacts.get("final_xlsx") or "").strip()
+            if not xlsx_jobs and xlsx_sources and final_xlsx_path:
+                xlsx_jobs.append((xlsx_sources[0].expanduser(), Path(final_xlsx_path).expanduser()))
+
+            if xlsx_jobs:
+                try:
+                    from scripts.format_qa_vision import run_format_qa_loop
+
+                    max_retries = int(os.getenv("OPENCLAW_FORMAT_QA_MAX_RETRIES", "2"))
+                    qa_root = Path(review_dir) / ".system" / "format_qa"
+                    qa_root.mkdir(parents=True, exist_ok=True)
+
+                    any_failed = False
+                    any_aesthetic_warning = False
+                    for original_xlsx, translated_xlsx in xlsx_jobs:
+                        if not original_xlsx.exists() or not translated_xlsx.exists():
+                            status_flags.append("format_qa_skipped_missing_files")
+                            continue
+                        qa_result = run_format_qa_loop(
+                            original_xlsx.resolve(),
+                            translated_xlsx.resolve(),
+                            qa_root / original_xlsx.stem,
+                            max_retries=max_retries,
+                        )
+                        format_qa_results[translated_xlsx.name] = qa_result
+                        if qa_result.get("status") != "passed":
+                            any_failed = True
+                        if qa_result.get("aesthetics_warning"):
+                            any_aesthetic_warning = True
+
+                    if format_qa_results:
+                        quality_report["format_qa"] = format_qa_results
+                        quality = evaluate_quality(
+                            model_scores=model_scores,
+                            delta_pack=delta_pack,
+                            thresholds=thresholds,
+                            format_qa_results=format_qa_results,
+                        )
+                    if any_aesthetic_warning:
+                        status_flags.append("format_qa_aesthetics_warning")
+                    if any_failed:
+                        status_flags.append("format_qa_failed")
+                        if status == "review_ready":
+                            status = "needs_attention"
+                except Exception as exc:
+                    status_flags.append("format_qa_error")
+                    quality_report["format_qa_error"] = str(exc)
+            elif xlsx_sources and not final_xlsx_path:
+                status_flags.append("format_qa_skipped_no_final_xlsx")
+
+        # --- Optional DOCX vision QA (Gemini Vision) for layout fidelity + aesthetics ---
+        if DOCX_QA_ENABLED:
+            try:
+                from scripts.docx_qa_vision import run_docx_qa
+
+                original_docx_value = str(_template_candidate or "").strip()
+                translated_docx_value = str(artifacts.get("final_docx") or "").strip()
+                if not original_docx_value or not translated_docx_value:
+                    status_flags.append("docx_qa_skipped_no_template")
+                else:
+                    original_docx_path = Path(original_docx_value).expanduser()
+                    translated_docx_path = Path(translated_docx_value).expanduser()
+
+                    if original_docx_path.suffix.lower() != ".docx" or translated_docx_path.suffix.lower() != ".docx":
+                        status_flags.append("docx_qa_skipped_not_docx")
+                    elif original_docx_path.exists() and translated_docx_path.exists():
+                        max_pages = int(os.getenv("OPENCLAW_DOCX_QA_PAGES_MAX", "6"))
+                        fidelity_threshold = float(
+                            os.getenv(
+                                "OPENCLAW_DOCX_QA_THRESHOLD",
+                                os.getenv("OPENCLAW_FORMAT_QA_THRESHOLD", "0.85"),
+                            )
+                        )
+                        aesthetics_warn = float(os.getenv("OPENCLAW_VISION_AESTHETICS_WARN_THRESHOLD", "0.7"))
+                        qa_root = Path(review_dir) / ".system" / "docx_qa"
+                        qa_root.mkdir(parents=True, exist_ok=True)
+                        docx_qa = run_docx_qa(
+                            original_docx=original_docx_path.resolve(),
+                            translated_docx=translated_docx_path.resolve(),
+                            review_dir=qa_root / original_docx_path.stem,
+                            max_pages=max_pages,
+                            fidelity_threshold=fidelity_threshold,
+                            aesthetics_warn_threshold=aesthetics_warn,
+                        )
+                        quality_report["docx_vision_qa"] = {translated_docx_path.name: docx_qa}
+                        if docx_qa.get("aesthetics_warning"):
+                            status_flags.append("docx_layout_ugly")
+                        if docx_qa.get("status") != "passed":
+                            status_flags.append("docx_qa_failed")
+                            if status == "review_ready":
+                                status = "needs_attention"
+                    else:
+                        status_flags.append("docx_qa_skipped_missing_files")
+            except Exception as exc:
+                status_flags.append("docx_qa_error")
+                quality_report["docx_qa_error"] = str(exc)
+
+        # Keep the on-disk quality report consistent with the returned payload.
+        try:
+            quality_report_json = str(artifacts.get("quality_report_json") or "").strip()
+            if quality_report_json:
+                report_path = Path(quality_report_json).expanduser()
+                _write_json(report_path, quality_report)
+        except Exception:
+            pass
+
         response = {
             "ok": status == "review_ready",
             "job_id": job_id,
+            "pipeline_version": pipeline_version,
             "status": status,
             "review_dir": review_dir,
             "artifacts": artifacts,
@@ -916,6 +2159,7 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
         response = {
             "ok": False,
             "job_id": job_id,
+            "pipeline_version": pipeline_version,
             "status": "failed",
             "review_dir": review_dir,
             "errors": [str(exc)],

@@ -31,12 +31,13 @@ Configure provider auth inside OpenClaw profile:
 - `openai-codex` (primary)
 - `google-antigravity` / Gemini (fallback/reviewer)
 
-## WhatsApp
+## Telegram
 
-OpenClaw WhatsApp channel must be:
-- configured
-- linked
-- running + connected
+Inbound tasks are received via the standalone Telegram bot (`scripts/telegram_bot.py`).
+
+Outbound notifications use:
+- `OPENCLAW_NOTIFY_CHANNEL=telegram`
+- Optional direct send: `TELEGRAM_DIRECT_MODE=1` + `TELEGRAM_BOT_TOKEN`
 
 Check:
 ```bash

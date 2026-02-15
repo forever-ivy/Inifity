@@ -18,13 +18,16 @@
         "REVISION_UPDATE",
         "NEW_TRANSLATION",
         "BILINGUAL_REVIEW",
+        "BILINGUAL_PROOFREADING",
         "EN_ONLY_EDIT",
         "MULTI_FILE_BATCH",
         "TERMINOLOGY_ENFORCEMENT",
         "LOW_CONTEXT_TASK",
-        "FORMAT_CRITICAL_TASK"
+        "FORMAT_CRITICAL_TASK",
+        "SPREADSHEET_TRANSLATION"
       ]
     },
+    "task_label": { "type": "string", "description": "Brief human-friendly task description" },
     "source_language": { "type": "string" },
     "target_language": { "type": "string" },
     "required_inputs": {

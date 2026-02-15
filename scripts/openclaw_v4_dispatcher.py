@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""V5.2 dispatcher for OpenClaw full orchestration."""
+"""V6.0 dispatcher for OpenClaw full orchestration."""
 
 from __future__ import annotations
 
@@ -133,7 +133,7 @@ def cmd_approval(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="OpenClaw V5.2 dispatcher")
+    parser = argparse.ArgumentParser(description="OpenClaw V6.0 dispatcher")
     parser.add_argument("--work-root", default=str(DEFAULT_WORK_ROOT))
     parser.add_argument("--kb-root", default=str(DEFAULT_KB_ROOT))
     parser.add_argument("--notify-target", default=DEFAULT_NOTIFY_TARGET)
@@ -157,12 +157,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_msg.add_argument("--payload-file")
     p_msg.add_argument("--auto-run", action="store_true")
 
-    # backward compat alias
-    p_wa = sub.add_parser("whatsapp-event")
-    p_wa.add_argument("--payload-json")
-    p_wa.add_argument("--payload-file")
-    p_wa.add_argument("--auto-run", action="store_true")
-
     p_job = sub.add_parser("run-job")
     p_job.add_argument("--job-id", required=True)
 
@@ -182,7 +176,7 @@ def main() -> int:
 
     if args.cmd == "email-poll":
         return cmd_email_poll(args)
-    if args.cmd in ("message-event", "whatsapp-event"):
+    if args.cmd == "message-event":
         return cmd_message_event(args)
     if args.cmd == "run-job":
         return cmd_run_job(args)
