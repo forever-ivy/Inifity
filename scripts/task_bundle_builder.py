@@ -49,11 +49,13 @@ def infer_language(path: Path) -> str:
 
 def infer_version(path: Path) -> str:
     lowered = path.name.lower()
-    if re.search(r"(^|[\s_\-\[\(])v1([\s_\-\]\)]|$)", lowered):
+    # Allow . as right boundary to handle file extensions like "report_v2.docx"
+    # Also allow underscore between v and number (e.g., "v_3_file.docx")
+    if re.search(r"(^|[\s_\-\[\(])v_?1([\s_\.\-\]\)]|$)", lowered):
         return "v1"
-    if re.search(r"(^|[\s_\-\[\(])v2([\s_\-\]\)]|$)", lowered):
+    if re.search(r"(^|[\s_\-\[\(])v_?2([\s_\.\-\]\)]|$)", lowered):
         return "v2"
-    if re.search(r"(^|[\s_\-\[\(])v3([\s_\-\]\)]|$)", lowered):
+    if re.search(r"(^|[\s_\-\[\(])v_?3([\s_\.\-\]\)]|$)", lowered):
         return "v3"
     return "unknown"
 

@@ -96,27 +96,10 @@
         },
         "files": {
           "type": "object",
-          "properties": {
-            "arabic_v1": {
-              "type": [
-                "object",
-                "null"
-              ]
-            },
-            "arabic_v2": {
-              "type": [
-                "object",
-                "null"
-              ]
-            },
-            "english_v1": {
-              "type": [
-                "object",
-                "null"
-              ]
-            }
-          },
-          "additionalProperties": true
+          "description": "Dynamic slots keyed by language_version (e.g., arabic_v1, fr_v2, zh_v1)",
+          "additionalProperties": {
+            "type": ["object", "null"]
+          }
         }
       },
       "additionalProperties": true

@@ -13,12 +13,8 @@
     },
     "files": {
       "type": "object",
-      "required": ["arabic_v1", "arabic_v2", "english_v1"],
-      "properties": {
-        "arabic_v1": {"$ref": "#/$defs/fileStruct"},
-        "arabic_v2": {"$ref": "#/$defs/fileStruct"},
-        "english_v1": {"$ref": "#/$defs/fileStruct"}
-      }
+      "description": "Dynamic slots keyed by language_version (e.g., arabic_v1, fr_v2, zh_v1)",
+      "additionalProperties": {"$ref": "#/$defs/fileStruct"}
     }
   },
   "$defs": {

@@ -424,6 +424,164 @@ class SkillApprovalTest(unittest.TestCase):
             )
             self.assertFalse(review_dir.exists())
 
+    @patch("scripts.skill_approval.send_message")
+    def test_discard_moves_files_to_trash(self, mocked_send):
+        """discard should move review_dir and inbox_dir to _TRASH and set status to discarded."""
+        mocked_send.return_value = {"ok": True}
+        with tempfile.TemporaryDirectory() as tmp:
+            work_root = Path(tmp) / "Translation Task"
+            kb_root = Path(tmp) / "Knowledge Repository"
+            kb_root.mkdir(parents=True, exist_ok=True)
+            job_id = "job_test_discard"
+            inbox = work_root / "_INBOX" / "telegram" / job_id
+            inbox.mkdir(parents=True, exist_ok=True)
+            create_job(
+                source="telegram",
+                sender="+8613",
+                subject="Test",
+                message_text="",
+                inbox_dir=inbox,
+                job_id=job_id,
+                work_root=work_root,
+            )
+            paths = ensure_runtime_paths(work_root)
+            review_dir = paths.review_root / job_id
+            review_dir.mkdir(parents=True, exist_ok=True)
+
+            # Create some test files
+            (review_dir / "test.docx").write_text("test", encoding="utf-8")
+            (inbox / "source.txt").write_text("source", encoding="utf-8")
+
+            # Verify files exist before discard
+            self.assertTrue(review_dir.is_dir())
+            self.assertTrue(inbox.is_dir())
+
+            conn = db_connect(paths)
+            set_sender_active_job(conn, sender="+8613", job_id=job_id)
+            conn.close()
+
+            result = handle_command(
+                command_text="discard duplicate submission",
+                work_root=work_root,
+                kb_root=kb_root,
+                target="+8613",
+                sender="+8613",
+                dry_run_notify=True,
+            )
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["status"], "discarded")
+            self.assertEqual(result.get("reason"), "duplicate submission")
+
+            # Verify job status is updated
+            conn = db_connect(paths)
+            job = get_job(conn, job_id)
+            conn.close()
+            self.assertEqual(job["status"], "discarded")
+
+            # Verify files are moved to trash
+            trash_root = work_root / "_TRASH"
+            self.assertTrue(trash_root.is_dir())
+            trash_dirs = list(trash_root.iterdir())
+            self.assertEqual(len(trash_dirs), 1)
+            trash_dir = trash_dirs[0]
+            self.assertTrue(trash_dir.name.startswith(f"{job_id}_"))
+
+            # Verify subdirectories exist in trash
+            trash_review = trash_dir / "review"
+            trash_inbox = trash_dir / "inbox"
+            self.assertTrue(trash_review.is_dir())
+            self.assertTrue(trash_inbox.is_dir())
+            self.assertTrue((trash_review / "test.docx").exists())
+            self.assertTrue((trash_inbox / "source.txt").exists())
+
+            # Verify original directories are gone
+            self.assertFalse(review_dir.exists())
+            self.assertFalse(inbox.is_dir())
+
+    @patch("scripts.skill_approval.send_message")
+    def test_discard_with_default_reason(self, mocked_send):
+        """discard without a reason should use 'manual_discard'."""
+        mocked_send.return_value = {"ok": True}
+        with tempfile.TemporaryDirectory() as tmp:
+            work_root = Path(tmp) / "Translation Task"
+            kb_root = Path(tmp) / "Knowledge Repository"
+            kb_root.mkdir(parents=True, exist_ok=True)
+            job_id = "job_test_discard_default"
+            inbox = work_root / "_INBOX" / "telegram" / job_id
+            inbox.mkdir(parents=True, exist_ok=True)
+            create_job(
+                source="telegram",
+                sender="+8613",
+                subject="Test",
+                message_text="",
+                inbox_dir=inbox,
+                job_id=job_id,
+                work_root=work_root,
+            )
+
+            result = handle_command(
+                command_text="discard",
+                work_root=work_root,
+                kb_root=kb_root,
+                target="+8613",
+                sender="+8613",
+                dry_run_notify=True,
+            )
+            self.assertTrue(result["ok"])
+            self.assertEqual(result.get("reason"), "manual_discard")
+
+    @patch("scripts.skill_approval.send_message")
+    def test_discard_allows_rerun(self, mocked_send):
+        """After discard, rerun should be allowed."""
+        mocked_send.return_value = {"ok": True}
+        with tempfile.TemporaryDirectory() as tmp:
+            work_root = Path(tmp) / "Translation Task"
+            kb_root = Path(tmp) / "Knowledge Repository"
+            (kb_root / "30_Reference" / "Eventranz").mkdir(parents=True, exist_ok=True)
+            job_id = "job_test_discard_rerun"
+            inbox = work_root / "_INBOX" / "telegram" / job_id
+            inbox.mkdir(parents=True, exist_ok=True)
+            create_job(
+                source="telegram",
+                sender="+8613",
+                subject="Test",
+                message_text="",
+                inbox_dir=inbox,
+                job_id=job_id,
+                work_root=work_root,
+            )
+
+            # First discard
+            result = handle_command(
+                command_text="discard",
+                work_root=work_root,
+                kb_root=kb_root,
+                target="+8613",
+                sender="+8613",
+                dry_run_notify=True,
+            )
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["status"], "discarded")
+
+            # Set kb_company for rerun
+            paths = ensure_runtime_paths(work_root)
+            conn = db_connect(paths)
+            set_job_kb_company(conn, job_id=job_id, kb_company="Eventranz")
+            set_sender_active_job(conn, sender="+8613", job_id=job_id)
+            conn.close()
+
+            # Now rerun should work
+            rerun = handle_command(
+                command_text="rerun",
+                work_root=work_root,
+                kb_root=kb_root,
+                target="+8613",
+                sender="+8613",
+                dry_run_notify=True,
+            )
+            self.assertTrue(rerun["ok"])
+            self.assertEqual(rerun.get("status"), "queued")
+
 
 if __name__ == "__main__":
     unittest.main()

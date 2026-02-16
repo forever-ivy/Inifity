@@ -59,18 +59,19 @@ def _extract_missing(errors: list[str]) -> list[str]:
 
 
 _STATUS_LABEL: dict[str, str] = {
-    "collecting": "Collecting",
-    "queued": "Queued",
-    "received": "Received",
-    "running": "Running...",
-    "canceled": "\u26d4\ufe0f Canceled",
-    "review_ready": "\u2705 Review ready",
-    "needs_attention": "\u26a0\ufe0f Needs attention",
-    "needs_revision": "\U0001f527 Needs revision",
-    "missing_inputs": "\U0001f4ed Missing inputs",
-    "verified": "\u2705 Verified",
-    "failed": "\u274c Failed",
-    "incomplete_input": "\U0001f4ed Incomplete input",
+    "collecting": "📥 Collecting files",
+    "queued": "⏳ Queued",
+    "received": "📩 Received",
+    "running": "🔄 Running...",
+    "canceled": "⏹️ Canceled",
+    "review_ready": "✅ Review ready",
+    "needs_attention": "⚠️ Needs attention",
+    "needs_revision": "🔧 Needs revision",
+    "missing_inputs": "📭 Missing inputs",
+    "verified": "✅ Verified",
+    "failed": "❌ Failed",
+    "incomplete_input": "📭 Incomplete input",
+    "discarded": "🗑️ Discarded",
 }
 
 
@@ -78,21 +79,27 @@ def _status_label(status: str) -> str:
     return _STATUS_LABEL.get(status, status)
 
 
+# Available commands by status
+_COMMANDS_BY_STATUS: dict[str, str] = {
+    "collecting": "run | status | discard",
+    "queued": "status | cancel",
+    "received": "run | status | discard",
+    "running": "status | cancel",
+    "canceled": "rerun | discard | status",
+    "review_ready": "ok | no {reason} | rerun | status",
+    "needs_attention": "ok | no {reason} | rerun | discard | status",
+    "needs_revision": "rerun | discard | status",
+    "missing_inputs": "upload files → rerun | status | discard",
+    "verified": "new (start fresh)",
+    "failed": "rerun | discard | status",
+    "incomplete_input": "upload files → rerun | discard | status",
+    "discarded": "new (start fresh)",
+}
+
+
 def next_action_for_status(status: str, *, require_new: bool = True) -> str:
     status_norm = (status or "").strip().lower()
-    if status_norm in {"collecting", "received", "missing_inputs", "needs_revision"}:
-        return "run"
-    if status_norm in {"queued"}:
-        return "status"
-    if status_norm in {"running"}:
-        return "status"
-    if status_norm in {"canceled"}:
-        return "rerun | new" if require_new else "rerun"
-    if status_norm in {"review_ready", "needs_attention", "failed", "incomplete_input"}:
-        return "ok | no {reason} | rerun"
-    if status_norm in {"verified"}:
-        return "new" if require_new else "done"
-    return "new" if require_new else "run"
+    return _COMMANDS_BY_STATUS.get(status_norm, "status")
 
 
 def build_status_card(

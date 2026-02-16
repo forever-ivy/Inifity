@@ -23,11 +23,13 @@ def build_file_fingerprint(files: Any) -> str:
     parts: list[str] = []
 
     if isinstance(files, dict):
-        for key in ["arabic_v1", "arabic_v2", "english_v1"]:
-            item = files.get(key)
+        # Iterate over all keys dynamically instead of hardcoding specific slots
+        for key, item in files.items():
             if not item:
                 continue
-            p = Path(item["path"])
+            p = Path(item.get("path", ""))
+            if not p.exists():
+                continue
             stat = p.stat()
             parts.append(f"{key}:{p.resolve()}:{stat.st_size}:{stat.st_mtime_ns}")
     elif isinstance(files, list):
@@ -53,6 +55,10 @@ def build_doc_struct(root: Path, job_id: str) -> dict[str, Any]:
     legacy_files = bundle["files"]
     candidate_files = bundle.get("candidate_files", [])
 
+    # Use dynamic slots from bundle instead of hardcoding
+    # Initialize files dict with all keys from legacy_files, all set to None
+    files_dict: dict[str, Any] = {key: None for key in legacy_files.keys()}
+
     output: dict[str, Any] = {
         "job_id": job_id,
         "root": str(root.resolve()),
@@ -61,11 +67,7 @@ def build_doc_struct(root: Path, job_id: str) -> dict[str, Any]:
         "legacy_missing": bundle.get("legacy_missing", []),
         "stats": bundle.get("stats", {}),
         "file_fingerprint": "",
-        "files": {
-            "arabic_v1": None,
-            "arabic_v2": None,
-            "english_v1": None,
-        },
+        "files": files_dict,
         "candidate_files": [],
     }
 
@@ -85,7 +87,8 @@ def build_doc_struct(root: Path, job_id: str) -> dict[str, Any]:
         output["candidate_files"].append(enriched)
         candidate_by_path[str(path.resolve())] = enriched
 
-    for key in ["arabic_v1", "arabic_v2", "english_v1"]:
+    # Iterate over all slots dynamically from legacy_files
+    for key in legacy_files.keys():
         if not legacy_files.get(key):
             continue
         path = Path(legacy_files[key]["path"]).resolve()

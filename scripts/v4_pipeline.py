@@ -14,6 +14,7 @@ from scripts.attention_summary import attention_summary
 from scripts.openclaw_translation_orchestrator import run as run_translation
 
 log = logging.getLogger(__name__)
+from scripts.detail_validator import validate_job_artifacts, ValidationReportGenerator
 from scripts.task_bundle_builder import infer_language, infer_role, infer_version
 from scripts.v4_kb import retrieve_kb_with_fallback, sync_kb_with_rag
 from scripts.v4_runtime import (
@@ -553,6 +554,84 @@ def run_job_pipeline(
         dry_run=dry_run_notify,
     )
     result = run_translation(meta, plan_only=False)
+
+    # Run detail validation if enabled (after translation, before quality gate)
+    detail_validation_enabled = str(
+        os.getenv("OPENCLAW_DETAIL_VALIDATION", "1")
+    ).strip().lower() not in {"0", "false", "off", "no"}
+    if detail_validation_enabled and result.get("status") in {"review_ready", "needs_attention"}:
+        try:
+            # Get original file paths from candidates
+            original_files = []
+            for c in candidates:
+                p = c.get("path")
+                if p:
+                    original_files.append(Path(p))
+
+            # Get translated file paths from artifacts
+            artifacts = dict(result.get("artifacts", {}))
+            translated_files = []
+            for artifact_name in ["Final.docx", "Final-Reflow.docx", "Translated.xlsx"]:
+                artifact_path = artifacts.get(artifact_name)
+                if artifact_path:
+                    translated_files.append(Path(artifact_path))
+
+            # Only validate if we have both original and translated files
+            if original_files and translated_files:
+                validation_results = validate_job_artifacts(
+                    review_dir=review_dir,
+                    original_files=original_files,
+                    translated_files=translated_files,
+                )
+
+                if validation_results:
+                    # Generate markdown report
+                    generator = ValidationReportGenerator()
+                    report = generator.generate_markdown(
+                        list(validation_results.values()),
+                        job_id=job_id,
+                    )
+
+                    # Write to .system directory
+                    system_dir = review_dir / ".system"
+                    system_dir.mkdir(parents=True, exist_ok=True)
+                    report_path = system_dir / "detail_validation_report.md"
+                    report_path.write_text(report, encoding="utf-8")
+
+                    # Generate summary for result
+                    validation_summary = generator.generate_summary(list(validation_results.values()))
+                    result["detail_validation"] = validation_summary
+
+                    # Record event
+                    record_event(
+                        conn,
+                        job_id=job_id,
+                        milestone="detail_validation_done",
+                        payload={
+                            "files_validated": len(validation_results),
+                            "score": validation_summary.get("score", 0.0),
+                            "issues_found": validation_summary.get("failed", 0),
+                            "warnings": validation_summary.get("warnings", 0),
+                            "report_path": str(report_path.resolve()),
+                        },
+                    )
+
+                    log.info(
+                        "Detail validation: %d files, score=%.2f, %d critical, %d warnings",
+                        validation_summary.get("total_files", 0),
+                        validation_summary.get("score", 0.0),
+                        validation_summary.get("failed", 0),
+                        validation_summary.get("warnings", 0),
+                    )
+        except Exception as e:
+            # Don't fail the job if detail validation has issues
+            log.warning("Detail validation failed for job %s: %s", job_id, e)
+            record_event(
+                conn,
+                job_id=job_id,
+                milestone="detail_validation_failed",
+                payload={"error": str(e)},
+            )
 
     update_job_result(
         conn,

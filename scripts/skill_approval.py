@@ -49,9 +49,10 @@ from scripts.v4_runtime import (
     write_job,
 )
 
-ACTIVE_JOB_STATUSES = {"collecting", "received", "missing_inputs", "needs_revision"}
+ACTIVE_JOB_STATUSES = {"collecting", "received", "missing_inputs", "needs_revision", "discarded"}
 RUN_ALLOWED_STATUSES = {"collecting", "received", "missing_inputs", "needs_revision"}
-RERUN_ALLOWED_STATUSES = {"collecting", "received", "missing_inputs", "needs_revision", "review_ready", "needs_attention", "failed", "incomplete_input", "canceled"}
+RERUN_ALLOWED_STATUSES = {"collecting", "received", "missing_inputs", "needs_revision", "review_ready", "needs_attention", "failed", "incomplete_input", "canceled", "discarded"}
+DISCARD_ALLOWED_STATUSES = {"collecting", "received", "missing_inputs", "needs_revision", "review_ready", "needs_attention", "failed", "incomplete_input", "canceled", "verified"}
 
 
 def _require_new_enabled() -> bool:
@@ -88,15 +89,18 @@ def _parse_command(text: str) -> tuple[str, str | None, str]:
         return "cancel", explicit_job, reason
 
     action = raw_action
-    if action not in {"run", "status", "ok", "no", "rerun", "new", "cancel"}:
+    if action not in {"run", "status", "ok", "no", "rerun", "new", "cancel", "discard", "help"}:
         return "", None, ""
+
+    if action == "help":
+        return "help", None, ""
 
     explicit_job: str | None = None
     reason = ""
     if action in {"run", "status", "ok", "rerun", "cancel"}:
         if len(parts) >= 2 and parts[1].startswith("job_"):
             explicit_job = parts[1]
-    if action == "no":
+    if action in {"no", "discard"}:
         if len(parts) >= 2 and parts[1].startswith("job_"):
             explicit_job = parts[1]
             reason = " ".join(parts[2:]).strip()
@@ -287,6 +291,56 @@ def _slugify(value: str, *, fallback: str = "project") -> str:
         return fallback
     slug = slugify_identifier(raw, max_len=64, default_prefix=fallback).replace("-", "_")
     return slug[:64] if slug else fallback
+
+
+def _discard_job_files(
+    *,
+    job: dict[str, Any],
+    work_root: Path,
+) -> dict[str, Any]:
+    """Move review_dir and inbox_dir contents to _TRASH/{job_id}_{timestamp}/.
+
+    Returns a dict with the trash destination path and any errors.
+    """
+    work_root_path = work_root.expanduser().resolve()
+    trash_root = work_root_path / "_TRASH"
+    trash_root.mkdir(parents=True, exist_ok=True)
+
+    ts = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+    job_id = str(job.get("job_id") or "")
+    safe_name = f"{job_id}_{ts}".replace("/", "_")
+    dest = trash_root / safe_name
+    dest.mkdir(parents=True, exist_ok=True)
+
+    moved: list[dict[str, Any]] = []
+    errors: list[str] = []
+
+    # Move review_dir if it exists
+    review_dir = Path(str(job.get("review_dir", ""))).expanduser().resolve()
+    if review_dir.is_dir():
+        try:
+            dest_review = dest / "review"
+            shutil.move(str(review_dir), str(dest_review))
+            moved.append({"source": str(review_dir), "dest": str(dest_review.resolve())})
+        except Exception as e:
+            errors.append(f"review_dir: {e}")
+
+    # Move inbox_dir if it exists
+    inbox_dir = Path(str(job.get("inbox_dir", ""))).expanduser().resolve()
+    if inbox_dir.is_dir():
+        try:
+            dest_inbox = dest / "inbox"
+            shutil.move(str(inbox_dir), str(dest_inbox))
+            moved.append({"source": str(inbox_dir), "dest": str(dest_inbox.resolve())})
+        except Exception as e:
+            errors.append(f"inbox_dir: {e}")
+
+    return {
+        "ok": True,
+        "trash_dir": str(dest.resolve()),
+        "moved": moved,
+        "errors": errors,
+    }
 
 
 def _default_archive_project(job: dict[str, Any], final_uploads: list[str]) -> str:
@@ -653,6 +707,38 @@ def handle_command(
         )
         conn.close()
         return {"ok": True, "status": "no_active_job", "send_result": send_result}
+
+    # Help is always available, even without an active job
+    if action == "help":
+        from scripts.skill_status_card import _COMMANDS_BY_STATUS
+        current_status_for_help = str(job.get("status") or "collecting").lower() if job else "collecting"
+        available_cmds = _COMMANDS_BY_STATUS.get(current_status_for_help, "status | help")
+        help_msg = f"""📚 Available Commands
+
+🔹 Task Management
+  new [note]      - Create new task
+  status [job_id] - Check task status
+  cancel [job_id] - Cancel running task
+  discard [reason]- Delete task and files
+
+🔹 Execution
+  run [job_id]    - Start translation
+  rerun [job_id]  - Re-run translation
+
+🔹 Review
+  ok [job_id]     - Approve & archive
+  no {{reason}}     - Reject / needs revision
+
+🔹 Quick Help
+  help            - Show this message
+
+📋 Typical Flow:
+  new → upload files → run → wait → ok/no
+
+⚡ Available now: {available_cmds}"""
+        send_message(target=target, message=help_msg, dry_run=dry_run_notify)
+        conn.close()
+        return {"ok": True, "action": "help"}
     if not job:
         send_result = send_message(
             target=target,
@@ -911,6 +997,40 @@ def handle_command(
         conn.close()
         return {"ok": True, "job_id": job_id, "status": "needs_revision", "reason": reason_norm}
 
+    if action == "discard":
+        clear_job_pending_action(conn, job_id=job_id)
+        reason_norm = reason.strip() or "manual_discard"
+
+        if current_status not in DISCARD_ALLOWED_STATUSES:
+            msg = (
+                f"\u26a0\ufe0f Cannot discard\n"
+                f"\U0001f4cb {_task_name}\n"
+                f"Current stage: {current_status}\n"
+            )
+            _send_and_record(conn, job_id=job_id, milestone="discard_rejected", target=target, message=msg, dry_run=dry_run_notify)
+            conn.close()
+            return {"ok": False, "job_id": job_id, "error": "invalid_discard_status", "status": current_status}
+
+        discard_result = _discard_job_files(job=job, work_root=work_root)
+        update_job_status(conn, job_id=job_id, status="discarded", errors=[reason_norm])
+        trash_dir = discard_result.get("trash_dir", "")
+        errors = discard_result.get("errors", [])
+        error_msg = f"\n\u26a0\ufe0f Errors: {', '.join(errors)}" if errors else ""
+        _send_and_record(
+            conn,
+            job_id=job_id,
+            milestone="discarded",
+            target=target,
+            message=(
+                f"\U0001f5d1\ufe0f Discarded\n"
+                f"\U0001f4cb {_task_name}\n"
+                f"\U0001f4c1 Moved to: {trash_dir}{error_msg}"
+            ),
+            dry_run=dry_run_notify,
+        )
+        conn.close()
+        return {"ok": True, "job_id": job_id, "status": "discarded", "discard": discard_result, "reason": reason_norm}
+
     if action in {"run", "rerun"}:
         queue_item = get_active_queue_item(conn, job_id=job_id) or {}
         if queue_item:
@@ -993,7 +1113,7 @@ def handle_command(
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--command", required=True, help="new|run|status|ok|no {reason}|rerun")
+    parser.add_argument("--command", required=True, help="new|run|status|ok|no {reason}|rerun|discard [reason]")
     parser.add_argument("--work-root", default=str(DEFAULT_WORK_ROOT))
     parser.add_argument("--kb-root", default=str(DEFAULT_KB_ROOT))
     parser.add_argument("--target", default=DEFAULT_NOTIFY_TARGET)

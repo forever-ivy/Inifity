@@ -1,0 +1,158 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "detail_validation_report.schema.json",
+  "title": "DetailValidationReport",
+  "type": "object",
+  "description": "Format validation report comparing original and translated documents at structure level",
+  "properties": {
+    "summary": {
+      "type": "object",
+      "description": "Aggregated summary across all validated files",
+      "properties": {
+        "total_checks": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Total number of validation checks performed"
+        },
+        "passed": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of checks that passed"
+        },
+        "warnings": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of warnings (non-critical issues)"
+        },
+        "failed": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of failed checks (critical issues)"
+        },
+        "score": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Overall format fidelity score (0.0-1.0)"
+        },
+        "by_category": {
+          "type": "object",
+          "description": "Pass/fail counts grouped by category",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "passed": {"type": "integer"},
+              "failed": {"type": "integer"}
+            }
+          }
+        },
+        "files_valid": {
+          "type": "integer",
+          "description": "Number of files that passed validation"
+        },
+        "total_files": {
+          "type": "integer",
+          "description": "Total number of files validated"
+        }
+      }
+    },
+    "files": {
+      "type": "array",
+      "description": "Per-file validation results",
+      "items": {
+        "type": "object",
+        "properties": {
+          "file_name": {
+            "type": "string",
+            "description": "Name of the validated file"
+          },
+          "file_path": {
+            "type": "string",
+            "description": "Full path to the validated file"
+          },
+          "format_type": {
+            "type": "string",
+            "enum": ["docx", "xlsx"],
+            "description": "File format type"
+          },
+          "valid": {
+            "type": "boolean",
+            "description": "Whether the file passed validation"
+          },
+          "total_checks": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "passed": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "warnings": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "failed": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "score": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "description": "Format fidelity score for this file"
+          },
+          "issues": {
+            "type": "array",
+            "description": "List of validation issues found",
+            "items": {
+              "type": "object",
+              "properties": {
+                "severity": {
+                  "type": "string",
+                  "enum": ["error", "warning", "info"],
+                  "description": "Issue severity level"
+                },
+                "category": {
+                  "type": "string",
+                  "description": "Category of the issue (e.g., 'font', 'table_borders')"
+                },
+                "location": {
+                  "type": "string",
+                  "description": "Location identifier (e.g., 'p:42', 'Sheet1!A5')"
+                },
+                "element_type": {
+                  "type": "string",
+                  "description": "Type of element (e.g., 'paragraph', 'cell')"
+                },
+                "expected": {
+                  "type": "string",
+                  "description": "Expected value"
+                },
+                "actual": {
+                  "type": "string",
+                  "description": "Actual value found"
+                },
+                "fix_hint": {
+                  "type": "string",
+                  "description": "Human-readable fix suggestion for LLM"
+                }
+              },
+              "required": ["severity", "category", "location", "element_type", "expected", "actual"]
+            }
+          },
+          "validation_timestamp": {
+            "type": "string",
+            "format": "date-time",
+            "description": "ISO timestamp when validation was performed"
+          }
+        },
+        "required": ["file_name", "format_type", "valid", "score"]
+      }
+    },
+    "visual_report": {
+      "type": "string",
+      "description": "Markdown formatted report for LLM consumption"
+    }
+  },
+  "required": ["summary"]
+}

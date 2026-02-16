@@ -38,10 +38,13 @@ def _resolve_openclaw_bin() -> str:
     found = shutil.which("openclaw")
     if found:
         return found
-    # Common npm-global install location on macOS
-    npm_global = Path.home() / ".npm-global" / "bin" / "openclaw"
-    if npm_global.exists():
-        return str(npm_global)
+    # Check common install locations
+    for candidate in [
+        Path.home() / ".npm-global" / "bin" / "openclaw",
+        Path.home() / ".local" / "bin" / "openclaw",
+    ]:
+        if candidate.exists():
+            return str(candidate)
     # Fallback: let subprocess try and fail with a clear error
     return "openclaw"
 
@@ -674,6 +677,7 @@ def _available_slots(
     has_target = _has_lang(tgt)
     has_source_v1 = _has_lang_version(src, "v1")
     has_source_v2 = _has_lang_version(src, "v2")
+    has_source_v3 = _has_lang_version(src, "v3")
     has_target_v1 = _has_lang_version(tgt, "v1")
 
     source_document = has_any_file if src in {"unknown", "multi"} else (has_source or has_any_file)
@@ -682,7 +686,7 @@ def _available_slots(
 
     return {
         "source_old": has_source_v1,
-        "source_new": has_source_v2,
+        "source_new": has_source_v2 or has_source_v3,  # V2 or V3 counts as new source
         "target_baseline": target_baseline,
         "source_document": source_document,
         "target_document": target_document,
@@ -2150,6 +2154,82 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
             except Exception as exc:
                 status_flags.append("docx_qa_error")
                 quality_report["docx_qa_error"] = str(exc)
+
+        # --- Optional Detail Validation (structure-based format checking) ---
+        detail_validation_enabled = os.getenv("OPENCLAW_DETAIL_VALIDATION", "1").strip() not in {"0", "false", "no"}
+        if detail_validation_enabled:
+            try:
+                from scripts.detail_validator import validate_file_pair, ValidationReportGenerator
+
+                detail_results: dict[str, Any] = {}
+                original_files: list[Path] = []
+                translated_files: list[Path] = []
+
+                # Collect DOCX pairs
+                if _template_candidate and artifacts.get("final_docx"):
+                    orig_docx = Path(str(_template_candidate)).expanduser()
+                    trans_docx = Path(str(artifacts["final_docx"])).expanduser()
+                    if orig_docx.exists() and trans_docx.exists():
+                        original_files.append(orig_docx)
+                        translated_files.append(trans_docx)
+
+                # Collect XLSX pairs
+                for entry in (artifacts.get("xlsx_files") or []):
+                    src = str(entry.get("source_path") or "").strip()
+                    out = str(entry.get("path") or "").strip()
+                    if src and out:
+                        src_path = Path(src).expanduser()
+                        out_path = Path(out).expanduser()
+                        if src_path.exists() and out_path.exists():
+                            original_files.append(src_path)
+                            translated_files.append(out_path)
+
+                # Run validation on each pair
+                for orig, trans in zip(original_files, translated_files):
+                    try:
+                        result = validate_file_pair(orig, trans)
+                        detail_results[trans.name] = result.to_dict()
+                    except Exception as ve:
+                        detail_results[trans.name] = {"error": str(ve)}
+
+                if detail_results:
+                    quality_report["detail_validation"] = detail_results
+
+                    # Generate markdown report
+                    from scripts.detail_validator import ValidationResult
+                    results_list = []
+                    for name, data in detail_results.items():
+                        if "error" not in data:
+                            results_list.append(ValidationResult(
+                                file_name=name,
+                                file_path=data.get("file_path", ""),
+                                format_type=data.get("format_type", "unknown"),
+                                valid=data.get("valid", False),
+                                total_checks=data.get("total_checks", 0),
+                                passed=data.get("passed", 0),
+                                warnings=data.get("warnings", 0),
+                                failed=data.get("failed", 0),
+                                issues=[],
+                                format_fidelity_score=data.get("score", 1.0),
+                            ))
+
+                    if results_list:
+                        generator = ValidationReportGenerator()
+                        report_md = generator.generate_markdown(results_list, job_id=job_id)
+                        detail_report_path = Path(review_dir) / ".system" / "detail_validation_report.md"
+                        detail_report_path.parent.mkdir(parents=True, exist_ok=True)
+                        detail_report_path.write_text(report_md, encoding="utf-8")
+
+                        # Add summary to status flags if score is low
+                        summary = generator.generate_summary(results_list)
+                        if summary.get("score", 1.0) < 0.85:
+                            status_flags.append("detail_validation_low_score")
+                        if summary.get("failed", 0) > 0:
+                            status_flags.append("detail_validation_failed")
+
+            except Exception as exc:
+                status_flags.append("detail_validation_error")
+                quality_report["detail_validation_error"] = str(exc)
 
         # Keep the on-disk quality report consistent with the returned payload.
         try:
