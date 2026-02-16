@@ -30,8 +30,10 @@ TASK_DOC_EXTENSIONS = {".docx"}
 SOURCE_GROUP_WEIGHTS = {
     "glossary": 1.7,
     "previously_translated": 1.4,
-    "translated_en": 1.2,
-    "arabic_source": 1.0,
+    "translated_output": 1.2,   # Generic translated output
+    "translated_en": 1.2,       # Backward compatible
+    "source_text": 1.0,         # Generic source text
+    "arabic_source": 1.0,       # Backward compatible
     "general": 0.8,
 }
 
@@ -514,8 +516,14 @@ def infer_source_group(path: Path, kb_root: Path | None = None) -> str:
         return "general"
     if "previously translated" in full:
         return "previously_translated"
+    # Generic translated output folder (e.g., "Translated/")
+    if "/translated/" in full and "/translated -" not in full:
+        return "translated_output"
     if "translated -en" in full:
         return "translated_en"
+    # Generic source folder (e.g., "Source/")
+    if "/source/" in full or "arabic source" in full:
+        return "source_text"
     if kb_root and str(kb_root).lower() in full:
         return "general"
     return "general"

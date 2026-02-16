@@ -11,10 +11,12 @@ from pathlib import Path
 from typing import Any
 
 KNOWN_SUBFOLDERS = {
-    "arabic_source": "Arabic Source",
+    "source": "Source",                  # Generic source folder
+    "arabic_source": "Arabic Source",    # Backward compatible
     "glossary": "Glossery",
     "previously_translated": "Previously Translated",
-    "translated_en": "Translated -EN",
+    "translated_output": "Translated",   # Generic output folder
+    "translated_en": "Translated -EN",   # Backward compatible
 }
 
 
@@ -65,9 +67,13 @@ def infer_role(path: Path) -> str:
         return "glossary"
     if "previously translated" in lowered_full:
         return "reference_translation"
+    # Generic translated output folder (e.g., "Translated/")
+    if "/translated/" in lowered_full and "/translated -" not in lowered_full:
+        return "translated_output"
     if "translated -en" in lowered_full:
         return "translated_output"
-    if "source" in lowered_full:
+    # Generic source folder (e.g., "Source/")
+    if "/source/" in lowered_full or "arabic source" in lowered_full:
         return "source"
     if any(t in lowered_name for t in ("survey", "questionnaire", "استبانة")):
         return "survey"
@@ -75,15 +81,30 @@ def infer_role(path: Path) -> str:
 
 
 def classify_legacy_slot(path: Path) -> str | None:
-    name = path.name.lower()
-    arabic = is_arabic_name(path.name)
+    """Dynamically classify a file into a legacy slot based on detected language/version.
 
-    if arabic and "v2" in name:
+    Returns slot names like "ar_v1", "fr_v2", "en_v1" based on language detection.
+    Falls back to legacy Arabic/English naming for backward compatibility.
+    """
+    name = path.name.lower()
+    lang = infer_language(path)
+    version = infer_version(path)
+
+    # Backward compatibility: maintain legacy slot names for ar/en
+    if lang == "ar" and version == "v2":
         return "arabic_v2"
-    if arabic and "v1" in name:
+    if lang == "ar" and version == "v1":
         return "arabic_v1"
-    if ("english" in name or "ai readiness" in name or "quantitative" in name) and "v1" in name:
+    if lang == "en" and version == "v1":
+        # Legacy check for English-specific keywords
+        if "english" in name or "ai readiness" in name or "quantitative" in name:
+            return "english_v1"
+        # Also support generic English detection
         return "english_v1"
+
+    # Dynamic slot for other languages: {lang}_{version} (e.g., fr_v1, zh_v2)
+    if lang != "unknown" and version != "unknown":
+        return f"{lang}_{version}"
     return None
 
 
@@ -133,7 +154,16 @@ def build_bundle(root: Path, job_id: str) -> dict[str, Any]:
         if legacy_slot and legacy_slot not in legacy_mapping:
             legacy_mapping[legacy_slot] = doc
 
-    required_legacy = ["arabic_v1", "arabic_v2", "english_v1"]
+    # Dynamically determine required legacy slots from discovered candidates
+    # instead of hard-coding arabic_v1, arabic_v2, english_v1
+    required_legacy = sorted(legacy_mapping.keys())
+
+    # For backward compatibility, ensure ar/en slots are present if any candidates exist
+    # (this maintains the old behavior when no language-specific files are found)
+    if not required_legacy and candidate_files:
+        # Default legacy slots for ar→en workflow
+        required_legacy = ["arabic_v1", "arabic_v2", "english_v1"]
+
     missing_legacy = [k for k in required_legacy if k not in legacy_mapping]
 
     bundle_files: dict[str, Any] = {}

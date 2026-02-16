@@ -86,7 +86,10 @@ def compare_format_visual(original_png_b64: str, translated_png_b64: str) -> dic
     api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY") or ""
     if not api_key:
         raise RuntimeError("GOOGLE_API_KEY (or GEMINI_API_KEY) environment variable is required for format QA vision.")
-    model = os.environ.get("OPENCLAW_GEMINI_VISION_MODEL", "gemini-3-pro")
+    model = os.environ.get("OPENCLAW_GEMINI_VISION_MODEL", "gemini-3-pro").strip()
+    if "/" in model:
+        # Accept OpenClaw-style provider/model ids and use the raw model id for Gemini API.
+        model = model.rsplit("/", 1)[-1]
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/models/{model}"
         f":generateContent?key={api_key}"

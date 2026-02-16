@@ -329,11 +329,34 @@ def _collect_candidates(meta: dict[str, Any]) -> list[dict[str, Any]]:
         out.append(item)
 
     files = meta.get("files") or {}
-    legacy_candidates = [
-        ("arabic_v1", "ar", "v1"),
-        ("arabic_v2", "ar", "v2"),
-        ("english_v1", "en", "v1"),
-    ]
+
+    def _build_legacy_slot_candidates() -> list[tuple[str, str, str]]:
+        """Dynamically build (slot_name, language, version) from files dict.
+
+        Supports both legacy names (arabic_v1, english_v1) and dynamic names (fr_v1, zh_v2).
+        """
+        result: list[tuple[str, str, str]] = []
+        legacy_map = {
+            "arabic_v1": ("ar", "v1"),
+            "arabic_v2": ("ar", "v2"),
+            "english_v1": ("en", "v1"),
+        }
+        # Add legacy ar/en slots first for backward compatibility
+        for key, (lang, ver) in legacy_map.items():
+            if key in files and files.get(key):
+                result.append((key, lang, ver))
+        # Then add any dynamic slots from files (e.g., fr_v1, zh_v2)
+        for key in files:
+            if key in legacy_map:
+                continue
+            # Parse dynamic slot names like "fr_v1", "zh_v2", "de_v1"
+            parts = key.rsplit("_", 1)
+            if len(parts) == 2 and len(parts[0]) == 2 and parts[1] in {"v1", "v2", "v3"}:
+                lang, ver = parts
+                result.append((key, lang, ver))
+        return result
+
+    legacy_candidates = _build_legacy_slot_candidates()
     seen = {Path(x["path"]).resolve() for x in out if x.get("path")}
     for key, lang, version in legacy_candidates:
         data = files.get(key)
@@ -587,10 +610,16 @@ def _agent_call(agent_id: str, message: str, timeout_seconds: int = OPENCLAW_CMD
 
 
 LEGACY_REQUIRED_INPUTS_MAP = {
+    # Legacy ar→en mappings
     "arabic_old": "source_old",
     "arabic_new": "source_new",
     "english_baseline": "target_baseline",
     "english_document": "target_document",
+    # Generic aliases for any language pair
+    "source_old": "source_old",
+    "source_new": "source_new",
+    "target_baseline": "target_baseline",
+    "target_document": "target_document",
 }
 
 

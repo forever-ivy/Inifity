@@ -31,8 +31,10 @@ _KB_FTS_AVAILABLE: bool | None = None
 _RERANK_SOURCE_GROUP_WEIGHTS: dict[str, float] = {
     "glossary": 2.2,
     "previously_translated": 1.6,
-    "translated_en": 1.3,
-    "arabic_source": 1.0,
+    "translated_output": 1.3,   # Generic translated output
+    "translated_en": 1.3,       # Backward compatible
+    "source_text": 1.0,         # Generic source text
+    "arabic_source": 1.0,       # Backward compatible
     "general": 0.9,
 }
 
@@ -51,11 +53,11 @@ def _task_boost(task_type: str, source_group: str) -> float:
     task = (task_type or "").upper().strip()
     boosts = {
         "REVISION_UPDATE": {"glossary": 1.25, "previously_translated": 1.2},
-        "NEW_TRANSLATION": {"glossary": 1.2, "arabic_source": 1.1},
-        "BILINGUAL_REVIEW": {"glossary": 1.2, "translated_en": 1.15},
-        "EN_ONLY_EDIT": {"translated_en": 1.2, "previously_translated": 1.1},
+        "NEW_TRANSLATION": {"glossary": 1.2, "arabic_source": 1.1, "source_text": 1.1},
+        "BILINGUAL_REVIEW": {"glossary": 1.2, "translated_en": 1.15, "translated_output": 1.15},
+        "EN_ONLY_EDIT": {"translated_en": 1.2, "translated_output": 1.2, "previously_translated": 1.1},
         "MULTI_FILE_BATCH": {"glossary": 1.15, "previously_translated": 1.1},
-        "TERMINOLOGY_ENFORCEMENT": {"glossary": 1.4, "translated_en": 1.15},
+        "TERMINOLOGY_ENFORCEMENT": {"glossary": 1.4, "translated_en": 1.15, "translated_output": 1.15},
         "FORMAT_CRITICAL_TASK": {"glossary": 1.2, "previously_translated": 1.15},
         "LOW_CONTEXT_TASK": {"glossary": 1.1},
     }.get(task, {})
@@ -894,11 +896,11 @@ def retrieve_kb(
     task = task_type.upper().strip()
     task_boosts = {
         "REVISION_UPDATE": {"glossary": 1.25, "previously_translated": 1.2},
-        "NEW_TRANSLATION": {"glossary": 1.2, "arabic_source": 1.1},
-        "BILINGUAL_REVIEW": {"glossary": 1.2, "translated_en": 1.15},
-        "EN_ONLY_EDIT": {"translated_en": 1.2, "previously_translated": 1.1},
+        "NEW_TRANSLATION": {"glossary": 1.2, "arabic_source": 1.1, "source_text": 1.1},
+        "BILINGUAL_REVIEW": {"glossary": 1.2, "translated_en": 1.15, "translated_output": 1.15},
+        "EN_ONLY_EDIT": {"translated_en": 1.2, "translated_output": 1.2, "previously_translated": 1.1},
         "MULTI_FILE_BATCH": {"glossary": 1.15, "previously_translated": 1.1},
-        "TERMINOLOGY_ENFORCEMENT": {"glossary": 1.4, "translated_en": 1.15},
+        "TERMINOLOGY_ENFORCEMENT": {"glossary": 1.4, "translated_en": 1.15, "translated_output": 1.15},
         "FORMAT_CRITICAL_TASK": {"glossary": 1.2, "previously_translated": 1.15},
         "LOW_CONTEXT_TASK": {"glossary": 1.1},
     }.get(task, {})

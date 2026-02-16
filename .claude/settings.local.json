@@ -6,7 +6,8 @@
       "Bash(openclaw:*)",
       "Bash(./scripts/*.sh)",
       "WebSearch",
-      "WebFetch"
+      "WebFetch",
+      "Bash(ls:*)"
     ]
   },
   "agentTeams": {
@@ -24,7 +25,14 @@
           "Translation round logic",
           "Candidate selection and scoring"
         ],
-        "tools": ["Read", "Edit", "Write", "Grep", "Glob", "Bash"]
+        "tools": [
+          "Read",
+          "Edit",
+          "Write",
+          "Grep",
+          "Glob",
+          "Bash"
+        ]
       },
       {
         "id": "format-specialist",
@@ -37,7 +45,14 @@
           "scripts/extract_docx_structure.py",
           "Format fidelity and layout preservation"
         ],
-        "tools": ["Read", "Edit", "Write", "Grep", "Glob", "Bash"]
+        "tools": [
+          "Read",
+          "Edit",
+          "Write",
+          "Grep",
+          "Glob",
+          "Bash"
+        ]
       },
       {
         "id": "qa-engineer",
@@ -50,7 +65,14 @@
           "Quality thresholds and metrics",
           "Vision QA retry logic"
         ],
-        "tools": ["Read", "Edit", "Write", "Grep", "Glob", "Bash"]
+        "tools": [
+          "Read",
+          "Edit",
+          "Write",
+          "Grep",
+          "Glob",
+          "Bash"
+        ]
       },
       {
         "id": "pipeline-infra",
@@ -65,7 +87,14 @@
           "scripts/v4_runtime.py",
           "scripts/openclaw_v4_dispatcher.py"
         ],
-        "tools": ["Read", "Edit", "Write", "Grep", "Glob", "Bash"]
+        "tools": [
+          "Read",
+          "Edit",
+          "Write",
+          "Grep",
+          "Glob",
+          "Bash"
+        ]
       },
       {
         "id": "tester",
@@ -78,7 +107,14 @@
           "Integration testing",
           "Regression prevention"
         ],
-        "tools": ["Read", "Edit", "Write", "Grep", "Glob", "Bash"]
+        "tools": [
+          "Read",
+          "Edit",
+          "Write",
+          "Grep",
+          "Glob",
+          "Bash"
+        ]
       },
       {
         "id": "kb-memory",
@@ -93,7 +129,14 @@
           "scripts/skill_message_ingest.py",
           "docs/IMPLEMENTATION_NOTES.md"
         ],
-        "tools": ["Read", "Edit", "Write", "Grep", "Glob", "Bash"]
+        "tools": [
+          "Read",
+          "Edit",
+          "Write",
+          "Grep",
+          "Glob",
+          "Bash"
+        ]
       },
       {
         "id": "security-auditor",
@@ -107,7 +150,14 @@
           "docs/SECURITY_ROTATION_CHECKLIST.md",
           "config/env.example"
         ],
-        "tools": ["Read", "Edit", "Write", "Grep", "Glob", "Bash"]
+        "tools": [
+          "Read",
+          "Edit",
+          "Write",
+          "Grep",
+          "Glob",
+          "Bash"
+        ]
       },
       {
         "id": "docs-maintainer",
@@ -120,7 +170,14 @@
           "config/env.example",
           "config/env.v4.local.example"
         ],
-        "tools": ["Read", "Edit", "Write", "Grep", "Glob", "Bash"]
+        "tools": [
+          "Read",
+          "Edit",
+          "Write",
+          "Grep",
+          "Glob",
+          "Bash"
+        ]
       }
     ],
     "coordinationRules": {
