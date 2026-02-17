@@ -45,7 +45,10 @@
       "Bash(# 查看任务输入文件 WORK_ROOT=\"\"/Users/ivy/Library/CloudStorage/OneDrive-Personal/Translation Task\"\" INBOX_DIR=\"\"$WORK_ROOT/_INBOX/telegram/job_telegram_20260217_092850_197eab63\"\" echo \"\"=== 输入文件 ===\"\" ls -la \"\"$INBOX_DIR/\"\" # 查看任务元数据 echo \"\"\"\" echo \"\"=== 任务配置 ===\"\" cat \"\"$INBOX_DIR/../.system/job_meta.json\"\" | python3 -m json.tool)",
       "Bash(chmod +x:*)",
       "Bash(/Users/Code/workflow/translation/scripts/start.sh --help)",
-      "Bash(/Users/Code/workflow/translation/scripts/start.sh:*)"
+      "Bash(/Users/Code/workflow/translation/scripts/start.sh:*)",
+      "Bash(pnpm:*)",
+      "Bash(rustc:*)",
+      "Bash(sudo chown:*)"
     ]
   }
 }
