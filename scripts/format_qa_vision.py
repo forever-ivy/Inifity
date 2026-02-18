@@ -240,7 +240,21 @@ def run_format_qa_loop(
         for idx, (orig_png, trans_png) in enumerate(paired, start=1):
             orig_b64 = base64.b64encode(orig_png.read_bytes()).decode("ascii")
             trans_b64 = base64.b64encode(trans_png.read_bytes()).decode("ascii")
-            result = compare_format_visual(orig_b64, trans_b64)
+            try:
+                result = compare_format_visual(orig_b64, trans_b64)
+            except Exception as exc:
+                # Treat vision API issues (auth, quota, outage) as a skip instead of crashing the whole job.
+                return {
+                    "status": "skipped",
+                    "attempts": attempts,
+                    "reason": "vision_unavailable",
+                    "error": str(exc),
+                    "sheets_compared": 0,
+                    "sheets_total_original": len(original_images),
+                    "sheets_total_translated": 0,
+                    "original_dir": str(original_dir),
+                    "translated_dir": str(translated_dir),
+                }
             score = float(result.get("format_fidelity_score", 0.0) or 0.0)
             aesthetic = float(result.get("aesthetics_score", 0.0) or 0.0)
             scores.append(score)

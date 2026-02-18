@@ -115,7 +115,7 @@ class SkillStatusCardTest(unittest.TestCase):
             last_milestone="run_enqueued",
             last_milestone_at="2026-01-01T00:00:00+00:00",
         )
-        self.assertIn("Stage: Queued", card)
+        self.assertIn("Stage: ⏳ Queued", card)
         self.assertIn("Queue: queued", card)
         self.assertIn("Last: run_enqueued", card)
 

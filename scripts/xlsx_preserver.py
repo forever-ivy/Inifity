@@ -26,6 +26,7 @@ except Exception:  # pragma: no cover
 
 _TEXT_HAS_LETTER_RE = re.compile(r"[A-Za-z\u00C0-\u024F\u0370-\u03FF\u0400-\u04FF\u0600-\u06FF\u4E00-\u9FFF]")
 _TEXT_ALL_PUNCT_NUM_RE = re.compile(r"^[\s0-9\.,:;()\[\]{}%+\-–—/_\\|]*$")
+_TEXT_HAS_ARABIC_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]")
 
 
 @dataclass(frozen=True)
@@ -70,6 +71,10 @@ def extract_translatable_cells(
     xlsx_path: Path,
     *,
     max_cells: int | None = None,
+    arabic_only: bool = False,
+    interview_only_if_present: bool = False,
+    sheet_include_regex: str | None = None,
+    sheet_exclude_regex: str | None = None,
 ) -> tuple[list[XlsxCellUnit], dict[str, Any]]:
     """Extract translatable cells (string values only) from workbook.
 
@@ -81,13 +86,42 @@ def extract_translatable_cells(
     units: list[XlsxCellUnit] = []
     truncated = False
 
+    include_re = None
+    exclude_re = None
+    if sheet_include_regex and str(sheet_include_regex).strip():
+        include_re = re.compile(str(sheet_include_regex))
+    if sheet_exclude_regex and str(sheet_exclude_regex).strip():
+        exclude_re = re.compile(str(sheet_exclude_regex))
+
+    has_interview = False
+    if interview_only_if_present:
+        for ws in wb.worksheets:
+            if str(ws.title or "").lower().startswith("interview_"):
+                has_interview = True
+                break
+
+    included_sheets: list[str] = []
     for ws in wb.worksheets:
+        title = str(ws.title or "")
+        if include_re and not include_re.search(title):
+            continue
+        if exclude_re and exclude_re.search(title):
+            continue
+        if has_interview and not title.lower().startswith("interview_"):
+            continue
+        included_sheets.append(title)
+
+    for ws in wb.worksheets:
+        if ws.title not in included_sheets:
+            continue
         for row in ws.iter_rows():
             for cell in row:
                 if _is_formula_cell(cell):
                     continue
                 value = cell.value
                 if not _is_translatable_text(value):
+                    continue
+                if arabic_only and not _TEXT_HAS_ARABIC_RE.search(_normalize_text(str(value))):
                     continue
                 units.append(
                     XlsxCellUnit(
@@ -105,7 +139,17 @@ def extract_translatable_cells(
         if truncated:
             break
     wb.close()
-    return units, {"file": xlsx_path.name, "cell_count": len(units), "truncated": truncated, "max_cells": max_cells}
+    return units, {
+        "file": xlsx_path.name,
+        "cell_count": len(units),
+        "truncated": truncated,
+        "max_cells": max_cells,
+        "arabic_only": bool(arabic_only),
+        "interview_only_if_present": bool(interview_only_if_present),
+        "sheet_include_regex": str(sheet_include_regex or ""),
+        "sheet_exclude_regex": str(sheet_exclude_regex or ""),
+        "included_sheets": included_sheets,
+    }
 
 
 def units_to_payload(units: Iterable[XlsxCellUnit], *, max_chars_per_cell: int = 400) -> list[dict[str, Any]]:

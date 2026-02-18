@@ -308,6 +308,18 @@ def _validate_format_preserve_coverage(context: dict[str, Any], draft: dict[str,
     return findings, meta
 
 
+def _preserve_nonempty_translation_maps(previous: dict[str, Any], updated: dict[str, Any]) -> dict[str, Any]:
+    """Avoid wiping preserve maps when applying a fix that doesn't return them."""
+    if not isinstance(previous, dict) or not isinstance(updated, dict):
+        return updated
+    for field in ["docx_translation_map", "xlsx_translation_map"]:
+        prev_val = previous.get(field)
+        new_val = updated.get(field)
+        if prev_val and not new_val:
+            updated[field] = prev_val
+    return updated
+
+
 def _load_meta(args: argparse.Namespace) -> dict[str, Any]:
     if args.meta_json:
         return json.loads(args.meta_json)
@@ -936,13 +948,14 @@ def _build_execution_context(
     revision_pack: RevisionPack | None = None,
 ) -> dict[str, Any]:
     task_type = str(intent.get("task_type", "LOW_CONTEXT_TASK"))
+    include_candidate_text = task_type != "SPREADSHEET_TRANSLATION"
     context: dict[str, Any] = {
         "job_id": meta.get("job_id"),
         "subject": meta.get("subject", ""),
         "message_text": meta.get("message_text", ""),
         "task_intent": intent,
         "selected_tool": task_type,
-        "candidate_files": _candidate_payload(candidates, include_text=True),
+        "candidate_files": _candidate_payload(candidates, include_text=include_candidate_text),
         "knowledge_context": kb_hits[:12],
         "cross_job_memories": list(meta.get("cross_job_memories") or []),
         "rules": {
@@ -1816,9 +1829,28 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
             if xlsx_sources:
                 max_cells = int(os.getenv("OPENCLAW_XLSX_TRANSLATION_MAX_CELLS", "2000"))
                 max_chars = int(os.getenv("OPENCLAW_XLSX_MAX_CHARS_PER_CELL", "400"))
+                src_lang = str(intent.get("source_language") or "").strip().lower()
+                arabic_only = False
+                if src_lang in {"ar", "arabic"}:
+                    arabic_only = os.getenv("OPENCLAW_XLSX_ARABIC_ONLY", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+                sheet_include_regex = os.getenv("OPENCLAW_XLSX_SHEET_INCLUDE_REGEX", "").strip() or None
+                sheet_exclude_regex = os.getenv("OPENCLAW_XLSX_SHEET_EXCLUDE_REGEX", "").strip() or None
+                focus_interview = (
+                    task_type == "SPREADSHEET_TRANSLATION"
+                    and os.getenv("OPENCLAW_XLSX_FOCUS_INTERVIEW_SHEETS", "1").strip().lower() not in {"0", "false", "no", "off"}
+                    and not sheet_include_regex
+                )
                 sources_payload: list[dict[str, Any]] = []
                 for src in xlsx_sources:
-                    units, meta_info = extract_translatable_cells(src, max_cells=max_cells)
+                    units, meta_info = extract_translatable_cells(
+                        src,
+                        max_cells=max_cells,
+                        arabic_only=arabic_only,
+                        interview_only_if_present=focus_interview,
+                        sheet_include_regex=sheet_include_regex,
+                        sheet_exclude_regex=sheet_exclude_regex,
+                    )
                     sources_payload.append(
                         {
                             "file": src.name,
@@ -1981,15 +2013,18 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
 
             review_findings: list[str] = []
             if selected_review:
-                review_findings = list(selected_review.get("findings") or selected_review.get("unresolved") or [])
+                review_findings = list(selected_review.get("unresolved") or [])
+                if not review_findings and not bool(selected_review.get("pass", False)):
+                    review_findings = list(selected_review.get("findings") or [])
             if not review_findings:
                 review_findings = list(selected_draft.get("unresolved") or [])
 
             did_fix = False
             if review_findings:
+                prev_selected = selected_draft
                 codex_fix = _codex_generate(execution_context, selected_draft, review_findings, round_idx)
                 if codex_fix.get("ok"):
-                    selected_draft = codex_fix["data"]
+                    selected_draft = _preserve_nonempty_translation_maps(prev_selected, codex_fix["data"])
                     did_fix = True
 
             if gemini_enabled:
@@ -2041,7 +2076,7 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
                 items: list[str] = []
                 if isinstance(gemini_data, dict):
                     items.extend([str(x) for x in (gemini_data.get("unresolved") or [])])
-                    if not items:
+                    if not items and not bool(gemini_data.get("pass", False)):
                         items.extend([str(x) for x in (gemini_data.get("findings") or [])])
                 if not items:
                     items.extend([str(x) for x in (selected_draft.get("unresolved") or [])])
@@ -2067,7 +2102,7 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
                 if not codex_fix.get("ok"):
                     errors.append(f"hard_gate_fix_failed:{codex_fix.get('error')}")
                     break
-                selected_draft = codex_fix["data"]
+                selected_draft = _preserve_nonempty_translation_maps(selected_draft, codex_fix["data"])
                 did_fix = True
 
                 if gemini_enabled:
@@ -2321,6 +2356,7 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
 
                     any_failed = False
                     any_aesthetic_warning = False
+                    any_skipped = False
                     for original_xlsx, translated_xlsx in xlsx_jobs:
                         if not original_xlsx.exists() or not translated_xlsx.exists():
                             status_flags.append("format_qa_skipped_missing_files")
@@ -2332,7 +2368,11 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
                             max_retries=max_retries,
                         )
                         format_qa_results[translated_xlsx.name] = qa_result
-                        if qa_result.get("status") != "passed":
+                        status_value = str(qa_result.get("status") or "").strip().lower()
+                        if status_value == "skipped":
+                            any_skipped = True
+                            continue
+                        if status_value != "passed":
                             any_failed = True
                         if qa_result.get("aesthetics_warning"):
                             any_aesthetic_warning = True
@@ -2347,6 +2387,8 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
                         )
                     if any_aesthetic_warning:
                         status_flags.append("format_qa_aesthetics_warning")
+                    if any_skipped:
+                        status_flags.append("format_qa_skipped")
                     if any_failed:
                         status_flags.append("format_qa_failed")
                         if status == "review_ready":

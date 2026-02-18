@@ -53,6 +53,10 @@ def _flag_message(flag: str, *, review_dir: str) -> str | None:
         base = _system_path(review_dir, "format_qa")
         msg = "Format QA failed (XLSX layout mismatch)."
         return f"{msg} Check: {base}" if base else msg
+    if f == "format_qa_skipped":
+        base = _system_path(review_dir, "format_qa")
+        msg = "Format QA skipped (Vision unavailable)."
+        return f"{msg} Check: {base}" if base else msg
     if f == "format_qa_error":
         base = _system_path(review_dir, "format_qa")
         msg = "Format QA error (Vision QA)."

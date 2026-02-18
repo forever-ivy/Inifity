@@ -8,6 +8,7 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill
 
 from scripts.xlsx_preserver import apply_translation_map
+from scripts.xlsx_preserver import extract_translatable_cells
 
 
 def _make_xlsx(path: Path) -> None:
@@ -26,6 +27,35 @@ def _make_xlsx(path: Path) -> None:
     ws.merge_cells("C1:D1")
     ws["C1"] = "Merged"
 
+    path.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(path)
+    wb.close()
+
+
+def _make_interview_workbook(path: Path) -> None:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Interview_Schools"
+    ws["A1"] = "مرحبا"
+    ws["A2"] = "Hello"
+    ws["A3"] = "=SUM(1,2)"
+
+    lookups = wb.create_sheet(title="Lookups")
+    lookups["A1"] = "مرحبا"
+    lookups["A2"] = "Lookup"
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(path)
+    wb.close()
+
+
+def _make_non_interview_workbook(path: Path) -> None:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    ws["A1"] = "مرحبا"
+    ws2 = wb.create_sheet(title="Lookups")
+    ws2["A1"] = "مرحبا"
     path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(path)
     wb.close()
@@ -84,7 +114,39 @@ class XlsxPreserverTest(unittest.TestCase):
             self.assertGreaterEqual(float(ws.row_dimensions[1].height), 20.0)
             wb.close()
 
+    def test_extract_translatable_cells_arabic_only_interview_focus(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "source.xlsx"
+            _make_interview_workbook(src)
+
+            units, meta = extract_translatable_cells(
+                src,
+                arabic_only=True,
+                interview_only_if_present=True,
+            )
+            self.assertEqual([u.sheet for u in units], ["Interview_Schools"])
+            self.assertEqual([u.cell for u in units], ["A1"])
+            self.assertEqual([u.text for u in units], ["مرحبا"])
+            self.assertTrue(meta.get("arabic_only"))
+            self.assertTrue(meta.get("interview_only_if_present"))
+            self.assertIn("Interview_Schools", meta.get("included_sheets") or [])
+            self.assertNotIn("Lookups", meta.get("included_sheets") or [])
+
+    def test_extract_translatable_cells_interview_focus_falls_back_when_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "source.xlsx"
+            _make_non_interview_workbook(src)
+
+            units, meta = extract_translatable_cells(
+                src,
+                arabic_only=True,
+                interview_only_if_present=True,
+            )
+            self.assertEqual(len(units), 2)
+            self.assertCountEqual([u.sheet for u in units], ["Sheet1", "Lookups"])
+            self.assertIn("Sheet1", meta.get("included_sheets") or [])
+            self.assertIn("Lookups", meta.get("included_sheets") or [])
+
 
 if __name__ == "__main__":
     unittest.main()
-
