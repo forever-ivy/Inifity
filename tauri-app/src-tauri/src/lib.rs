@@ -68,7 +68,56 @@ pub struct Artifact {
 pub struct QualityReport {
     pub terminology_hit: u32,
     pub structure_fidelity: u32,
-    pub purity_score: f64,
+    pub purity_score: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct KbSyncReport {
+    #[serde(default)]
+    pub ok: bool,
+    #[serde(default)]
+    pub kb_root: String,
+    #[serde(default)]
+    pub scanned_count: u32,
+    #[serde(default)]
+    pub created: u32,
+    #[serde(default)]
+    pub updated: u32,
+    #[serde(default)]
+    pub metadata_only: u32,
+    #[serde(default)]
+    pub metadata_only_paths: Vec<String>,
+    #[serde(default)]
+    pub unscoped_skipped: u32,
+    #[serde(default)]
+    pub unscoped_skipped_paths: Vec<String>,
+    #[serde(default)]
+    pub removed: u32,
+    #[serde(default)]
+    pub removed_paths: Vec<String>,
+    #[serde(default)]
+    pub skipped: u32,
+    #[serde(default)]
+    pub errors: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub files: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub indexed_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KbSourceGroupStat {
+    pub source_group: String,
+    pub count: u64,
+    pub chunk_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KbStats {
+    pub total_files: u64,
+    pub total_chunks: u64,
+    pub last_indexed_at: Option<String>,
+    pub by_source_group: Vec<KbSourceGroupStat>,
 }
 
 // ============================================================================
@@ -193,6 +242,36 @@ fn get_service_status_inner(state: &AppState) -> Result<Vec<ServiceStatus>, Stri
     Ok(services)
 }
 
+fn parse_env_assignment(line: &str) -> Option<(String, String)> {
+    let mut s = line.trim();
+    if s.is_empty() || s.starts_with('#') {
+        return None;
+    }
+    if let Some(rest) = s.strip_prefix("export ") {
+        s = rest.trim_start();
+    }
+    let (k, v) = s.split_once('=')?;
+    let key = k.trim().to_string();
+    let raw = v.trim();
+    if raw.is_empty() {
+        return Some((key, String::new()));
+    }
+    let mut val = raw.to_string();
+    // Strip matching surrounding quotes.
+    if (val.starts_with('"') && val.ends_with('"')) || (val.starts_with('\'') && val.ends_with('\'')) {
+        if val.len() >= 2 {
+            val = val[1..val.len() - 1].to_string();
+        }
+    }
+    Some((key, val))
+}
+
+fn env_quote_double(value: &str) -> String {
+    // Safe for bash `source` in .env-style files.
+    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{}\"", escaped)
+}
+
 fn get_config_inner(state: &AppState) -> Result<AppConfig, String> {
     let env_path = format!("{}/.env.v4.local", state.config_path);
 
@@ -207,31 +286,48 @@ fn get_config_inner(state: &AppState) -> Result<AppConfig, String> {
         rag_backend: "local".to_string(),
     };
 
-    // Helper to extract value after first '=' and strip quotes
-    fn extract_value(line: &str) -> String {
-        if let Some(pos) = line.find('=') {
-            let value = &line[pos + 1..];
-            value.trim().trim_matches('"').to_string()
-        } else {
-            String::new()
-        }
-    }
-
     for line in content.lines() {
-        if line.starts_with("V4_WORK_ROOT=") {
-            config.work_root = extract_value(line);
-        } else if line.starts_with("V4_KB_ROOT=") {
-            config.kb_root = extract_value(line);
-        } else if line.starts_with("OPENCLAW_STRICT_ROUTER=") {
-            config.strict_router = line.contains("1");
-        } else if line.starts_with("OPENCLAW_REQUIRE_NEW=") {
-            config.require_new = line.contains("1");
-        } else if line.starts_with("OPENCLAW_RAG_BACKEND=") {
-            config.rag_backend = extract_value(line);
+        let Some((key, value)) = parse_env_assignment(line) else {
+            continue;
+        };
+        match key.as_str() {
+            "V4_WORK_ROOT" => config.work_root = value,
+            "V4_KB_ROOT" => config.kb_root = value,
+            "OPENCLAW_STRICT_ROUTER" => config.strict_router = value.trim() == "1",
+            "OPENCLAW_REQUIRE_NEW" => config.require_new = value.trim() == "1",
+            "OPENCLAW_RAG_BACKEND" => config.rag_backend = value,
+            _ => {}
         }
     }
 
     Ok(config)
+}
+
+fn verify_root(work_root: &str) -> PathBuf {
+    PathBuf::from(work_root)
+        .join("Translated -EN")
+        .join("_VERIFY")
+}
+
+fn find_python_bin(state: &AppState) -> String {
+    let env_path = PathBuf::from(&state.config_path).join(".env.v4.local");
+    if let Ok(content) = fs::read_to_string(&env_path) {
+        for line in content.lines() {
+            if let Some((key, value)) = parse_env_assignment(line) {
+                if key == "V4_PYTHON_BIN" && !value.trim().is_empty() {
+                    return value;
+                }
+            }
+        }
+    }
+    let venv_python = PathBuf::from(&state.config_path)
+        .join(".venv")
+        .join("bin")
+        .join("python");
+    if venv_python.exists() {
+        return venv_python.to_string_lossy().to_string();
+    }
+    "python3".to_string()
 }
 
 fn run_start_script(state: &AppState, flag: &str) -> Result<String, String> {
@@ -303,6 +399,42 @@ async fn restart_all_services(state: State<'_, AppState>) -> Result<Vec<ServiceS
     stop_services_inner(&state)?;
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     start_services_inner(&state)?;
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    get_service_status_inner(&state)
+}
+
+fn service_flag(service_id: &str, action: &str) -> Result<&'static str, String> {
+    match (service_id, action) {
+        ("telegram", "start") => Ok("--telegram"),
+        ("worker", "start") => Ok("--worker"),
+        ("telegram", "stop") => Ok("--stop-telegram"),
+        ("worker", "stop") => Ok("--stop-worker"),
+        ("telegram", "restart") => Ok("--restart-telegram"),
+        ("worker", "restart") => Ok("--restart-worker"),
+        _ => Err(format!("Unknown service/action: {} {}", service_id, action)),
+    }
+}
+
+#[tauri::command]
+async fn start_service(service_id: String, state: State<'_, AppState>) -> Result<Vec<ServiceStatus>, String> {
+    let flag = service_flag(service_id.trim(), "start")?;
+    run_start_script(&state, flag)?;
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    get_service_status_inner(&state)
+}
+
+#[tauri::command]
+async fn stop_service(service_id: String, state: State<'_, AppState>) -> Result<Vec<ServiceStatus>, String> {
+    let flag = service_flag(service_id.trim(), "stop")?;
+    run_start_script(&state, flag)?;
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    get_service_status_inner(&state)
+}
+
+#[tauri::command]
+async fn restart_service(service_id: String, state: State<'_, AppState>) -> Result<Vec<ServiceStatus>, String> {
+    let flag = service_flag(service_id.trim(), "restart")?;
+    run_start_script(&state, flag)?;
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     get_service_status_inner(&state)
 }
@@ -521,15 +653,31 @@ fn save_config(config: AppConfig, state: State<'_, AppState>) -> Result<(), Stri
     // Helper to update or add a line
     fn update_or_add(lines: &mut Vec<String>, key: &str, value: &str) {
         let key_prefix = format!("{}=", key);
-        if let Some(line) = lines.iter_mut().find(|l| l.starts_with(&key_prefix)) {
-            *line = format!("{}={}", key, value);
+        if let Some(line) = lines.iter_mut().find(|l| {
+            let s = l.trim_start();
+            if s.starts_with(&key_prefix) {
+                return true;
+            }
+            if let Some(rest) = s.strip_prefix("export ") {
+                return rest.trim_start().starts_with(&key_prefix);
+            }
+            false
+        }) {
+            let s = line.trim_start();
+            if s.starts_with("export ") {
+                *line = format!("export {}={}", key, value);
+            } else {
+                *line = format!("{}={}", key, value);
+            }
         } else {
             lines.push(format!("{}={}", key, value));
         }
     }
 
-    update_or_add(&mut lines, "V4_WORK_ROOT", &config.work_root);
-    update_or_add(&mut lines, "V4_KB_ROOT", &config.kb_root);
+    let work_root = env_quote_double(&config.work_root);
+    let kb_root = env_quote_double(&config.kb_root);
+    update_or_add(&mut lines, "V4_WORK_ROOT", &work_root);
+    update_or_add(&mut lines, "V4_KB_ROOT", &kb_root);
     update_or_add(&mut lines, "OPENCLAW_STRICT_ROUTER", if config.strict_router { "1" } else { "0" });
     update_or_add(&mut lines, "OPENCLAW_REQUIRE_NEW", if config.require_new { "1" } else { "0" });
     update_or_add(&mut lines, "OPENCLAW_RAG_BACKEND", &config.rag_backend);
@@ -634,9 +782,7 @@ fn get_job_milestones(job_id: String, state: State<'_, AppState>) -> Result<Vec<
 #[tauri::command]
 fn list_verify_artifacts(job_id: String, state: State<'_, AppState>) -> Result<Vec<Artifact>, String> {
     let config = get_config_inner(&state)?;
-    let verify_path = format!("{}/_VERIFY/{}", config.work_root, job_id);
-
-    let path = PathBuf::from(&verify_path);
+    let path = verify_root(&config.work_root).join(&job_id);
     if !path.exists() {
         return Ok(vec![]);
     }
@@ -676,9 +822,10 @@ fn list_verify_artifacts(job_id: String, state: State<'_, AppState>) -> Result<V
 #[tauri::command]
 fn get_quality_report(job_id: String, state: State<'_, AppState>) -> Result<Option<QualityReport>, String> {
     let config = get_config_inner(&state)?;
-    let report_path = format!("{}/_VERIFY/{}/quality_report.json", config.work_root, job_id);
-
-    let path = PathBuf::from(&report_path);
+    let path = verify_root(&config.work_root)
+        .join(&job_id)
+        .join(".system")
+        .join("quality_report.json");
     if !path.exists() {
         return Ok(None);
     }
@@ -689,17 +836,148 @@ fn get_quality_report(job_id: String, state: State<'_, AppState>) -> Result<Opti
     let json: serde_json::Value = serde_json::from_str(&content)
         .map_err(|e| format!("Failed to parse quality report: {}", e))?;
 
+    let rounds = json.get("rounds").and_then(|v| v.as_array());
+    let Some(rounds) = rounds else {
+        return Ok(None);
+    };
+    let Some(last) = rounds.last() else {
+        return Ok(None);
+    };
+    let metrics = last.get("metrics").and_then(|m| m.as_object());
+    let Some(metrics) = metrics else {
+        return Ok(None);
+    };
+
+    fn as_rate(v: Option<&serde_json::Value>) -> f64 {
+        v.and_then(|x| x.as_f64().or_else(|| x.as_u64().map(|u| u as f64)))
+            .unwrap_or(0.0)
+    }
+    fn pct(rate: f64) -> u32 {
+        let mut v = (rate * 100.0).round();
+        if v < 0.0 {
+            v = 0.0;
+        }
+        if v > 100.0 {
+            v = 100.0;
+        }
+        v as u32
+    }
+
     Ok(Some(QualityReport {
-        terminology_hit: json.get("terminology_hit").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-        structure_fidelity: json.get("structure_fidelity").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-        purity_score: json.get("purity_score").and_then(|v| v.as_f64()).unwrap_or(0.0),
+        terminology_hit: pct(as_rate(metrics.get("terminology_rate"))),
+        structure_fidelity: pct(as_rate(metrics.get("structure_complete_rate"))),
+        purity_score: pct(as_rate(metrics.get("target_language_purity"))),
     }))
 }
 
 #[tauri::command]
 fn get_verify_folder_path(state: State<'_, AppState>) -> Result<String, String> {
     let config = get_config_inner(&state)?;
-    Ok(format!("{}/_VERIFY", config.work_root))
+    Ok(verify_root(&config.work_root).to_string_lossy().to_string())
+}
+
+// ============================================================================
+// KB Health Commands
+// ============================================================================
+
+fn kb_sync_report_path(work_root: &str) -> PathBuf {
+    PathBuf::from(work_root)
+        .join(".system")
+        .join("kb")
+        .join("kb_sync_latest.json")
+}
+
+fn read_kb_sync_report(work_root: &str) -> Result<Option<KbSyncReport>, String> {
+    let path = kb_sync_report_path(work_root);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = fs::read_to_string(&path)
+        .map_err(|e| format!("Failed to read KB sync report: {}", e))?;
+    let report: KbSyncReport = serde_json::from_str(&content)
+        .map_err(|e| format!("Failed to parse KB sync report: {}", e))?;
+    Ok(Some(report))
+}
+
+#[tauri::command]
+fn get_kb_sync_report(state: State<'_, AppState>) -> Result<Option<KbSyncReport>, String> {
+    let config = get_config_inner(&state)?;
+    read_kb_sync_report(&config.work_root)
+}
+
+#[tauri::command]
+fn get_kb_stats(state: State<'_, AppState>) -> Result<KbStats, String> {
+    use rusqlite::Connection;
+
+    let conn = Connection::open(&state.db_path)
+        .map_err(|e| format!("Failed to open database: {}", e))?;
+
+    let total_files: u64 = conn
+        .query_row("SELECT COUNT(*) FROM kb_files", [], |row| row.get(0))
+        .unwrap_or(0);
+    let total_chunks: u64 = conn
+        .query_row("SELECT COALESCE(SUM(chunk_count), 0) FROM kb_files", [], |row| row.get(0))
+        .unwrap_or(0);
+    let last_indexed_at: Option<String> = conn
+        .query_row("SELECT MAX(indexed_at) FROM kb_files", [], |row| row.get(0))
+        .ok();
+
+    let mut by_source_group: Vec<KbSourceGroupStat> = Vec::new();
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT source_group, COUNT(*) as c, COALESCE(SUM(chunk_count), 0) as chunks FROM kb_files GROUP BY source_group ORDER BY c DESC"
+    ) {
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(KbSourceGroupStat {
+                    source_group: row.get(0)?,
+                    count: row.get(1)?,
+                    chunk_count: row.get(2)?,
+                })
+            })
+            .map_err(|e| format!("Failed to query KB stats: {}", e))?;
+        for r in rows {
+            by_source_group.push(r.map_err(|e| format!("Failed to collect KB stats: {}", e))?);
+        }
+    }
+
+    Ok(KbStats {
+        total_files,
+        total_chunks,
+        last_indexed_at,
+        by_source_group,
+    })
+}
+
+#[tauri::command]
+async fn kb_sync_now(state: State<'_, AppState>) -> Result<KbSyncReport, String> {
+    let config = get_config_inner(&state)?;
+    let python_bin = find_python_bin(&state);
+
+    let output = Command::new(&python_bin)
+        .args([
+            "-m",
+            "scripts.openclaw_v4_dispatcher",
+            "--work-root",
+            &config.work_root,
+            "--kb-root",
+            &config.kb_root,
+            "kb-sync",
+        ])
+        .current_dir(&state.config_path)
+        .output()
+        .map_err(|e| format!("Failed to run kb-sync: {}", e))?;
+
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let detail = if !stderr.trim().is_empty() { stderr } else { stdout };
+        return Err(format!("kb-sync failed: {}", detail));
+    }
+
+    match read_kb_sync_report(&config.work_root)? {
+        Some(r) => Ok(r),
+        None => Err("kb-sync finished but kb_sync_latest.json not found".to_string()),
+    }
 }
 
 // ============================================================================
@@ -1151,6 +1429,9 @@ pub fn run() {
             start_all_services,
             stop_all_services,
             restart_all_services,
+            start_service,
+            stop_service,
+            restart_service,
             run_preflight_check,
             auto_fix_preflight,
             start_openclaw,
@@ -1161,6 +1442,9 @@ pub fn run() {
             list_verify_artifacts,
             get_quality_report,
             get_verify_folder_path,
+            get_kb_sync_report,
+            get_kb_stats,
+            kb_sync_now,
             get_docker_status,
             start_docker_services,
             stop_docker_services,

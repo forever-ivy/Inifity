@@ -101,14 +101,18 @@ export function Settings() {
   };
 
   const handleSave = async () => {
-    await saveConfig({
-      workRoot: String(localConfig.workRoot || ""),
-      kbRoot: String(localConfig.kbRoot || ""),
-      strictRouter: Boolean(localConfig.strictRouter),
-      requireNew: Boolean(localConfig.requireNew),
-      ragBackend: String(localConfig.ragBackend || "local"),
-    });
-    setHasChanges(false);
+    try {
+      await saveConfig({
+        workRoot: String(localConfig.workRoot || ""),
+        kbRoot: String(localConfig.kbRoot || ""),
+        strictRouter: Boolean(localConfig.strictRouter),
+        requireNew: Boolean(localConfig.requireNew),
+        ragBackend: String(localConfig.ragBackend || "local"),
+      });
+      setHasChanges(false);
+    } catch {
+      // keep "Unsaved changes" so user can retry
+    }
   };
 
   const handleReset = () => {

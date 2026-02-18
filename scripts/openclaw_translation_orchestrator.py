@@ -156,7 +156,10 @@ TASK_TOOL_INSTRUCTIONS: dict[str, str] = {
     "SPREADSHEET_TRANSLATION": (
         "Translate cell by cell, preserving the spreadsheet structure exactly. Do not alter "
         "numbers, formulas, or cell references. Keep column/row alignment intact. "
-        "Translate headers and text cells only."
+        "Translate headers and text cells only. "
+        "CRITICAL: If execution_context.format_preserve.xlsx_sources is present, you MUST translate "
+        "every cell listed in xlsx_sources[].cell_units (even if the sheet notes say a column "
+        "\"auto-populates\"). Do not omit any provided (file, sheet, cell)."
     ),
     "FORMAT_CRITICAL_TASK": (
         "Structural fidelity is the top priority. Preserve all headings, numbering, "
@@ -276,6 +279,7 @@ def _validate_format_preserve_coverage(context: dict[str, Any], draft: dict[str,
     xlsx_sources = preserve.get("xlsx_sources") if isinstance(preserve.get("xlsx_sources"), list) else []
     if xlsx_sources:
         expected_keys: set[tuple[str, str, str]] = set()
+        expected_text_by_key: dict[tuple[str, str, str], str] = {}
         xlsx_files: list[str] = []
         for src in xlsx_sources:
             if not isinstance(src, dict):
@@ -290,7 +294,11 @@ def _validate_format_preserve_coverage(context: dict[str, Any], draft: dict[str,
                 cell = str(unit.get("cell") or "").strip().upper()
                 file_val = str(unit.get("file") or file_name).strip()
                 if file_val and sheet and cell:
-                    expected_keys.add((file_val, sheet, cell))
+                    key = (file_val, sheet, cell)
+                    expected_keys.add(key)
+                    text_val = unit.get("text")
+                    if isinstance(text_val, str) and text_val.strip():
+                        expected_text_by_key[key] = text_val
 
         got_keys = _normalize_xlsx_translation_map_keys(draft.get("xlsx_translation_map"), xlsx_files=xlsx_files)
         missing = sorted(expected_keys - got_keys)
@@ -298,11 +306,26 @@ def _validate_format_preserve_coverage(context: dict[str, Any], draft: dict[str,
         meta["xlsx_got"] = len(got_keys)
         if expected_keys and not got_keys:
             findings.append("xlsx_translation_map_missing")
-        elif missing:
-            findings.append(f"xlsx_translation_map_incomplete:missing={len(missing)}")
+            missing_list = sorted(expected_keys)
+        else:
+            missing_list = missing
+
+        if missing_list:
+            if not got_keys:
+                pass
+            else:
+                findings.append(f"xlsx_translation_map_incomplete:missing={len(missing_list)}")
+
             meta["xlsx_missing_sample"] = [
                 {"file": f, "sheet": s, "cell": c}
-                for (f, s, c) in missing[:8]
+                for (f, s, c) in missing_list[:8]
+            ]
+            max_units = 20
+            if len(missing_list) <= 60:
+                max_units = len(missing_list)
+            meta["xlsx_missing_units_sample"] = [
+                {"file": f, "sheet": s, "cell": c, "text": expected_text_by_key.get((f, s, c), "")}
+                for (f, s, c) in missing_list[:max_units]
             ]
 
     return findings, meta
@@ -2082,6 +2105,25 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
                     items.extend([str(x) for x in (selected_draft.get("unresolved") or [])])
                 return [x for x in items if str(x).strip()]
 
+            def _hard_gate_retry_hints(meta: dict[str, Any]) -> list[str]:
+                hints: list[str] = []
+                preserve = meta.get("preserve_coverage") if isinstance(meta.get("preserve_coverage"), dict) else {}
+                preserve_meta = preserve.get("meta") if isinstance(preserve.get("meta"), dict) else {}
+
+                xlsx_units = preserve_meta.get("xlsx_missing_units_sample")
+                if isinstance(xlsx_units, list) and xlsx_units:
+                    hints.append(f"xlsx_missing_units_sample:{json.dumps(xlsx_units, ensure_ascii=False)}")
+                else:
+                    xlsx_sample = preserve_meta.get("xlsx_missing_sample")
+                    if isinstance(xlsx_sample, list) and xlsx_sample:
+                        hints.append(f"xlsx_missing_sample:{json.dumps(xlsx_sample, ensure_ascii=False)}")
+
+                docx_sample = preserve_meta.get("docx_missing_sample")
+                if isinstance(docx_sample, list) and docx_sample:
+                    hints.append(f"docx_missing_sample:{json.dumps(docx_sample, ensure_ascii=False)}")
+
+                return hints
+
             hard_fix_attempts: list[dict[str, Any]] = []
             hard_findings, hard_warnings, hard_meta = _compute_hard_gates(
                 review_dir=review_dir,
@@ -2094,7 +2136,7 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
 
             while hard_findings and vision_fix_used < vision_fix_limit:
                 vision_fix_used += 1
-                retry_findings = sorted(set(_fix_findings_for_retry() + hard_findings))
+                retry_findings = sorted(set(_fix_findings_for_retry() + hard_findings + _hard_gate_retry_hints(hard_meta)))
                 retry_findings = [x for x in retry_findings if str(x).strip()][:40]
                 hard_fix_attempts.append({"attempt": vision_fix_used, "findings": retry_findings})
 

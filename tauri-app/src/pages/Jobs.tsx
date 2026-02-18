@@ -75,7 +75,23 @@ export function Jobs() {
 
   const getMilestoneTime = (eventType: string) => {
     const milestone = selectedJobMilestones.find((m) => m.eventType === eventType);
-    return milestone?.timestamp ? milestone.timestamp.split(" ")[1]?.slice(0, 8) : null;
+    const ts = milestone?.timestamp;
+    if (!ts) return null;
+
+    const d = new Date(ts);
+    if (!Number.isNaN(d.getTime())) {
+      return d.toLocaleTimeString([], { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    }
+
+    // Fallbacks for non-ISO formats
+    if (ts.includes("T")) {
+      const timePart = ts.split("T")[1] || "";
+      return timePart.replace(/Z$/, "").split(/[.+]/)[0]?.slice(0, 8) || null;
+    }
+    if (ts.includes(" ")) {
+      return ts.split(" ")[1]?.slice(0, 8) || null;
+    }
+    return ts.slice(0, 8);
   };
 
   const isMilestoneComplete = (eventType: string) => {

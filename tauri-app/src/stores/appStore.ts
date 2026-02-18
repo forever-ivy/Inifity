@@ -535,6 +535,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       get().addToast("success", "Settings saved successfully");
     } catch (err) {
       get().addToast("error", `Failed to save config: ${err}`);
+      throw err;
     } finally {
       set({ isLoading: false });
     }
@@ -544,16 +545,43 @@ export const useAppStore = create<AppState>((set, get) => ({
     try {
       const logLines = await tauri.readLogFile(service, lines);
       const logs = logLines.map((line) => {
-        // Parse log format: "2026-02-17 10:32:15 [INFO] message"
-        const match = line.match(/^(\d{4}-\d{2}-\d{2} )?(\d{2}:\d{2}:\d{2})\s*\[(\w+)\]\s*(.*)$/);
-        if (match) {
+        const normalizeLevel = (lvl: string) => {
+          const up = (lvl || "").trim().toUpperCase();
+          if (up === "WARNING") return "WARN";
+          if (up === "CRITICAL" || up === "FATAL") return "ERROR";
+          return up || "INFO";
+        };
+
+        const trimmed = String(line || "").trim();
+        if (trimmed.startsWith("{")) {
+          return { time: "", level: "INFO", service, message: line };
+        }
+
+        // Primary format:
+        // "2026-02-18 23:45:07 [run-worker] INFO message..."
+        const m1 = line.match(
+          /^(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})\s+\[([^\]]+)\]\s+([A-Z]+)\s+(.*)$/
+        );
+        if (m1) {
           return {
-            time: match[2],
-            level: match[3],
-            service,
-            message: match[4],
+            time: m1[2],
+            level: normalizeLevel(m1[4]),
+            service: m1[3] || service,
+            message: m1[5],
           };
         }
+
+        // Back-compat: "YYYY-MM-DD HH:MM:SS [INFO] message" OR "HH:MM:SS [INFO] message"
+        const m2 = line.match(/^(\d{4}-\d{2}-\d{2}\s+)?(\d{2}:\d{2}:\d{2})\s*\[([A-Z]+)\]\s*(.*)$/);
+        if (m2) {
+          return {
+            time: m2[2],
+            level: normalizeLevel(m2[3]),
+            service,
+            message: m2[4],
+          };
+        }
+
         return { time: "", level: "INFO", service, message: line };
       });
       set({ logs, selectedLogService: service });
