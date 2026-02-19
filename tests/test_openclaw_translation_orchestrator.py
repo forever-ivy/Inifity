@@ -11,7 +11,15 @@ from unittest.mock import patch
 from docx import Document
 from openpyxl import Workbook
 
-from scripts.openclaw_translation_orchestrator import _agent_call, _available_slots, run
+from scripts.openclaw_translation_orchestrator import (
+    _agent_call,
+    _available_slots,
+    _compact_knowledge_context,
+    _codex_generate,
+    _infer_language_pair_from_context,
+    _trim_xlsx_prompt_text,
+    run,
+)
 
 
 def _make_docx(path: Path, text: str) -> None:
@@ -534,6 +542,160 @@ class OpenClawTranslationOrchestratorTest(unittest.TestCase):
             self.assertEqual(out["status"], "planned")
             self.assertEqual(out["intent"]["task_type"], "BILINGUAL_PROOFREADING")
             self.assertGreater(out["intent"]["confidence"], 0.0)
+
+
+class IntentFallbackLanguageInferenceTest(unittest.TestCase):
+    def test_infer_language_pair_dedupes_candidate_languages(self):
+        candidates = [
+            {"language": "ar"},
+            {"language": "ar"},
+            {"language": "ar"},
+        ]
+        src, tgt = _infer_language_pair_from_context("", candidates)
+        self.assertEqual(src, "ar")
+        self.assertEqual(tgt, "en")
+
+    def test_infer_language_pair_accepts_english_typos(self):
+        candidates = [{"language": "ar"}]
+        src, tgt = _infer_language_pair_from_context("translate arabic to englsih", candidates)
+        self.assertEqual(src, "ar")
+        self.assertEqual(tgt, "en")
+
+
+class PromptCompactionHelpersTest(unittest.TestCase):
+    def test_compact_knowledge_context_truncates_payload(self):
+        hits = [
+            {
+                "id": "h1",
+                "title": "Doc",
+                "text": "A" * 5000,
+                "score": 0.9,
+            }
+        ] * 10
+        compact = _compact_knowledge_context(hits)
+        self.assertGreater(len(compact), 0)
+        self.assertLessEqual(len(compact), 6)
+        snippet = str((compact[0] or {}).get("snippet") or "")
+        self.assertTrue(len(snippet) <= 1201)
+
+    def test_trim_xlsx_prompt_text(self):
+        context = {
+            "format_preserve": {
+                "xlsx_sources": [
+                    {
+                        "file": "a.xlsx",
+                        "cell_units": [
+                            {"file": "a.xlsx", "sheet": "S1", "cell": "A1", "text": "B" * 300},
+                            {"file": "a.xlsx", "sheet": "S1", "cell": "A2", "text": "short"},
+                        ],
+                    }
+                ]
+            }
+        }
+        trimmed = _trim_xlsx_prompt_text(context, max_chars_per_cell=80)
+        self.assertEqual(trimmed, 1)
+        units = context["format_preserve"]["xlsx_sources"][0]["cell_units"]
+        self.assertTrue(len(units[0]["text"]) <= 81)
+        self.assertEqual(units[1]["text"], "short")
+
+
+class CodexGenerateFallbackTest(unittest.TestCase):
+    @patch("scripts.openclaw_translation_orchestrator._moonshot_direct_api_call")
+    @patch("scripts.openclaw_translation_orchestrator._agent_call")
+    def test_codex_generate_uses_fallback_agent_before_direct_api(self, mocked_agent_call, mocked_kimi_call):
+        mocked_agent_call.side_effect = [
+            {
+                "ok": True,
+                "agent_id": "translator-core",
+                "payload": {},
+                "text": (
+                    "Cloud Code Assist API error (400): Invalid JSON payload received. "
+                    "Unknown name \"patternProperties\" at "
+                    "'request.tools[0].function_declarations[3].parameters.properties[2].value': Cannot find field."
+                ),
+                "meta": {"provider": "google-antigravity", "model": "claude-opus-4-6-thinking"},
+            },
+            {
+                "ok": True,
+                "agent_id": "qa-gate",
+                "payload": {},
+                "text": json.dumps(
+                    {
+                        "final_text": "English output via fallback agent",
+                        "final_reflow_text": "English output via fallback agent",
+                        "docx_translation_map": [],
+                        "xlsx_translation_map": [],
+                        "review_brief_points": [],
+                        "change_log_points": [],
+                        "resolved": [],
+                        "unresolved": [],
+                        "codex_pass": True,
+                        "reasoning_summary": "ok",
+                    }
+                ),
+                "meta": {"provider": "openai-codex", "model": "gpt-5.2"},
+            },
+        ]
+        mocked_kimi_call.return_value = {"ok": False, "error": "should_not_be_called"}
+
+        context = {
+            "task_intent": {"task_type": "SPREADSHEET_TRANSLATION"},
+            "subject": "Translate",
+            "message_text": "translate arabic to english",
+            "candidate_files": [],
+        }
+        out = _codex_generate(context, None, [], 1)
+        self.assertTrue(out.get("ok"))
+        self.assertEqual((out.get("call_meta") or {}).get("provider"), "openai-codex")
+        self.assertEqual((out.get("call_meta") or {}).get("model"), "gpt-5.2")
+        mocked_kimi_call.assert_not_called()
+
+    @patch("scripts.openclaw_translation_orchestrator._moonshot_direct_api_call")
+    @patch("scripts.openclaw_translation_orchestrator._agent_call")
+    def test_codex_generate_falls_back_to_kimi_direct_api_on_schema_error(self, mocked_agent_call, mocked_kimi_call):
+        mocked_agent_call.return_value = {
+            "ok": True,
+            "agent_id": "translator-core",
+            "payload": {},
+            "text": (
+                "Cloud Code Assist API error (400): Invalid JSON payload received. "
+                "Unknown name \"patternProperties\" at "
+                "'request.tools[0].function_declarations[3].parameters.properties[2].value': Cannot find field."
+            ),
+            "meta": {"provider": "google-antigravity", "model": "claude-opus-4-6-thinking"},
+        }
+        mocked_kimi_call.return_value = {
+            "ok": True,
+            "text": json.dumps(
+                {
+                    "final_text": "English output",
+                    "final_reflow_text": "English output",
+                    "docx_translation_map": [],
+                    "xlsx_translation_map": [],
+                    "review_brief_points": [],
+                    "change_log_points": [],
+                    "resolved": [],
+                    "unresolved": [],
+                    "codex_pass": True,
+                    "reasoning_summary": "ok",
+                }
+            ),
+            "source": "direct_api_kimi",
+            "provider": "moonshot",
+            "model": "moonshot/kimi-k2.5",
+        }
+
+        context = {
+            "task_intent": {"task_type": "SPREADSHEET_TRANSLATION"},
+            "subject": "Translate",
+            "message_text": "translate arabic to english",
+            "candidate_files": [],
+        }
+        out = _codex_generate(context, None, [], 1)
+        self.assertTrue(out.get("ok"))
+        self.assertEqual((out.get("call_meta") or {}).get("provider"), "moonshot")
+        self.assertEqual((out.get("call_meta") or {}).get("model"), "moonshot/kimi-k2.5")
+        mocked_kimi_call.assert_called_once()
 
 
 class AvailableSlotsTest(unittest.TestCase):

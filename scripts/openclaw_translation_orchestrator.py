@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import copy
 import json
 import logging
 import os
@@ -122,6 +123,12 @@ REQUIRED_INPUTS_BY_TASK: dict[str, list[str]] = {
 }
 
 CODEX_AGENT = os.getenv("OPENCLAW_CODEX_AGENT", "translator-core")
+CODEX_FALLBACK_AGENT = os.getenv("OPENCLAW_CODEX_FALLBACK_AGENT", "qa-gate").strip()
+INTENT_AGENT = (
+    os.getenv("OPENCLAW_INTENT_AGENT", "").strip()
+    or os.getenv("OPENCLAW_TASK_ROUTER_AGENT", "").strip()
+    or "task-router"
+)
 
 TASK_TOOL_INSTRUCTIONS: dict[str, str] = {
     "REVISION_UPDATE": (
@@ -189,6 +196,12 @@ VALID_THINKING_LEVELS = {"off", "minimal", "low", "medium", "high"}
 OPENCLAW_TRANSLATION_THINKING = os.getenv("OPENCLAW_TRANSLATION_THINKING", "high").strip().lower()
 if OPENCLAW_TRANSLATION_THINKING not in VALID_THINKING_LEVELS:
     OPENCLAW_TRANSLATION_THINKING = "high"
+INTENT_CLASSIFIER_MODE = os.getenv("OPENCLAW_INTENT_CLASSIFIER_MODE", "hybrid").strip().lower() or "hybrid"
+OPENCLAW_AGENT_MESSAGE_MAX_BYTES = max(300000, int(os.getenv("OPENCLAW_AGENT_MESSAGE_MAX_BYTES", "1800000")))
+OPENCLAW_KB_CONTEXT_MAX_HITS = max(0, int(os.getenv("OPENCLAW_KB_CONTEXT_MAX_HITS", "6")))
+OPENCLAW_KB_CONTEXT_MAX_CHARS = max(120, int(os.getenv("OPENCLAW_KB_CONTEXT_MAX_CHARS", "1200")))
+OPENCLAW_XLSX_PROMPT_TEXT_MAX_CHARS = max(40, int(os.getenv("OPENCLAW_XLSX_PROMPT_TEXT_MAX_CHARS", "160")))
+OPENCLAW_PREVIOUS_MAP_MAX_ENTRIES = max(100, int(os.getenv("OPENCLAW_PREVIOUS_MAP_MAX_ENTRIES", "1200")))
 
 GLM_AGENT = os.getenv("OPENCLAW_GLM_AGENT", "glm-reviewer")
 GLM_GENERATOR_AGENT = os.getenv("OPENCLAW_GLM_GENERATOR_AGENT", GLM_AGENT)
@@ -783,6 +796,230 @@ def _candidate_payload(candidates: list[dict[str, Any]], *, include_text: bool =
     return rows
 
 
+def _truncate_text(value: Any, *, max_chars: int) -> str:
+    text = str(value or "")
+    if len(text) <= max_chars:
+        return text
+    return text[: max(1, max_chars)] + "…"
+
+
+def _compact_knowledge_context(hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if OPENCLAW_KB_CONTEXT_MAX_HITS <= 0:
+        return []
+    out: list[dict[str, Any]] = []
+    for hit in list(hits or [])[:OPENCLAW_KB_CONTEXT_MAX_HITS]:
+        if not isinstance(hit, dict):
+            out.append({"snippet": _truncate_text(hit, max_chars=OPENCLAW_KB_CONTEXT_MAX_CHARS)})
+            continue
+        row: dict[str, Any] = {}
+        for key in ("id", "source", "path", "title", "score", "company", "doc_id", "chunk_id"):
+            if key in hit:
+                row[key] = hit.get(key)
+        snippet = hit.get("snippet")
+        if not snippet:
+            snippet = hit.get("text")
+        if not snippet:
+            snippet = hit.get("content")
+        if snippet:
+            row["snippet"] = _truncate_text(snippet, max_chars=OPENCLAW_KB_CONTEXT_MAX_CHARS)
+        if not row:
+            row["snippet"] = _truncate_text(json.dumps(hit, ensure_ascii=False), max_chars=OPENCLAW_KB_CONTEXT_MAX_CHARS)
+        out.append(row)
+    return out
+
+
+def _trim_xlsx_prompt_text(context_payload: dict[str, Any], *, max_chars_per_cell: int) -> int:
+    preserve = context_payload.get("format_preserve")
+    if not isinstance(preserve, dict):
+        return 0
+    sources = preserve.get("xlsx_sources")
+    if not isinstance(sources, list):
+        return 0
+    trimmed = 0
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        units = src.get("cell_units")
+        if not isinstance(units, list):
+            continue
+        for unit in units:
+            if not isinstance(unit, dict):
+                continue
+            text = unit.get("text")
+            if not isinstance(text, str):
+                continue
+            if len(text) > max_chars_per_cell:
+                unit["text"] = _truncate_text(text, max_chars=max_chars_per_cell)
+                trimmed += 1
+    return trimmed
+
+
+def _compact_previous_draft_for_prompt(previous_payload: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    if not isinstance(previous_payload, dict):
+        return {}, False
+    out = copy.deepcopy(previous_payload)
+    changed = False
+    for key in ("final_text", "final_reflow_text"):
+        if isinstance(out.get(key), str) and len(out[key]) > 12000:
+            out[key] = _truncate_text(out[key], max_chars=12000)
+            changed = True
+    for key in ("docx_translation_map", "xlsx_translation_map"):
+        entries = out.get(key)
+        if isinstance(entries, list) and len(entries) > OPENCLAW_PREVIOUS_MAP_MAX_ENTRIES:
+            out[key] = entries[:OPENCLAW_PREVIOUS_MAP_MAX_ENTRIES]
+            changed = True
+    return out, changed
+
+
+LANGUAGE_ALIASES: dict[str, str] = {
+    "ar": "ar",
+    "arabic": "ar",
+    "arab": "ar",
+    "en": "en",
+    "english": "en",
+    "eng": "en",
+    "englsih": "en",
+    "englsh": "en",
+    "inglish": "en",
+    "fr": "fr",
+    "french": "fr",
+    "es": "es",
+    "spanish": "es",
+    "de": "de",
+    "german": "de",
+    "pt": "pt",
+    "portuguese": "pt",
+    "zh": "zh",
+    "chinese": "zh",
+    "tr": "tr",
+    "turkish": "tr",
+}
+
+
+def _normalize_language_token(token: str) -> str:
+    raw = str(token or "").strip().lower()
+    if not raw:
+        return "unknown"
+    return LANGUAGE_ALIASES.get(raw, "unknown")
+
+
+def _ordered_unique(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in values:
+        key = str(value or "").strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return out
+
+
+def _has_english_target_hint(text: str) -> bool:
+    if not text:
+        return False
+    return bool(
+        re.search(
+            r"\b(?:to|into|->|=>)\s*(?:english|eng|englsih|englsh|inglish)\b",
+            text,
+        )
+    )
+
+
+def _infer_language_pair_from_context(message_blob: str, candidates: list[dict[str, Any]]) -> tuple[str, str]:
+    text = (message_blob or "").strip().lower()
+    if text:
+        # Most common phrasing: "<source> to <target>" or "<source> -> <target>".
+        pattern = (
+            r"\b(arabic|arab|english|eng|englsih|englsh|inglish|french|spanish|german|"
+            r"portuguese|chinese|turkish|ar|en|fr|es|de|pt|zh|tr)\b\s*(?:to|into|->|=>)\s*"
+            r"\b(arabic|arab|english|eng|englsih|englsh|inglish|french|spanish|german|"
+            r"portuguese|chinese|turkish|ar|en|fr|es|de|pt|zh|tr)\b"
+        )
+        match = re.search(pattern, text)
+        if match:
+            src = _normalize_language_token(match.group(1))
+            tgt = _normalize_language_token(match.group(2))
+            if src == tgt and src not in {"unknown", "en"} and _has_english_target_hint(text):
+                tgt = "en"
+            return src, tgt
+
+        if _has_english_target_hint(text):
+            tokens = re.findall(
+                r"\b(arabic|arab|french|spanish|german|portuguese|chinese|turkish|ar|fr|es|de|pt|zh|tr)\b",
+                text,
+            )
+            src = _normalize_language_token(tokens[0]) if tokens else "unknown"
+            return src, "en"
+
+    langs = [str(x.get("language") or "").strip().lower() for x in candidates]
+    known_langs = _ordered_unique([x for x in langs if x and x not in {"unknown", "multi"}])
+    if len(known_langs) >= 2:
+        src = known_langs[0]
+        tgt = known_langs[1]
+        if src == tgt and src not in {"unknown", "en"}:
+            return src, "en"
+        return src, tgt
+    if len(known_langs) == 1:
+        src = known_langs[0]
+        tgt = "en" if src != "en" else "unknown"
+        return src, tgt
+
+    return "unknown", "en"
+
+
+def _fallback_intent(meta: dict[str, Any], candidates: list[dict[str, Any]], *, reason: str, raw_text: str = "") -> dict[str, Any]:
+    message_blob = " ".join(
+        [
+            str(meta.get("subject") or ""),
+            str(meta.get("message_text") or ""),
+            str(meta.get("message") or ""),
+        ]
+    ).strip()
+    source_language, target_language = _infer_language_pair_from_context(message_blob, candidates)
+    suffixes = {Path(str(x.get("path") or "")).suffix.lower() for x in candidates}
+    lowered_message = message_blob.lower()
+    if any(ext in suffixes for ext in {".xlsx", ".csv", ".tsv"}):
+        task_type = "SPREADSHEET_TRANSLATION"
+    elif "proofread" in lowered_message:
+        task_type = "BILINGUAL_PROOFREADING"
+    elif len(candidates) >= 2:
+        task_type = "MULTI_FILE_BATCH"
+    else:
+        task_type = "LOW_CONTEXT_TASK"
+
+    required = _normalize_required_inputs(REQUIRED_INPUTS_BY_TASK.get(task_type, []))
+    slots = _available_slots(candidates, source_language=source_language, target_language=target_language)
+    missing = [x for x in required if not slots.get(x, False)]
+    task_label = {
+        "SPREADSHEET_TRANSLATION": "Translate spreadsheet content",
+        "BILINGUAL_PROOFREADING": "Proofread bilingual translation",
+        "MULTI_FILE_BATCH": "Translate multiple files",
+    }.get(task_type, "Translation task")
+
+    log.warning("Intent classifier fallback engaged: %s", reason)
+    return {
+        "ok": True,
+        "intent": {
+            "task_type": task_type,
+            "task_label": task_label,
+            "source_language": source_language,
+            "target_language": target_language,
+            "required_inputs": required,
+            "missing_inputs": missing,
+            "confidence": 0.35,
+            "reasoning_summary": f"Fallback classification used because intent model was unavailable ({reason}).",
+        },
+        "estimated_minutes": 45 if task_type == "SPREADSHEET_TRANSLATION" else 20,
+        "complexity_score": 60.0 if task_type == "SPREADSHEET_TRANSLATION" else 30.0,
+        "raw": {
+            "fallback": True,
+            "reason": reason,
+            "raw_text": raw_text[:1200],
+        },
+    }
+
+
 def _extract_json_from_text(text: str) -> dict[str, Any]:
     raw = (text or "").strip()
     if not raw:
@@ -1141,6 +1378,9 @@ def _available_slots(
 
 
 def _llm_intent(meta: dict[str, Any], candidates: list[dict[str, Any]]) -> dict[str, Any]:
+    if INTENT_CLASSIFIER_MODE in {"heuristic", "local"}:
+        return _fallback_intent(meta, candidates, reason="intent_classifier_mode_forced_heuristic")
+
     message_blob = " ".join(
         [
             str(meta.get("subject") or ""),
@@ -1186,13 +1426,23 @@ Rules:
 - Infer source_language and target_language from the user message (e.g. "translate French to English" → source_language: "fr", target_language: "en").
 - task_label must always be a short human-readable description of the task, never empty.
 """.strip()
-    call = _agent_call(CODEX_AGENT, prompt)
+    call = _agent_call(INTENT_AGENT, prompt)
     if not call.get("ok"):
-        return {"ok": False, "error": call.get("error"), "detail": call}
+        return _fallback_intent(
+            meta,
+            candidates,
+            reason=str(call.get("error") or "intent_agent_call_failed"),
+            raw_text=str(call.get("stdout") or call.get("stderr") or ""),
+        )
     try:
         parsed = _extract_json_from_text(str(call.get("text", "")))
     except Exception as exc:
-        return {"ok": False, "error": "intent_json_parse_failed", "detail": str(exc), "raw_text": call.get("text", "")}
+        return _fallback_intent(
+            meta,
+            candidates,
+            reason="intent_json_parse_failed",
+            raw_text=str(call.get("text", "") or str(exc)),
+        )
 
     task_type = str(parsed.get("task_type") or "").strip().upper()
     if task_type not in TASK_TYPES:
@@ -1306,7 +1556,7 @@ def _build_execution_context(
         "task_intent": intent,
         "selected_tool": task_type,
         "candidate_files": _candidate_payload(candidates, include_text=include_candidate_text),
-        "knowledge_context": kb_hits[:12],
+        "knowledge_context": _compact_knowledge_context(kb_hits),
         "cross_job_memories": list(meta.get("cross_job_memories") or []),
         "rules": {
             "preserve_structure_first": True,
@@ -1337,17 +1587,23 @@ PRESERVED_TEXT_MAP (copy these texts EXACTLY for the corresponding unit IDs):
 {json.dumps(context.get("revision_pack", {}).get("preserved_text_map", {}), ensure_ascii=False)}
 """
 
-    prompt = f"""
+    def _render_prompt(
+        *,
+        context_payload: dict[str, Any],
+        previous_payload: dict[str, Any] | None,
+        revision_section: str,
+    ) -> str:
+        return f"""
 You are Codex translator. Work on this translation job and return strict JSON only.
 
 Round: {round_index}
 Previous unresolved findings: {json.dumps(findings, ensure_ascii=False)}
-{revision_context_section}
+{revision_section}
 Execution context:
-{json.dumps(context, ensure_ascii=False)}
+{json.dumps(context_payload, ensure_ascii=False)}
 
 Previous draft (if any):
-{json.dumps(previous_draft or {}, ensure_ascii=False)}
+{json.dumps(previous_payload or {}, ensure_ascii=False)}
 
 Output JSON:
 {{
@@ -1379,9 +1635,127 @@ Rules:
 - If context is insufficient, keep "codex_pass": false and explain in unresolved.
 - JSON only.
 """.strip()
+
+    context_for_prompt = copy.deepcopy(context)
+    previous_for_prompt = copy.deepcopy(previous_draft or {})
+    prompt = _render_prompt(
+        context_payload=context_for_prompt,
+        previous_payload=previous_for_prompt,
+        revision_section=revision_context_section,
+    )
+    prompt_bytes = len(prompt.encode("utf-8"))
+    compactions: list[str] = []
+
+    if prompt_bytes > OPENCLAW_AGENT_MESSAGE_MAX_BYTES:
+        context_for_prompt["knowledge_context"] = []
+        context_for_prompt["cross_job_memories"] = []
+        compactions.append("drop_knowledge_context")
+        prompt = _render_prompt(
+            context_payload=context_for_prompt,
+            previous_payload=previous_for_prompt,
+            revision_section=revision_context_section,
+        )
+        prompt_bytes = len(prompt.encode("utf-8"))
+
+    if prompt_bytes > OPENCLAW_AGENT_MESSAGE_MAX_BYTES and task_type == "SPREADSHEET_TRANSLATION":
+        trimmed_cells = _trim_xlsx_prompt_text(
+            context_for_prompt,
+            max_chars_per_cell=OPENCLAW_XLSX_PROMPT_TEXT_MAX_CHARS,
+        )
+        if trimmed_cells > 0:
+            compactions.append(f"trim_xlsx_text:{trimmed_cells}")
+            prompt = _render_prompt(
+                context_payload=context_for_prompt,
+                previous_payload=previous_for_prompt,
+                revision_section=revision_context_section,
+            )
+            prompt_bytes = len(prompt.encode("utf-8"))
+
+    if prompt_bytes > OPENCLAW_AGENT_MESSAGE_MAX_BYTES and previous_for_prompt:
+        previous_for_prompt, changed = _compact_previous_draft_for_prompt(previous_for_prompt)
+        if changed:
+            compactions.append("compact_previous_draft")
+            prompt = _render_prompt(
+                context_payload=context_for_prompt,
+                previous_payload=previous_for_prompt,
+                revision_section=revision_context_section,
+            )
+            prompt_bytes = len(prompt.encode("utf-8"))
+
+    if compactions:
+        context_for_prompt["prompt_compaction"] = {
+            "applied": compactions,
+            "max_bytes": OPENCLAW_AGENT_MESSAGE_MAX_BYTES,
+        }
+        prompt = _render_prompt(
+            context_payload=context_for_prompt,
+            previous_payload=previous_for_prompt,
+            revision_section=revision_context_section,
+        )
+        prompt_bytes = len(prompt.encode("utf-8"))
+
+    if prompt_bytes > OPENCLAW_AGENT_MESSAGE_MAX_BYTES:
+        return {
+            "ok": False,
+            "error": "prompt_too_large",
+            "detail": {
+                "bytes": prompt_bytes,
+                "max_bytes": OPENCLAW_AGENT_MESSAGE_MAX_BYTES,
+                "compactions": compactions,
+            },
+            "raw_text": "",
+        }
+
     call = _agent_call(CODEX_AGENT, prompt)
+    raw_text = str(call.get("text") or call.get("stdout") or call.get("stderr") or "")
+    if call.get("ok") and _looks_like_provider_schema_error(raw_text):
+        call = {
+            "ok": False,
+            "error": "agent_provider_schema_rejected",
+            "detail": raw_text[:2000],
+            "raw_text": raw_text,
+        }
+
     if not call.get("ok"):
-        return {"ok": False, "error": call.get("error"), "detail": call}
+        fallback_errors: dict[str, str] = {}
+
+        if CODEX_FALLBACK_AGENT and CODEX_FALLBACK_AGENT != CODEX_AGENT:
+            fallback_call = _agent_call(CODEX_FALLBACK_AGENT, prompt)
+            fallback_text = str(fallback_call.get("text") or fallback_call.get("stdout") or fallback_call.get("stderr") or "")
+            if fallback_call.get("ok") and _looks_like_provider_schema_error(fallback_text):
+                fallback_call = {
+                    "ok": False,
+                    "error": "agent_provider_schema_rejected",
+                    "detail": fallback_text[:2000],
+                    "raw_text": fallback_text,
+                }
+            if fallback_call.get("ok"):
+                call = fallback_call
+            else:
+                fallback_errors["agent"] = str(
+                    fallback_call.get("error") or f"agent_call_failed:{CODEX_FALLBACK_AGENT}"
+                )
+
+        if not call.get("ok") and _env_flag("OPENCLAW_KIMI_DIRECT_FALLBACK_ENABLED", "1"):
+            kimi_call = _moonshot_direct_api_call(prompt)
+            if kimi_call.get("ok"):
+                call = kimi_call
+            else:
+                fallback_errors["kimi"] = str(kimi_call.get("error") or "kimi_direct_failed")
+
+        if not call.get("ok") and _env_flag("OPENCLAW_GLM_DIRECT_FALLBACK_ENABLED", "1"):
+            glm_call = _glm_direct_api_call(prompt)
+            if glm_call.get("ok"):
+                call = glm_call
+            else:
+                fallback_errors["glm"] = str(glm_call.get("error") or "glm_direct_failed")
+
+        if not call.get("ok"):
+            detail = dict(call)
+            if fallback_errors:
+                detail["fallback_errors"] = fallback_errors
+            return {"ok": False, "error": call.get("error"), "detail": detail, "raw_text": raw_text}
+
     try:
         parsed = _extract_json_from_text(str(call.get("text", "")))
     except Exception as exc:
@@ -1390,6 +1764,20 @@ Rules:
     call_meta = call.get("meta") if isinstance(call.get("meta"), dict) else {}
     if isinstance(call, dict) and call.get("agent_id"):
         call_meta = {"agent_id": str(call.get("agent_id") or ""), **call_meta}
+    if isinstance(call, dict) and call.get("source") == "direct_api_kimi":
+        call_meta = {
+            "agent_id": "direct_api_kimi",
+            "provider": "moonshot",
+            "model": str(call.get("model") or os.getenv("OPENCLAW_KIMI_MODEL", "moonshot/kimi-k2.5")),
+            **call_meta,
+        }
+    if isinstance(call, dict) and call.get("source") == "direct_api":
+        call_meta = {
+            "agent_id": "direct_api_glm",
+            "provider": str(GLM_MODEL or "").split("/", 1)[0] if "/" in str(GLM_MODEL or "") else "zai",
+            "model": str(GLM_MODEL or "zai/glm-5"),
+            **call_meta,
+        }
     return {
         "ok": True,
         "data": {
@@ -1499,67 +1887,137 @@ Rules:
     return {"ok": True, "data": data, "raw": parsed, "call_meta": call_meta}
 
 
+def _resolve_openclaw_auth_profiles_path() -> Path:
+    override = os.environ.get("OPENCLAW_AUTH_PROFILES_PATH", "").strip()
+    if override:
+        return Path(override).expanduser()
+    return Path("~/.openclaw/agents/main/agent/auth-profiles.json").expanduser()
+
+
+def _read_openclaw_api_key(provider_id: str) -> str:
+    provider = str(provider_id or "").strip()
+    if not provider:
+        return ""
+    path = _resolve_openclaw_auth_profiles_path()
+    if not path.exists():
+        return ""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return ""
+    if not isinstance(data, dict):
+        return ""
+
+    profiles = data.get("profiles")
+    if not isinstance(profiles, dict):
+        profiles = {}
+
+    def _extract_key(profile_obj: Any) -> str:
+        if not isinstance(profile_obj, dict):
+            return ""
+        if str(profile_obj.get("type") or "") != "api_key":
+            return ""
+        for key_name in ("key", "api_key", "apiKey", "token"):
+            val = profile_obj.get(key_name)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+        return ""
+
+    last_good = data.get("lastGood")
+    if isinstance(last_good, dict):
+        profile_id = last_good.get(provider)
+        if isinstance(profile_id, str) and profile_id.strip():
+            key = _extract_key(profiles.get(profile_id.strip()))
+            if key:
+                return key
+
+    key = _extract_key(profiles.get(f"{provider}:default"))
+    if key:
+        return key
+
+    for profile_id, profile_obj in profiles.items():
+        if not isinstance(profile_id, str) or not profile_id.startswith(f"{provider}:"):
+            continue
+        key = _extract_key(profile_obj)
+        if key:
+            return key
+    return ""
+
+
+def _looks_like_provider_schema_error(text: str) -> bool:
+    lowered = str(text or "").lower()
+    if "patternproperties" not in lowered:
+        return False
+    return any(
+        token in lowered
+        for token in (
+            "invalid json payload",
+            "cannot find field",
+            "function_declarations",
+        )
+    )
+
+
+def _moonshot_direct_api_call(prompt: str) -> dict[str, Any]:
+    import urllib.request
+
+    model_key = str(os.getenv("OPENCLAW_KIMI_MODEL", "moonshot/kimi-k2.5") or "moonshot/kimi-k2.5").strip()
+    model = model_key.rsplit("/", 1)[-1] if "/" in model_key else model_key
+    api_key = str(os.getenv("MOONSHOT_API_KEY") or "").strip() or _read_openclaw_api_key("moonshot")
+    if not api_key:
+        return {"ok": False, "error": "moonshot_api_key_not_set"}
+
+    base_url = os.environ.get("OPENCLAW_MOONSHOT_BASE_URL", "https://api.moonshot.cn/v1").strip().rstrip("/")
+    url = f"{base_url}/chat/completions"
+    body = json.dumps(
+        {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.2,
+            "max_tokens": 4096,
+            "stream": False,
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        choice = (data.get("choices") or [{}])[0]
+        message = choice.get("message") or {}
+        content = message.get("content", "")
+        if isinstance(content, list):
+            content = "".join(
+                part.get("text", "")
+                for part in content
+                if isinstance(part, dict) and isinstance(part.get("text"), str)
+            )
+        if not isinstance(content, str):
+            content = str(content)
+        return {
+            "ok": True,
+            "text": content,
+            "source": "direct_api_kimi",
+            "provider": "moonshot",
+            "model": model_key,
+        }
+    except Exception as exc:
+        return {"ok": False, "error": f"moonshot_direct_api_failed:{exc}"}
+
+
 def _glm_direct_api_call(prompt: str) -> dict[str, Any]:
     """Fallback: call Zhipu GLM API directly when OpenClaw agent unavailable."""
     import urllib.request
 
-    def _read_key_from_auth_profiles() -> str:
-        try:
-            path = Path("~/.openclaw/agents/main/agent/auth-profiles.json").expanduser()
-        except Exception:
-            return ""
-        if not path.exists():
-            return ""
-        try:
-            data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
-        except Exception:
-            return ""
-        if not isinstance(data, dict):
-            return ""
-
-        profiles = data.get("profiles")
-        if not isinstance(profiles, dict):
-            profiles = {}
-
-        def _profile_key(profile_id: str) -> str:
-            p = profiles.get(profile_id)
-            if not isinstance(p, dict):
-                return ""
-            for k in ("key", "api_key", "apiKey", "token"):
-                val = p.get(k)
-                if isinstance(val, str) and val.strip():
-                    return val.strip()
-            return ""
-
-        # Prefer the default zai profile.
-        for pid in ("zai:default",):
-            k = _profile_key(pid)
-            if k:
-                return k
-
-        # Or the most recently-good zai profile.
-        last_good = data.get("lastGood")
-        if isinstance(last_good, dict):
-            pid = last_good.get("zai")
-            if isinstance(pid, str) and pid.strip():
-                k = _profile_key(pid.strip())
-                if k:
-                    return k
-
-        # Final fallback: any zai profile with a key.
-        for pid in profiles.keys():
-            if not isinstance(pid, str):
-                continue
-            if not pid.startswith("zai"):
-                continue
-            k = _profile_key(pid)
-            if k:
-                return k
-        return ""
-
     api_key = str(os.getenv("GLM_API_KEY") or GLM_API_KEY or "").strip()
     if not api_key:
-        api_key = _read_key_from_auth_profiles()
+        api_key = _read_openclaw_api_key("zai")
     if not api_key:
         return {"ok": False, "error": "glm_api_key_not_set"}
     url = f"{GLM_API_BASE_URL}/chat/completions"
@@ -2304,7 +2762,7 @@ def run(
             ]
             if xlsx_sources:
                 max_cells = int(os.getenv("OPENCLAW_XLSX_TRANSLATION_MAX_CELLS", "2000"))
-                max_chars = int(os.getenv("OPENCLAW_XLSX_MAX_CHARS_PER_CELL", "400"))
+                max_chars = int(os.getenv("OPENCLAW_XLSX_MAX_CHARS_PER_CELL", "160"))
                 src_lang = str(intent.get("source_language") or "").strip().lower()
                 arabic_only = False
                 if src_lang in {"ar", "arabic"}:
