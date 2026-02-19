@@ -5,6 +5,7 @@ ROOT_DIR="/Users/Code/workflow/translation"
 WORKSPACE_DIR="${OPENCLAW_WORKSPACE_DIR:-$ROOT_DIR}"
 PRIMARY_MODEL="${OPENCLAW_PRIMARY_MODEL:-openai-codex/gpt-5.2-codex}"
 FALLBACK_MODEL="${OPENCLAW_FALLBACK_MODEL:-google/gemini-2.5-pro}"
+KIMI_MODEL="${OPENCLAW_KIMI_MODEL:-moonshot/kimi-k2.5}"
 OPENCLAW_WORKSPACE_SKILL_ROOT="${OPENCLAW_WORKSPACE_SKILL_ROOT:-$HOME/.openclaw/workspace}"
 SKILL_LOCK_FILE="${SKILL_LOCK_FILE:-$ROOT_DIR/config/skill-lock.v6.json}"
 
@@ -86,8 +87,47 @@ fi
 
 echo "Configuring model routing..."
 openclaw models set "$PRIMARY_MODEL"
-openclaw models fallbacks clear || true
-openclaw models fallbacks add "$FALLBACK_MODEL" || true
+
+# Ensure the primary fallback is present without clobbering the whole list.
+if ! openclaw models fallbacks list --json 2>/dev/null | jq -e --arg m "$FALLBACK_MODEL" '(.fallbacks // []) | index($m) != null' >/dev/null; then
+  openclaw models fallbacks add "$FALLBACK_MODEL" || true
+fi
+
+# Insert/move Kimi fallback before any GLM fallbacks (zai/glm-*) while preserving order.
+if [[ -n "$KIMI_MODEL" ]]; then
+  FALLBACKS_JSON="$(openclaw models fallbacks list --json 2>/dev/null || echo '{"fallbacks": []}')"
+  CURRENT_LIST="$(jq -c '(.fallbacks // [])' <<<"$FALLBACKS_JSON")"
+  DESIRED_LIST="$(jq -c --arg kimi "$KIMI_MODEL" '
+    def norm: map(tostring | gsub("^\\s+|\\s+$"; "")) | map(select(length > 0));
+    def dedupe:
+      reduce .[] as $x ({"seen": {}, "out": []};
+        if (.seen[$x] // false) then .
+        else .seen[$x] = true | .out += [$x]
+        end
+      ) | .out;
+
+    (.fallbacks // [])
+    | norm
+    | map(select(. != $kimi))
+    | dedupe as $base
+    | ($base | map(startswith("zai/glm-")) | index(true)) as $i
+    | if $i == null then ($base + [$kimi]) else ($base[0:$i] + [$kimi] + $base[$i:]) end
+  ' <<<"$FALLBACKS_JSON")"
+
+  if [[ "$DESIRED_LIST" != "$CURRENT_LIST" ]]; then
+    echo "Updating OpenClaw fallbacks (Kimi before GLM)..."
+    openclaw models fallbacks clear || true
+    while IFS= read -r model; do
+      [[ -z "$model" ]] && continue
+      openclaw models fallbacks add "$model" || true
+    done < <(jq -r '.[]' <<<"$DESIRED_LIST")
+  fi
+fi
+
+# Configure image model for vision workflows (best-effort).
+if [[ -n "$KIMI_MODEL" ]]; then
+  openclaw models set-image "$KIMI_MODEL" || true
+fi
 
 install_community_skills_from_lock
 

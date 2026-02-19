@@ -24,6 +24,10 @@ const preflightItems = [
   { name: "requirements", key: "requirements" },
   { name: ".env.v4.local", key: "env" },
   { name: "OpenClaw", key: "openclaw" },
+  { name: "Models (translator-core)", key: "models_translator_core" },
+  { name: "Models (review-core)", key: "models_review_core", optional: true },
+  { name: "Vision QA Keys", key: "vision_keys", optional: true },
+  { name: "GLM", key: "glm", optional: true },
   { name: "LibreOffice", key: "libreoffice", optional: true },
 ];
 
@@ -63,6 +67,7 @@ export function Services() {
   } = useAppStore();
 
   const [isPreflightRunning, setIsPreflightRunning] = useState(false);
+  const [showAllPreflightDetails, setShowAllPreflightDetails] = useState(false);
 
   useEffect(() => {
     fetchServices();
@@ -86,6 +91,10 @@ export function Services() {
     return check.status;
   };
 
+  const preflightDetails = showAllPreflightDetails
+    ? preflightChecks
+    : preflightChecks.filter((c) => c.status !== "pass");
+
   return (
     <div className="p-6 space-y-6">
       {/* Header */}
@@ -108,7 +117,7 @@ export function Services() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <div className="grid grid-cols-3 gap-4 mb-4">
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 mb-4">
               {preflightItems.map((item, i) => {
                 const status = getPreflightStatus(item.key, item.optional);
 
@@ -120,7 +129,7 @@ export function Services() {
                     initial="hidden"
                     animate="show"
                     whileHover={{ scale: 1.02, backgroundColor: "var(--surface-hover, rgba(0,0,0,0.02))" }}
-                    className="flex items-center gap-2 p-2 rounded-xl border cursor-default"
+                    className="flex items-center gap-2 p-2 rounded-xl border cursor-default min-w-0"
                   >
                     {status === "pass" && (
                       <motion.div
@@ -133,7 +142,7 @@ export function Services() {
                     )}
                     {status === "warning" && <AlertCircle className="h-4 w-4 text-yellow-400" />}
                     {status === "blocker" && <XCircle className="h-4 w-4 text-red-400" />}
-                    <span className="text-sm">{item.name}</span>
+                    <span className="text-sm min-w-0 flex-1 truncate">{item.name}</span>
                     {item.optional && (
                       <Badge variant="outline" className="text-xs">
                         optional
@@ -143,7 +152,47 @@ export function Services() {
                 );
               })}
             </div>
-            <div className="flex gap-2">
+
+            {/* Details */}
+            {preflightChecks.length > 0 && (
+              <div className="mb-4 space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="text-xs text-muted-foreground">
+                    {showAllPreflightDetails ? "Showing all checks" : "Showing issues only"}
+                  </div>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => setShowAllPreflightDetails((v) => !v)}
+                  >
+                    {showAllPreflightDetails ? "Show issues only" : "Show all"}
+                  </Button>
+                </div>
+
+                {preflightDetails.length === 0 ? (
+                  <div className="p-3 rounded-xl border bg-background/40 text-sm text-muted-foreground">
+                    All checks passed.
+                  </div>
+                ) : preflightDetails.map((c) => (
+                  <div
+                    key={c.key}
+                    className="flex items-start gap-3 p-3 rounded-xl border bg-background/40"
+                  >
+                    {c.status === "pass" && <CheckCircle2 className="h-4 w-4 text-green-400 mt-0.5" />}
+                    {c.status === "warning" && <AlertCircle className="h-4 w-4 text-yellow-400 mt-0.5" />}
+                    {c.status === "blocker" && <XCircle className="h-4 w-4 text-red-400 mt-0.5" />}
+                    <div className="min-w-0">
+                      <div className="text-sm font-medium">{c.name}</div>
+                      <div className="text-xs text-muted-foreground whitespace-pre-wrap break-words">
+                        {c.message}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            <div className="flex flex-wrap gap-2">
               <motion.div whileHover={{ scale: 1.02 }} whileTap={{ scale: 0.98 }}>
                 <Button
                   variant="outline"

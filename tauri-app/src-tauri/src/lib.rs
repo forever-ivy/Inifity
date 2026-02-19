@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use chrono::{Local, TimeZone};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -120,6 +121,22 @@ pub struct KbStats {
     pub by_source_group: Vec<KbSourceGroupStat>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KbFileRow {
+    pub path: String,
+    pub parser: String,
+    pub source_group: String,
+    pub chunk_count: u64,
+    pub indexed_at: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KbFileList {
+    pub total: u64,
+    pub items: Vec<KbFileRow>,
+}
+
 // ============================================================================
 // API Provider Types
 // ============================================================================
@@ -144,6 +161,63 @@ pub struct ApiUsage {
     pub unit: String,
     pub reset_at: Option<i64>,
     pub fetched_at: i64,
+}
+
+// ============================================================================
+// Model Availability Types
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelAvailabilityReport {
+    pub fetched_at: i64, // epoch ms
+    pub agents: HashMap<String, AgentAvailability>,
+    pub vision: VisionAvailability,
+    pub glm: GlmAvailability,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentAvailability {
+    pub agent_id: String,
+    pub default_model: String,
+    pub fallbacks: Vec<String>,
+    pub route: Vec<RouteModelStatus>,
+    pub runnable_now: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_runnable_model: Option<String>,
+    pub blocked_reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteModelStatus {
+    pub model: String,
+    pub provider: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub available: Option<bool>,
+    pub state: String, // "ok" | "cooldown" | "unavailable" | "expired" | "unknown"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooldown_until_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_expired: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VisionAvailability {
+    pub has_google_api_key: bool,
+    pub has_gemini_api_key: bool,
+    pub has_moonshot_api_key: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vision_backend: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vision_model: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GlmAvailability {
+    pub glm_enabled: bool,
+    pub has_glm_api_key: bool,
+    pub has_zai_profile: bool,
 }
 
 // ============================================================================
@@ -263,6 +337,8 @@ fn parse_env_assignment(line: &str) -> Option<(String, String)> {
             val = val[1..val.len() - 1].to_string();
         }
     }
+    // After stripping quotes, normalize surrounding whitespace (common for secrets like "  ").
+    val = val.trim().to_string();
     Some((key, val))
 }
 
@@ -270,6 +346,19 @@ fn env_quote_double(value: &str) -> String {
     // Safe for bash `source` in .env-style files.
     let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
     format!("\"{}\"", escaped)
+}
+
+fn read_env_map(env_path: &PathBuf) -> HashMap<String, String> {
+    let mut out: HashMap<String, String> = HashMap::new();
+    let Ok(content) = fs::read_to_string(env_path) else {
+        return out;
+    };
+    for line in content.lines() {
+        if let Some((key, value)) = parse_env_assignment(line) {
+            out.insert(key, value);
+        }
+    }
+    out
 }
 
 fn get_config_inner(state: &AppState) -> Result<AppConfig, String> {
@@ -328,6 +417,495 @@ fn find_python_bin(state: &AppState) -> String {
         return venv_python.to_string_lossy().to_string();
     }
     "python3".to_string()
+}
+
+fn fmt_epoch_ms(ms: i64) -> String {
+    // Best-effort local timestamp formatting (human-friendly). Fallback: raw ms.
+    match Local.timestamp_millis_opt(ms).single() {
+        Some(dt) => dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+        None => ms.to_string(),
+    }
+}
+
+fn find_openclaw_bin() -> Option<String> {
+    // 1) PATH lookup (best in dev environments)
+    if let Ok(path_env) = std::env::var("PATH") {
+        for dir in path_env.split(':') {
+            if dir.trim().is_empty() {
+                continue;
+            }
+            let cand = PathBuf::from(dir).join("openclaw");
+            if cand.exists() {
+                return Some(cand.to_string_lossy().to_string());
+            }
+        }
+    }
+
+    // 2) Common install locations
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/ivy".to_string());
+    let candidates = [
+        format!("{}/.local/bin/openclaw", home),
+        "/usr/local/bin/openclaw".to_string(),
+        "/opt/homebrew/bin/openclaw".to_string(),
+        "/usr/bin/openclaw".to_string(),
+    ];
+    for cand in candidates {
+        if PathBuf::from(&cand).exists() {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+fn run_openclaw_json(args: &[&str]) -> Result<serde_json::Value, String> {
+    let bin = find_openclaw_bin().ok_or("OpenClaw not found in PATH or common locations")?;
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/ivy".to_string());
+
+    let output = Command::new(&bin)
+        .args(args)
+        .env("HOME", &home)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}/.local/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin",
+                std::env::var("PATH").unwrap_or_default(),
+                home
+            ),
+        )
+        .output()
+        .map_err(|e| format!("Failed to run openclaw {:?}: {}", args, e))?;
+
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let detail = if !stderr.trim().is_empty() { stderr } else { stdout };
+        return Err(format!(
+            "openclaw {:?} exited with code {:?}: {}",
+            args,
+            output.status.code(),
+            detail
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    serde_json::from_str(&stdout).map_err(|e| format!("Failed to parse openclaw JSON output: {}", e))
+}
+
+fn compute_fallbacks_with_kimi_before_glm(current: Vec<String>, kimi_model: &str) -> Vec<String> {
+    let kimi = kimi_model.trim();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+
+    for item in current {
+        let m = item.trim();
+        if m.is_empty() {
+            continue;
+        }
+        if !kimi.is_empty() && m == kimi {
+            continue;
+        }
+        if seen.insert(m.to_string()) {
+            out.push(m.to_string());
+        }
+    }
+
+    if kimi.is_empty() {
+        return out;
+    }
+
+    let glm_idx = out.iter().position(|m| m.starts_with("zai/glm-"));
+    match glm_idx {
+        Some(i) => out.insert(i, kimi.to_string()),
+        None => out.push(kimi.to_string()),
+    }
+    out
+}
+
+fn apply_fallbacks(new_list: &[String]) -> Result<(), String> {
+    let bin = find_openclaw_bin().ok_or("OpenClaw not found in PATH or common locations")?;
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/ivy".to_string());
+    let path_env = format!(
+        "{}:{}/.local/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin",
+        std::env::var("PATH").unwrap_or_default(),
+        home
+    );
+
+    let run = |args: &[&str]| -> Result<(), String> {
+        let output = Command::new(&bin)
+            .args(args)
+            .env("HOME", &home)
+            .env("PATH", &path_env)
+            .output()
+            .map_err(|e| format!("Failed to run openclaw {:?}: {}", args, e))?;
+
+        if !output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let detail = if !stderr.trim().is_empty() { stderr } else { stdout };
+            return Err(format!(
+                "openclaw {:?} exited with code {:?}: {}",
+                args,
+                output.status.code(),
+                detail
+            ));
+        }
+        Ok(())
+    };
+
+    run(&["models", "fallbacks", "clear"])?;
+    for model in new_list {
+        let m = model.trim();
+        if m.is_empty() {
+            continue;
+        }
+        run(&["models", "fallbacks", "add", m])?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Default)]
+struct ProviderAuthSummary {
+    total_profiles: usize,
+    cooldown_profiles: usize,
+    cooldown_until_ms: Option<i64>,
+    oauth_seen: bool,
+    oauth_has_valid: bool,
+    api_key_seen: bool,
+}
+
+fn provider_summaries_from_models_status(models_status: &serde_json::Value) -> HashMap<String, ProviderAuthSummary> {
+    let mut out: HashMap<String, ProviderAuthSummary> = HashMap::new();
+
+    let profiles = models_status
+        .pointer("/auth/oauth/profiles")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    for p in profiles {
+        let Some(provider) = p.get("provider").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if provider.trim().is_empty() {
+            continue;
+        }
+        let entry = out.entry(provider.to_string()).or_default();
+        entry.total_profiles += 1;
+
+        let ptype = p.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if ptype == "oauth" {
+            entry.oauth_seen = true;
+            let remaining_ms = p.get("remainingMs").and_then(|v| v.as_i64()).unwrap_or(0);
+            if remaining_ms > 0 {
+                entry.oauth_has_valid = true;
+            }
+        } else if ptype == "api_key" {
+            entry.api_key_seen = true;
+        }
+    }
+
+    let unusable = models_status
+        .pointer("/auth/unusableProfiles")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    for u in unusable {
+        let Some(provider) = u.get("provider").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if provider.trim().is_empty() {
+            continue;
+        }
+        let entry = out.entry(provider.to_string()).or_default();
+        entry.cooldown_profiles += 1;
+        if let Some(until) = u.get("until").and_then(|v| v.as_i64()) {
+            entry.cooldown_until_ms = Some(entry.cooldown_until_ms.map_or(until, |prev| prev.max(until)));
+        }
+    }
+
+    out
+}
+
+fn models_available_map(models_list: &serde_json::Value) -> HashMap<String, bool> {
+    let mut out: HashMap<String, bool> = HashMap::new();
+    let Some(models) = models_list.get("models").and_then(|v| v.as_array()) else {
+        return out;
+    };
+    for m in models {
+        let Some(key) = m.get("key").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if let Some(avail) = m.get("available").and_then(|v| v.as_bool()) {
+            out.insert(key.to_string(), avail);
+        }
+    }
+    out
+}
+
+fn has_provider_profile(models_status: &serde_json::Value, provider: &str, profile_type: Option<&str>) -> bool {
+    let Some(profiles) = models_status.pointer("/auth/oauth/profiles").and_then(|v| v.as_array()) else {
+        return false;
+    };
+    profiles.iter().any(|p| {
+        let Some(p_provider) = p.get("provider").and_then(|v| v.as_str()) else {
+            return false;
+        };
+        if p_provider != provider {
+            return false;
+        }
+        match profile_type {
+            Some(t) => p.get("type").and_then(|v| v.as_str()) == Some(t),
+            None => true,
+        }
+    })
+}
+
+fn compute_agent_availability(
+    agent_id: &str,
+    models_status: &serde_json::Value,
+    availability: &HashMap<String, bool>,
+) -> AgentAvailability {
+    let resolved_default = models_status
+        .get("resolvedDefault")
+        .and_then(|v| v.as_str())
+        .or_else(|| models_status.get("defaultModel").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .to_string();
+
+    let fallbacks: Vec<String> = models_status
+        .get("fallbacks")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut route_models: Vec<String> = Vec::new();
+    let mut seen_models: HashSet<String> = HashSet::new();
+    for item in std::iter::once(resolved_default.clone()).chain(fallbacks.clone()) {
+        let m = item.trim();
+        if m.is_empty() {
+            continue;
+        }
+        if seen_models.insert(m.to_string()) {
+            route_models.push(m.to_string());
+        }
+    }
+
+    let provider_summaries = provider_summaries_from_models_status(models_status);
+
+    let mut route: Vec<RouteModelStatus> = Vec::new();
+    for model in &route_models {
+        let provider = model.split('/').next().unwrap_or("").to_string();
+        let available = availability.get(model).copied();
+        let summary = provider_summaries.get(&provider).cloned().unwrap_or_default();
+
+        let provider_all_in_cooldown =
+            summary.total_profiles > 0 && summary.cooldown_profiles >= summary.total_profiles;
+        let oauth_expired = summary.oauth_seen && !summary.oauth_has_valid;
+        let auth_ok = if summary.oauth_seen {
+            summary.oauth_has_valid
+        } else if summary.api_key_seen {
+            true
+        } else {
+            false
+        };
+
+        let mut note: Option<String> = None;
+        if available.is_none() {
+            note = Some("Model not found in `openclaw models list` output.".to_string());
+        } else if available == Some(true) && !auth_ok && summary.total_profiles == 0 {
+            note = Some("No auth profiles found for this provider.".to_string());
+        }
+
+        let state = if available == Some(false) {
+            "unavailable"
+        } else if provider_all_in_cooldown {
+            "cooldown"
+        } else if summary.oauth_seen && oauth_expired {
+            "expired"
+        } else if available == Some(true) && auth_ok {
+            "ok"
+        } else {
+            "unknown"
+        }
+        .to_string();
+
+        route.push(RouteModelStatus {
+            model: model.to_string(),
+            provider: provider.clone(),
+            available,
+            state: state.clone(),
+            cooldown_until_ms: if state == "cooldown" { summary.cooldown_until_ms } else { None },
+            auth_expired: if summary.oauth_seen { Some(oauth_expired) } else { None },
+            note,
+        });
+    }
+
+    let first_runnable_model = route.iter().find(|r| r.state == "ok").map(|r| r.model.clone());
+    let runnable_now = first_runnable_model.is_some();
+
+    let mut blocked_reasons: Vec<String> = Vec::new();
+    if !runnable_now {
+        let mut seen_providers: HashSet<String> = HashSet::new();
+        for item in &route {
+            if !seen_providers.insert(item.provider.clone()) {
+                continue;
+            }
+            let summary = provider_summaries.get(&item.provider).cloned().unwrap_or_default();
+            let provider_all_in_cooldown =
+                summary.total_profiles > 0 && summary.cooldown_profiles >= summary.total_profiles;
+            let oauth_expired = summary.oauth_seen && !summary.oauth_has_valid;
+
+            if provider_all_in_cooldown {
+                if let Some(until) = summary.cooldown_until_ms {
+                    blocked_reasons.push(format!(
+                        "{} is in cooldown until {} ({}).",
+                        item.provider,
+                        fmt_epoch_ms(until),
+                        until
+                    ));
+                } else {
+                    blocked_reasons.push(format!("{} is in cooldown.", item.provider));
+                }
+                continue;
+            }
+
+            if route.iter().any(|r| r.provider == item.provider && r.state == "unavailable") {
+                blocked_reasons.push(format!("{} models are unavailable.", item.provider));
+                continue;
+            }
+
+            if summary.oauth_seen && oauth_expired {
+                blocked_reasons.push(format!("{} OAuth appears expired or missing.", item.provider));
+                continue;
+            }
+
+            if summary.total_profiles == 0 {
+                blocked_reasons.push(format!("{} has no auth profiles configured.", item.provider));
+                continue;
+            }
+
+            if route.iter().all(|r| r.provider != item.provider || r.state == "unknown") {
+                blocked_reasons.push(format!("{} availability is unknown.", item.provider));
+            }
+        }
+
+        if blocked_reasons.is_empty() {
+            blocked_reasons.push("No runnable route model found.".to_string());
+        }
+    }
+
+    AgentAvailability {
+        agent_id: agent_id.to_string(),
+        default_model: resolved_default,
+        fallbacks,
+        route,
+        runnable_now,
+        first_runnable_model,
+        blocked_reasons,
+    }
+}
+
+fn compute_model_availability_report_inner(state: &AppState) -> Result<ModelAvailabilityReport, String> {
+    let models_list = run_openclaw_json(&["models", "list", "--json"])?;
+    let availability = models_available_map(&models_list);
+
+    let translator_status = run_openclaw_json(&["models", "status", "--agent", "translator-core", "--json"])?;
+    let review_status = run_openclaw_json(&["models", "status", "--agent", "review-core", "--json"])?;
+
+    let mut agents: HashMap<String, AgentAvailability> = HashMap::new();
+    let translator = compute_agent_availability("translator-core", &translator_status, &availability);
+    let review = compute_agent_availability("review-core", &review_status, &availability);
+    agents.insert(translator.agent_id.clone(), translator);
+    agents.insert(review.agent_id.clone(), review);
+
+    let env_path = PathBuf::from(&state.config_path).join(".env.v4.local");
+    let env_map = read_env_map(&env_path);
+
+    let has_google_api_key = env_map
+        .get("GOOGLE_API_KEY")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    let has_gemini_api_key = env_map
+        .get("GEMINI_API_KEY")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    let has_moonshot_api_key = env_map
+        .get("MOONSHOT_API_KEY")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+        || has_provider_profile(&translator_status, "moonshot", Some("api_key"));
+
+    let vision_backend = env_map
+        .get("OPENCLAW_VISION_BACKEND")
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+
+    let backend_norm = vision_backend
+        .as_deref()
+        .unwrap_or("auto")
+        .trim()
+        .to_lowercase();
+
+    let vision_model = if backend_norm == "moonshot" || backend_norm == "kimi" {
+        env_map
+            .get("OPENCLAW_MOONSHOT_VISION_MODEL")
+            .or_else(|| env_map.get("OPENCLAW_KIMI_VISION_MODEL"))
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    } else if backend_norm == "gemini" || backend_norm == "google" {
+        env_map
+            .get("OPENCLAW_GEMINI_VISION_MODEL")
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    } else if has_google_api_key || has_gemini_api_key {
+        env_map
+            .get("OPENCLAW_GEMINI_VISION_MODEL")
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    } else {
+        env_map
+            .get("OPENCLAW_MOONSHOT_VISION_MODEL")
+            .or_else(|| env_map.get("OPENCLAW_KIMI_VISION_MODEL"))
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+
+    let glm_enabled = env_map
+        .get("OPENCLAW_GLM_ENABLED")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false);
+    let has_glm_api_key = env_map
+        .get("GLM_API_KEY")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    let has_zai_profile = has_provider_profile(&translator_status, "zai", Some("api_key"));
+
+    let fetched_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+
+    Ok(ModelAvailabilityReport {
+        fetched_at,
+        agents,
+        vision: VisionAvailability {
+            has_google_api_key,
+            has_gemini_api_key,
+            has_moonshot_api_key,
+            vision_backend,
+            vision_model,
+        },
+        glm: GlmAvailability {
+            glm_enabled,
+            has_glm_api_key,
+            has_zai_profile,
+        },
+    })
 }
 
 fn run_start_script(state: &AppState, flag: &str) -> Result<String, String> {
@@ -466,16 +1044,81 @@ fn auto_fix_preflight(state: State<'_, AppState>) -> Result<Vec<PreflightCheck>,
 
     // Try to create .env.v4.local template if missing
     let env_path = format!("{}/.env.v4.local", state.config_path);
-    if !PathBuf::from(&env_path).exists() {
-        let template = r#"# Translation system configuration
-V4_WORK_ROOT=
-V4_KB_ROOT=
-OPENCLAW_STRICT_ROUTER=0
-OPENCLAW_REQUIRE_NEW=0
-OPENCLAW_RAG_BACKEND=local
-"#;
-        let _ = fs::write(&env_path, template);
-    }
+	    if !PathBuf::from(&env_path).exists() {
+	        let template = r#"# Translation system configuration
+	V4_WORK_ROOT=
+	V4_KB_ROOT=
+	OPENCLAW_STRICT_ROUTER=0
+	OPENCLAW_REQUIRE_NEW=0
+	OPENCLAW_RAG_BACKEND=local
+	# Vision QA backend: auto | gemini | moonshot
+	OPENCLAW_VISION_BACKEND=auto
+	# Optional model overrides:
+	# OPENCLAW_GEMINI_VISION_MODEL=gemini-3-pro
+	# OPENCLAW_MOONSHOT_VISION_MODEL=moonshot/kimi-k2.5
+	"#;
+	        let _ = fs::write(&env_path, template);
+	    }
+
+    // Best-effort: ensure Kimi fallback is before any GLM fallbacks.
+    // This enables failover to Kimi when Codex/Gemini are unavailable, without live probing.
+    if let Some(bin) = find_openclaw_bin() {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/ivy".to_string());
+        let health_ok = Command::new(&bin)
+            .args(["health", "--json"])
+            .env("HOME", &home)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}/.local/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin",
+                    std::env::var("PATH").unwrap_or_default(),
+                    home
+                ),
+            )
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        if health_ok {
+            let env_map = read_env_map(&PathBuf::from(&state.config_path).join(".env.v4.local"));
+            let kimi_model = env_map
+                .get("OPENCLAW_KIMI_MODEL")
+                .cloned()
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| "moonshot/kimi-k2.5".to_string());
+
+	            if let Ok(json) = run_openclaw_json(&["models", "fallbacks", "list", "--json"]) {
+                let current: Vec<String> = json
+                    .get("fallbacks")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect::<Vec<String>>()
+                    })
+                    .unwrap_or_default();
+
+	                let desired = compute_fallbacks_with_kimi_before_glm(current.clone(), &kimi_model);
+	                if desired != current {
+	                    let _ = apply_fallbacks(&desired);
+	                }
+	            }
+
+	            // Best-effort: align the image model with Kimi for vision workflows.
+	            let _ = Command::new(&bin)
+	                .args(["models", "set-image", kimi_model.as_str()])
+	                .env("HOME", &home)
+	                .env(
+	                    "PATH",
+	                    format!(
+	                        "{}:{}/.local/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin",
+	                        std::env::var("PATH").unwrap_or_default(),
+	                        home
+	                    ),
+	                )
+	                .status();
+	        }
+	    }
 
     // Re-run preflight checks
     let checks = run_preflight_check_inner(&state);
@@ -569,6 +1212,138 @@ fn run_preflight_check_inner(state: &AppState) -> Vec<PreflightCheck> {
         message: if openclaw_ok { "OpenClaw is running".to_string() } else { "Run: openclaw gateway --force".to_string() },
     });
 
+    // Model availability checks (fast status; no live probes)
+    let env_path = PathBuf::from(&state.config_path).join(".env.v4.local");
+    let env_map = read_env_map(&env_path);
+    let vision_has_google = env_map
+        .get("GOOGLE_API_KEY")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    let vision_has_gemini = env_map
+        .get("GEMINI_API_KEY")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    let vision_has_moonshot_env = env_map
+        .get("MOONSHOT_API_KEY")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    let glm_enabled = env_map
+        .get("OPENCLAW_GLM_ENABLED")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false);
+    let glm_has_key = env_map
+        .get("GLM_API_KEY")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+
+    let report = if openclaw_ok { compute_model_availability_report_inner(state).ok() } else { None };
+    let vision_has_moonshot = vision_has_moonshot_env
+        || report
+            .as_ref()
+            .map(|r| r.vision.has_moonshot_api_key)
+            .unwrap_or(false);
+
+    // translator-core model route (required)
+    let (translator_status, translator_msg) = match report.as_ref().and_then(|r| r.agents.get("translator-core")) {
+        Some(a) if a.runnable_now => (
+            "pass",
+            format!(
+                "Runnable. First usable model: {}. (Inspect: openclaw models status --agent translator-core --json)",
+                a.first_runnable_model.clone().unwrap_or_else(|| "unknown".to_string())
+            ),
+        ),
+        Some(a) => (
+            "blocker",
+            format!(
+                "Blocked. {} (Inspect: openclaw models status --agent translator-core --json; Fix auth: openclaw models auth login --provider openai-codex)",
+                a.blocked_reasons.join(" ")
+            ),
+        ),
+        None if openclaw_ok => (
+            "blocker",
+            "Could not evaluate model availability (openclaw models status/list failed). Try: openclaw models status --agent translator-core --json".to_string(),
+        ),
+        None => (
+            "blocker",
+            "OpenClaw not running; cannot evaluate translator-core models. Try: openclaw gateway --force".to_string(),
+        ),
+    };
+    checks.push(PreflightCheck {
+        name: "Models (translator-core)".to_string(),
+        key: "models_translator_core".to_string(),
+        status: translator_status.to_string(),
+        message: translator_msg,
+    });
+
+    // review-core model route (optional-ish: warnings)
+    let (review_status, review_msg) = match report.as_ref().and_then(|r| r.agents.get("review-core")) {
+        Some(a) if a.runnable_now => (
+            "pass",
+            format!(
+                "Runnable. First usable model: {}. (Inspect: openclaw models status --agent review-core --json)",
+                a.first_runnable_model.clone().unwrap_or_else(|| "unknown".to_string())
+            ),
+        ),
+        Some(a) => (
+            "warning",
+            format!(
+                "Not runnable. {} (Inspect: openclaw models status --agent review-core --json)",
+                a.blocked_reasons.join(" ")
+            ),
+        ),
+        None if openclaw_ok => (
+            "warning",
+            "Could not evaluate review-core model availability. Try: openclaw models status --agent review-core --json".to_string(),
+        ),
+        None => (
+            "warning",
+            "OpenClaw not running; cannot evaluate review-core models.".to_string(),
+        ),
+    };
+    checks.push(PreflightCheck {
+        name: "Models (review-core)".to_string(),
+        key: "models_review_core".to_string(),
+        status: review_status.to_string(),
+        message: review_msg,
+    });
+
+    // Vision QA keys (Format QA)
+    checks.push(PreflightCheck {
+        name: "Vision QA Keys".to_string(),
+        key: "vision_keys".to_string(),
+        status: if vision_has_google || vision_has_gemini || vision_has_moonshot {
+            "pass".to_string()
+        } else {
+            "warning".to_string()
+        },
+        message: if vision_has_google || vision_has_gemini || vision_has_moonshot {
+            "Vision QA credentials configured.".to_string()
+        } else {
+            "Missing vision credentials (Gemini or Moonshot); Format QA will be skipped.".to_string()
+        },
+    });
+
+    // GLM
+    let has_zai_profile = report
+        .as_ref()
+        .map(|r| r.glm.has_zai_profile)
+        .unwrap_or(false);
+    let glm_ok = !glm_enabled || glm_has_key || has_zai_profile;
+    let glm_status = if glm_ok { "pass" } else { "warning" };
+    let glm_message = if !glm_enabled {
+        "GLM disabled (OPENCLAW_GLM_ENABLED!=1).".to_string()
+    } else if glm_has_key || has_zai_profile {
+        "GLM enabled and credentials present (GLM_API_KEY or zai profile).".to_string()
+    } else {
+        "GLM enabled but no GLM_API_KEY and no zai auth profile found.".to_string()
+    };
+    checks.push(PreflightCheck {
+        name: "GLM".to_string(),
+        key: "glm".to_string(),
+        status: glm_status.to_string(),
+        message: glm_message,
+    });
+
     // LibreOffice check (optional)
     let libreoffice_ok = Command::new("/Applications/LibreOffice.app/Contents/MacOS/soffice")
         .args(["--version"])
@@ -629,6 +1404,15 @@ async fn start_openclaw(state: State<'_, AppState>) -> Result<Vec<PreflightCheck
 #[tauri::command]
 fn run_preflight_check(state: State<'_, AppState>) -> Vec<PreflightCheck> {
     run_preflight_check_inner(&state)
+}
+
+// ============================================================================
+// Model Availability Commands
+// ============================================================================
+
+#[tauri::command]
+fn get_model_availability_report(state: State<'_, AppState>) -> Result<ModelAvailabilityReport, String> {
+    compute_model_availability_report_inner(&state)
 }
 
 // ============================================================================
@@ -978,6 +1762,92 @@ async fn kb_sync_now(state: State<'_, AppState>) -> Result<KbSyncReport, String>
     }
 }
 
+#[tauri::command]
+fn list_kb_files(
+    state: State<'_, AppState>,
+    query: Option<String>,
+    source_group: Option<String>,
+    limit: Option<u32>,
+    offset: Option<u32>,
+) -> Result<KbFileList, String> {
+    use rusqlite::types::Value;
+    use rusqlite::Connection;
+
+    let conn = Connection::open(&state.db_path)
+        .map_err(|e| format!("Failed to open database: {}", e))?;
+
+    let mut where_clauses: Vec<&'static str> = Vec::new();
+    let mut params: Vec<Value> = Vec::new();
+
+    if let Some(q) = query {
+        let q = q.trim().to_string();
+        if !q.is_empty() {
+            where_clauses.push("path LIKE ?");
+            params.push(Value::from(format!("%{}%", q)));
+        }
+    }
+
+    if let Some(sg) = source_group {
+        let sg = sg.trim().to_string();
+        if !sg.is_empty() {
+            where_clauses.push("source_group = ?");
+            params.push(Value::from(sg));
+        }
+    }
+
+    let where_sql = if where_clauses.is_empty() {
+        "".to_string()
+    } else {
+        format!("WHERE {}", where_clauses.join(" AND "))
+    };
+
+    let total_sql = format!("SELECT COUNT(*) FROM kb_files {}", where_sql);
+    let total: u64 = conn
+        .query_row(
+            &total_sql,
+            rusqlite::params_from_iter(params.iter()),
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+
+    let limit = limit.unwrap_or(50).clamp(1, 250);
+    let offset = offset.unwrap_or(0);
+
+    let mut list_params = params;
+    list_params.push(Value::from(i64::from(limit)));
+    list_params.push(Value::from(i64::from(offset)));
+
+    let sql = format!(
+        "SELECT path, parser, source_group, chunk_count, indexed_at, size_bytes FROM kb_files {} ORDER BY indexed_at DESC LIMIT ? OFFSET ?",
+        where_sql
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("Failed to query KB files: {}", e))?;
+
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(list_params.iter()), |row| {
+            let chunk_count: i64 = row.get(3)?;
+            let size_bytes: i64 = row.get(5)?;
+            Ok(KbFileRow {
+                path: row.get(0)?,
+                parser: row.get(1)?,
+                source_group: row.get(2)?,
+                chunk_count: std::cmp::max(0, chunk_count) as u64,
+                indexed_at: row.get(4)?,
+                size_bytes: std::cmp::max(0, size_bytes) as u64,
+            })
+        })
+        .map_err(|e| format!("Failed to query KB files: {}", e))?;
+
+    let mut items: Vec<KbFileRow> = Vec::new();
+    for r in rows {
+        items.push(r.map_err(|e| format!("Failed to collect KB files: {}", e))?);
+    }
+
+    Ok(KbFileList { total, items })
+}
+
 // ============================================================================
 // Docker / ClawRAG Commands
 // ============================================================================
@@ -1199,6 +2069,7 @@ fn get_known_providers() -> Vec<(&'static str, &'static str, &'static str)> {
         ("openai-codex", "OpenAI Codex", "oauth"),
         ("google-antigravity", "Google (Antigravity Proxy)", "oauth"),
         ("openrouter", "OpenRouter", "api_key"),
+        ("moonshot", "Moonshot (Kimi)", "api_key"),
         ("zai", "Zai (GLM)", "api_key"),
     ]
 }
@@ -1443,6 +2314,7 @@ pub fn run() {
             get_kb_sync_report,
             get_kb_stats,
             kb_sync_now,
+            list_kb_files,
             get_docker_status,
             start_docker_services,
             stop_docker_services,
@@ -1452,6 +2324,7 @@ pub fn run() {
             get_api_usage,
             set_api_key,
             delete_api_key,
+            get_model_availability_report,
         ])
         .setup(|app| {
             // Create system tray
@@ -1491,4 +2364,178 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::io::Write;
+
+    #[test]
+    fn read_env_map_parses_basic_assignments() {
+        let dir = std::env::temp_dir().join(format!("openclaw_env_test_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join(".env.v4.local");
+
+        let mut f = fs::File::create(&path).expect("create env file");
+        writeln!(f, "# comment").unwrap();
+        writeln!(f, "export GOOGLE_API_KEY=\"abc\"").unwrap();
+        writeln!(f, "GEMINI_API_KEY=").unwrap();
+        writeln!(f, "OPENCLAW_GLM_ENABLED=1").unwrap();
+        writeln!(f, "GLM_API_KEY='  '").unwrap();
+
+        let map = read_env_map(&path);
+        assert_eq!(map.get("GOOGLE_API_KEY").cloned(), Some("abc".to_string()));
+        assert_eq!(map.get("GEMINI_API_KEY").cloned(), Some("".to_string()));
+        assert_eq!(map.get("OPENCLAW_GLM_ENABLED").cloned(), Some("1".to_string()));
+        assert_eq!(map.get("GLM_API_KEY").cloned(), Some("".to_string()));
+    }
+
+    #[test]
+    fn agent_availability_marks_cooldown_when_all_profiles_in_cooldown() {
+        let status = json!({
+            "resolvedDefault": "openai-codex/gpt-5.2",
+            "fallbacks": ["openai-codex/gpt-5.3-codex"],
+            "auth": {
+                "oauth": {
+                    "profiles": [
+                        {"provider": "openai-codex", "type": "oauth", "remainingMs": 1000}
+                    ]
+                },
+                "unusableProfiles": [
+                    {"provider": "openai-codex", "until": 12345}
+                ]
+            }
+        });
+
+        let mut availability: HashMap<String, bool> = HashMap::new();
+        availability.insert("openai-codex/gpt-5.2".to_string(), true);
+        availability.insert("openai-codex/gpt-5.3-codex".to_string(), true);
+
+        let a = compute_agent_availability("translator-core", &status, &availability);
+        assert!(!a.runnable_now);
+        assert_eq!(a.route[0].state, "cooldown");
+        assert!(a.blocked_reasons.iter().any(|r| r.contains("openai-codex") && r.contains("12345")));
+    }
+
+    #[test]
+    fn agent_availability_marks_expired_oauth() {
+        let status = json!({
+            "resolvedDefault": "openai-codex/gpt-5.2",
+            "fallbacks": [],
+            "auth": {
+                "oauth": {
+                    "profiles": [
+                        {"provider": "openai-codex", "type": "oauth", "remainingMs": -1}
+                    ]
+                },
+                "unusableProfiles": []
+            }
+        });
+
+        let mut availability: HashMap<String, bool> = HashMap::new();
+        availability.insert("openai-codex/gpt-5.2".to_string(), true);
+
+        let a = compute_agent_availability("translator-core", &status, &availability);
+        assert!(!a.runnable_now);
+        assert_eq!(a.route[0].state, "expired");
+        assert!(a.blocked_reasons.iter().any(|r| r.contains("OAuth")));
+    }
+
+    #[test]
+    fn agent_availability_marks_ok_for_api_key_provider() {
+        let status = json!({
+            "resolvedDefault": "zai/glm-5",
+            "fallbacks": [],
+            "auth": {
+                "oauth": {
+                    "profiles": [
+                        {"provider": "zai", "type": "api_key"}
+                    ]
+                },
+                "unusableProfiles": []
+            }
+        });
+
+        let mut availability: HashMap<String, bool> = HashMap::new();
+        availability.insert("zai/glm-5".to_string(), true);
+
+        let a = compute_agent_availability("glm-reviewer", &status, &availability);
+        assert!(a.runnable_now);
+        assert_eq!(a.first_runnable_model, Some("zai/glm-5".to_string()));
+        assert_eq!(a.route[0].state, "ok");
+    }
+
+    #[test]
+    fn fallbacks_inserts_kimi_before_first_glm() {
+        let current = vec![
+            "google-antigravity/gemini-3-pro-high".to_string(),
+            "zai/glm-5".to_string(),
+            "zai/glm-4.6v".to_string(),
+        ];
+        let desired = compute_fallbacks_with_kimi_before_glm(current, "moonshot/kimi-k2.5");
+        assert_eq!(
+            desired,
+            vec![
+                "google-antigravity/gemini-3-pro-high".to_string(),
+                "moonshot/kimi-k2.5".to_string(),
+                "zai/glm-5".to_string(),
+                "zai/glm-4.6v".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn fallbacks_appends_kimi_when_no_glm() {
+        let current = vec!["openai-codex/gpt-5.2".to_string(), "google/gemini-2.5-pro".to_string()];
+        let desired = compute_fallbacks_with_kimi_before_glm(current, "moonshot/kimi-k2.5");
+        assert_eq!(
+            desired,
+            vec![
+                "openai-codex/gpt-5.2".to_string(),
+                "google/gemini-2.5-pro".to_string(),
+                "moonshot/kimi-k2.5".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn fallbacks_moves_existing_kimi_before_glm_without_duplication() {
+        let current = vec![
+            "openai-codex/gpt-5.2".to_string(),
+            "zai/glm-5".to_string(),
+            "moonshot/kimi-k2.5".to_string(),
+            "google/gemini-2.5-pro".to_string(),
+        ];
+        let desired = compute_fallbacks_with_kimi_before_glm(current, "moonshot/kimi-k2.5");
+        assert_eq!(
+            desired,
+            vec![
+                "openai-codex/gpt-5.2".to_string(),
+                "moonshot/kimi-k2.5".to_string(),
+                "zai/glm-5".to_string(),
+                "google/gemini-2.5-pro".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn fallbacks_dedupes_preserving_order() {
+        let current = vec![
+            "openai-codex/gpt-5.2".to_string(),
+            "openai-codex/gpt-5.2".to_string(),
+            "zai/glm-5".to_string(),
+            "zai/glm-5".to_string(),
+        ];
+        let desired = compute_fallbacks_with_kimi_before_glm(current, "moonshot/kimi-k2.5");
+        assert_eq!(
+            desired,
+            vec![
+                "openai-codex/gpt-5.2".to_string(),
+                "moonshot/kimi-k2.5".to_string(),
+                "zai/glm-5".to_string(),
+            ]
+        );
+    }
 }

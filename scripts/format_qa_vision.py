@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Multimodal format QA using Gemini Vision for xlsx translation quality.
+"""Multimodal format QA using Gemini Vision or Kimi (Moonshot) for xlsx translation quality.
 
 This module compares rendered screenshots of the original and translated spreadsheets
 to estimate format fidelity. It is designed to be safe for:
@@ -46,6 +46,69 @@ def _extract_first_json_object(raw: str) -> dict[str, Any]:
         if isinstance(cand, dict):
             return cand
     raise ValueError("no JSON object found in response text")
+
+
+def _resolve_openclaw_auth_profiles_path() -> Path:
+    override = os.environ.get("OPENCLAW_AUTH_PROFILES_PATH", "").strip()
+    if override:
+        return Path(override).expanduser()
+    agent_dir = os.environ.get("OPENCLAW_AGENT_DIR", "").strip()
+    if agent_dir:
+        return Path(agent_dir).expanduser() / "auth-profiles.json"
+    return Path("~/.openclaw/agents/main/agent/auth-profiles.json").expanduser()
+
+
+def _read_openclaw_api_key(provider_id: str) -> str:
+    """Read an api_key profile from OpenClaw's auth-profiles.json (best-effort)."""
+    provider = (provider_id or "").strip()
+    if not provider:
+        return ""
+    path = _resolve_openclaw_auth_profiles_path()
+    if not path.exists():
+        return ""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return ""
+    if not isinstance(data, dict):
+        return ""
+
+    profiles = data.get("profiles")
+    if not isinstance(profiles, dict):
+        profiles = {}
+
+    last_good = data.get("lastGood")
+    if not isinstance(last_good, dict):
+        last_good = {}
+
+    def _extract_key(profile_obj: Any) -> str:
+        if not isinstance(profile_obj, dict):
+            return ""
+        if str(profile_obj.get("type") or "") != "api_key":
+            return ""
+        for k in ("key", "api_key", "apiKey", "token"):
+            val = profile_obj.get(k)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+        return ""
+
+    lg = last_good.get(provider)
+    if isinstance(lg, str) and lg.strip():
+        key = _extract_key(profiles.get(lg.strip()))
+        if key:
+            return key
+
+    key = _extract_key(profiles.get(f"{provider}:default"))
+    if key:
+        return key
+
+    for pid, pobj in profiles.items():
+        if isinstance(pid, str) and pid.startswith(f"{provider}:"):
+            key = _extract_key(pobj)
+            if key:
+                return key
+
+    return ""
 
 
 @lru_cache(maxsize=1)
@@ -108,20 +171,8 @@ def render_xlsx_to_image(xlsx_path: Path, output_png: Path) -> Path:
     return output_png
 
 
-def compare_format_visual(original_png_b64: str, translated_png_b64: str) -> dict[str, Any]:
-    """Call Gemini Vision to compare two spreadsheet screenshots."""
-    api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY") or ""
-    if not api_key:
-        raise RuntimeError("GOOGLE_API_KEY (or GEMINI_API_KEY) environment variable is required for format QA vision.")
-    model = os.environ.get("OPENCLAW_GEMINI_VISION_MODEL", "gemini-3-pro").strip()
-    if "/" in model:
-        # Accept OpenClaw-style provider/model ids and use the raw model id for Gemini API.
-        model = model.rsplit("/", 1)[-1]
-    url = (
-        f"https://generativelanguage.googleapis.com/v1beta/models/{model}"
-        f":generateContent?key={api_key}"
-    )
-    prompt_text = (
+def _build_format_qa_prompt() -> str:
+    return (
         "Compare these two spreadsheet screenshots.\n"
         "- The first image is the original.\n"
         "- The second image is the translated output.\n\n"
@@ -140,14 +191,27 @@ def compare_format_visual(original_png_b64: str, translated_png_b64: str) -> dic
         '- "discrepancies": [{"location": str, "issue": str, "severity": str}]\n'
         '- "aesthetic_issues": [{"location": str, "issue": str, "severity": str}]\n'
     )
+
+
+def _compare_format_visual_gemini(original_png_b64: str, translated_png_b64: str) -> dict[str, Any]:
+    api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY") or ""
+    if not api_key:
+        raise RuntimeError("Missing GOOGLE_API_KEY/GEMINI_API_KEY for Gemini vision QA.")
+    model = os.environ.get("OPENCLAW_GEMINI_VISION_MODEL", "gemini-3-pro").strip()
+    if "/" in model:
+        # Accept OpenClaw-style provider/model ids and use the raw model id for Gemini API.
+        model = model.rsplit("/", 1)[-1]
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
     payload = {
-        "contents": [{
-            "parts": [
-                {"text": prompt_text},
-                {"inline_data": {"mime_type": "image/png", "data": original_png_b64}},
-                {"inline_data": {"mime_type": "image/png", "data": translated_png_b64}},
-            ],
-        }],
+        "contents": [
+            {
+                "parts": [
+                    {"text": _build_format_qa_prompt()},
+                    {"inline_data": {"mime_type": "image/png", "data": original_png_b64}},
+                    {"inline_data": {"mime_type": "image/png", "data": translated_png_b64}},
+                ],
+            }
+        ],
     }
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
@@ -167,6 +231,104 @@ def compare_format_visual(original_png_b64: str, translated_png_b64: str) -> dic
     result["format_fidelity_score"] = _clamp(result.get("format_fidelity_score", 0.0))
     result["aesthetics_score"] = _clamp(result.get("aesthetics_score", 0.0))
     return result
+
+
+def _moonshot_chat_completions(*, api_key: str, model: str, prompt: str, images_b64: list[str]) -> str:
+    base_url = os.environ.get("OPENCLAW_MOONSHOT_BASE_URL", "https://api.moonshot.cn/v1").strip().rstrip("/")
+    url = f"{base_url}/chat/completions"
+    parts: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+    for b64 in images_b64:
+        parts.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}})
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": parts}],
+        "temperature": 0.0,
+        "max_tokens": 2048,
+        "stream": False,
+    }
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+    )
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        body = json.loads(resp.read().decode("utf-8"))
+    choice = (body.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    content = message.get("content", "")
+    if isinstance(content, list):
+        content = "".join(
+            part.get("text", "") for part in content if isinstance(part, dict) and isinstance(part.get("text"), str)
+        )
+    if not isinstance(content, str):
+        content = str(content)
+    return content
+
+
+def _compare_format_visual_moonshot(original_png_b64: str, translated_png_b64: str) -> dict[str, Any]:
+    api_key = os.environ.get("MOONSHOT_API_KEY", "").strip() or _read_openclaw_api_key("moonshot")
+    if not api_key:
+        raise RuntimeError("Missing Moonshot API key (MOONSHOT_API_KEY or OpenClaw moonshot profile).")
+    model = (
+        os.environ.get("OPENCLAW_MOONSHOT_VISION_MODEL", "").strip()
+        or os.environ.get("OPENCLAW_KIMI_VISION_MODEL", "").strip()
+        or "moonshot/kimi-k2.5"
+    )
+    if "/" in model:
+        model = model.rsplit("/", 1)[-1]
+    raw = _moonshot_chat_completions(
+        api_key=api_key,
+        model=model,
+        prompt=_build_format_qa_prompt(),
+        images_b64=[original_png_b64, translated_png_b64],
+    )
+    result = _extract_first_json_object(raw)
+
+    def _clamp(val: Any) -> float:
+        try:
+            f = float(val)
+        except (TypeError, ValueError):
+            return 0.0
+        return max(0.0, min(1.0, f))
+
+    result["format_fidelity_score"] = _clamp(result.get("format_fidelity_score", 0.0))
+    result["aesthetics_score"] = _clamp(result.get("aesthetics_score", 0.0))
+    return result
+
+
+def compare_format_visual(original_png_b64: str, translated_png_b64: str) -> dict[str, Any]:
+    """Compare two spreadsheet screenshots with Gemini Vision or Kimi (Moonshot).
+
+    Select provider via OPENCLAW_VISION_BACKEND:
+      - gemini: require GOOGLE_API_KEY/GEMINI_API_KEY
+      - moonshot/kimi: require MOONSHOT_API_KEY or OpenClaw moonshot auth profile
+      - auto (default): try Gemini then fallback to Moonshot if available
+    """
+    backend = os.environ.get("OPENCLAW_VISION_BACKEND", "auto").strip().lower()
+    if backend in ("kimi", "moonshot"):
+        return _compare_format_visual_moonshot(original_png_b64, translated_png_b64)
+    if backend in ("gemini", "google"):
+        return _compare_format_visual_gemini(original_png_b64, translated_png_b64)
+
+    gemini_key_present = bool((os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY") or "").strip())
+    moonshot_key_present = bool((os.environ.get("MOONSHOT_API_KEY") or "").strip() or _read_openclaw_api_key("moonshot"))
+
+    if gemini_key_present:
+        try:
+            return _compare_format_visual_gemini(original_png_b64, translated_png_b64)
+        except Exception:
+            if moonshot_key_present:
+                return _compare_format_visual_moonshot(original_png_b64, translated_png_b64)
+            raise
+
+    if moonshot_key_present:
+        return _compare_format_visual_moonshot(original_png_b64, translated_png_b64)
+
+    raise RuntimeError(
+        "No vision credentials found. Set GOOGLE_API_KEY/GEMINI_API_KEY (Gemini) "
+        "or configure Moonshot (MOONSHOT_API_KEY or OpenClaw moonshot profile)."
+    )
 
 
 def auto_fix_format(xlsx_path: Path, original_xlsx: Path, discrepancies: list[dict]) -> Path:

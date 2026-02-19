@@ -43,6 +43,20 @@ export interface KbStats {
   by_source_group: KbSourceGroupStat[];
 }
 
+export interface KbFileRow {
+  path: string;
+  parser: string;
+  source_group: string;
+  chunk_count: number;
+  indexed_at: string;
+  size_bytes: number;
+}
+
+export interface KbFileList {
+  total: number;
+  items: KbFileRow[];
+}
+
 export interface PreflightCheck {
   name: string;
   key: string;
@@ -191,6 +205,19 @@ export const getKbStats = (): Promise<KbStats> =>
 export const kbSyncNow = (): Promise<KbSyncReport> =>
   invoke<KbSyncReport>("kb_sync_now");
 
+export const listKbFiles = (args?: {
+  query?: string;
+  sourceGroup?: string;
+  limit?: number;
+  offset?: number;
+}): Promise<KbFileList> =>
+  invoke<KbFileList>("list_kb_files", {
+    query: args?.query,
+    sourceGroup: args?.sourceGroup,
+    limit: args?.limit,
+    offset: args?.offset,
+  });
+
 // ============================================================================
 // Docker / ClawRAG Commands
 // ============================================================================
@@ -243,3 +270,57 @@ export const setApiKey = (provider: string, key: string): Promise<void> =>
 
 export const deleteApiKey = (provider: string): Promise<void> =>
   invoke<void>("delete_api_key", { provider });
+
+// ============================================================================
+// Model Availability Types
+// ============================================================================
+
+export type RouteModelState = "ok" | "cooldown" | "unavailable" | "expired" | "unknown";
+
+export interface RouteModelStatus {
+  model: string;
+  provider: string;
+  available?: boolean;
+  state: RouteModelState;
+  cooldown_until_ms?: number;
+  auth_expired?: boolean;
+  note?: string;
+}
+
+export interface AgentAvailability {
+  agent_id: string;
+  default_model: string;
+  fallbacks: string[];
+  route: RouteModelStatus[];
+  runnable_now: boolean;
+  first_runnable_model?: string;
+  blocked_reasons: string[];
+}
+
+export interface VisionAvailability {
+  has_google_api_key: boolean;
+  has_gemini_api_key: boolean;
+  has_moonshot_api_key: boolean;
+  vision_backend?: string;
+  vision_model?: string;
+}
+
+export interface GlmAvailability {
+  glm_enabled: boolean;
+  has_glm_api_key: boolean;
+  has_zai_profile: boolean;
+}
+
+export interface ModelAvailabilityReport {
+  fetched_at: number; // epoch ms
+  agents: Record<string, AgentAvailability>;
+  vision: VisionAvailability;
+  glm: GlmAvailability;
+}
+
+// ============================================================================
+// Model Availability Commands
+// ============================================================================
+
+export const getModelAvailabilityReport = (): Promise<ModelAvailabilityReport> =>
+  invoke<ModelAvailabilityReport>("get_model_availability_report");

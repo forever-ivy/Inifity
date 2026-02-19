@@ -111,6 +111,8 @@ export interface ApiUsage {
   fetchedAt: number;
 }
 
+export type ModelAvailabilityReport = tauri.ModelAvailabilityReport;
+
 interface AppState {
   // Services
   services: Service[];
@@ -203,6 +205,10 @@ interface AppState {
   fetchAllApiUsage: () => Promise<void>;
   setApiKey: (provider: string, key: string) => Promise<void>;
   deleteApiKey: (provider: string) => Promise<void>;
+
+  // Model Availability
+  modelAvailabilityReport: ModelAvailabilityReport | null;
+  fetchModelAvailabilityReport: () => Promise<void>;
 }
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -334,6 +340,12 @@ export const useAppStore = create<AppState>((set, get) => ({
         ]);
       } else if (activeTab === "jobs") {
         await get().fetchJobs();
+      } else if (activeTab === "api-config") {
+        await Promise.all([
+          get().fetchApiProviders(),
+          get().fetchModelAvailabilityReport(),
+        ]);
+        await get().fetchAllApiUsage();
       } else if (activeTab === "kb-health") {
         await Promise.all([
           get().fetchKbSyncReport(),
@@ -859,6 +871,17 @@ export const useAppStore = create<AppState>((set, get) => ({
       get().addToast("success", `API key removed for ${provider}`);
     } catch (err) {
       get().addToast("error", `Failed to remove API key: ${err}`);
+    }
+  },
+
+  // Model Availability
+  modelAvailabilityReport: null,
+  fetchModelAvailabilityReport: async () => {
+    try {
+      const report = await tauri.getModelAvailabilityReport();
+      set({ modelAvailabilityReport: report });
+    } catch (err) {
+      get().addToast("error", `Failed to fetch model availability: ${err}`);
     }
   },
 }));

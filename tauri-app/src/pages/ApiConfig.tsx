@@ -1,7 +1,7 @@
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { useAppStore, ApiProvider, ApiUsage } from "@/stores/appStore";
+import { useAppStore, ApiProvider, ApiUsage, ModelAvailabilityReport } from "@/stores/appStore";
 import { useState, useEffect, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
@@ -42,6 +42,113 @@ function getAuthTypeLabel(authType: ApiProvider["authType"]) {
     default:
       return authType;
   }
+}
+
+function getRouteStateBadge(state: string) {
+  switch (state) {
+    case "ok":
+      return <Badge variant="success">OK</Badge>;
+    case "cooldown":
+      return <Badge variant="warning">Cooldown</Badge>;
+    case "unavailable":
+      return <Badge variant="destructive">Unavailable</Badge>;
+    case "expired":
+      return <Badge variant="warning">Expired</Badge>;
+    case "unknown":
+    default:
+      return <Badge variant="outline">Unknown</Badge>;
+  }
+}
+
+function AgentAvailabilityCard({
+  title,
+  agent,
+}: {
+  title: string;
+  agent: ModelAvailabilityReport["agents"][string] | undefined;
+}) {
+  if (!agent) {
+    return (
+      <Card variant="glass">
+        <CardHeader className="pb-3">
+          <CardTitle className="text-base flex items-center gap-2">
+            <Zap className="h-4 w-4 text-primary" />
+            {title}
+          </CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="text-sm text-muted-foreground">
+            Availability data unavailable.
+          </div>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  return (
+    <Card variant="glass">
+      <CardHeader className="pb-3">
+        <div className="flex items-center justify-between gap-3">
+          <CardTitle className="text-base flex items-center gap-2">
+            <Zap className="h-4 w-4 text-primary" />
+            {title}
+          </CardTitle>
+          <Badge variant={agent.runnable_now ? "success" : "destructive"}>
+            {agent.runnable_now ? "Runnable" : "Blocked"}
+          </Badge>
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <div className="text-xs text-muted-foreground">
+          Default:{" "}
+          <code className="text-xs bg-muted px-1 rounded">
+            {agent.default_model}
+          </code>
+        </div>
+
+        <div className="space-y-2">
+          {agent.route.map((r) => (
+            <div
+              key={r.model}
+              className="flex items-start justify-between gap-3 p-2 rounded-xl border bg-background/40"
+            >
+              <div className="min-w-0">
+                <div className="text-xs font-mono break-all">{r.model}</div>
+                <div className="text-[10px] text-muted-foreground">
+                  Provider: {r.provider}
+                  {typeof r.available === "boolean" && (
+                    <> • Available: {r.available ? "yes" : "no"}</>
+                  )}
+                </div>
+                {r.cooldown_until_ms && (
+                  <div className="text-[10px] text-muted-foreground">
+                    Cooldown until: {new Date(r.cooldown_until_ms).toLocaleString()}
+                  </div>
+                )}
+                {r.note && (
+                  <div className="text-[10px] text-muted-foreground">
+                    Note: {r.note}
+                  </div>
+                )}
+              </div>
+              <div className="shrink-0">{getRouteStateBadge(r.state)}</div>
+            </div>
+          ))}
+        </div>
+
+        {!agent.runnable_now && agent.blocked_reasons.length > 0 && (
+          <div className="rounded-xl border bg-red-500/5 border-red-500/20 p-3">
+            <div className="text-sm font-medium mb-2">Blocked reasons</div>
+            <ul className="text-xs text-muted-foreground list-disc pl-4 space-y-1">
+              {agent.blocked_reasons.map((reason, idx) => (
+                <li key={idx}>{reason}</li>
+              ))}
+            </ul>
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
 }
 
 function UsageBar({ usage }: { usage: ApiUsage | undefined }) {
@@ -235,9 +342,11 @@ export function ApiConfig() {
   const {
     apiProviders,
     apiUsage,
+    modelAvailabilityReport,
     fetchApiProviders,
     fetchApiUsage,
     fetchAllApiUsage,
+    fetchModelAvailabilityReport,
     setApiKey,
     deleteApiKey,
   } = useAppStore();
@@ -245,10 +354,9 @@ export function ApiConfig() {
 
   // Initial fetch
   useEffect(() => {
-    fetchApiProviders().then(() => {
-      fetchAllApiUsage();
-    });
-  }, [fetchApiProviders, fetchAllApiUsage]);
+    fetchApiProviders().then(() => fetchAllApiUsage());
+    fetchModelAvailabilityReport();
+  }, [fetchApiProviders, fetchAllApiUsage, fetchModelAvailabilityReport]);
 
   // Auto-refresh usage every minute when page is visible
   const refreshUsage = useCallback(() => {
@@ -266,6 +374,7 @@ export function ApiConfig() {
     if (isRefreshing) return;
     setIsRefreshing(true);
     await fetchApiProviders();
+    await fetchModelAvailabilityReport();
     await fetchAllApiUsage();
     setIsRefreshing(false);
   };
@@ -297,6 +406,115 @@ export function ApiConfig() {
           </Button>
         </motion.div>
       </div>
+
+      {/* Runtime Availability */}
+      <Card variant="glass">
+        <CardHeader className="pb-3">
+          <div className="flex items-center justify-between gap-3">
+            <CardTitle className="text-base flex items-center gap-2">
+              <Zap className="h-4 w-4 text-primary" />
+              Runtime Availability
+            </CardTitle>
+            {modelAvailabilityReport?.fetched_at ? (
+              <div className="text-[10px] text-muted-foreground">
+                Updated: {new Date(modelAvailabilityReport.fetched_at).toLocaleString()}
+              </div>
+            ) : null}
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="grid gap-4 lg:grid-cols-3">
+            <AgentAvailabilityCard
+              title="translator-core"
+              agent={modelAvailabilityReport?.agents?.["translator-core"]}
+            />
+            <AgentAvailabilityCard
+              title="review-core"
+              agent={modelAvailabilityReport?.agents?.["review-core"]}
+            />
+            <Card variant="glass">
+              <CardHeader className="pb-3">
+                <CardTitle className="text-base flex items-center gap-2">
+                  <Zap className="h-4 w-4 text-primary" />
+                  Vision / GLM
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="text-sm font-medium">Vision QA credentials</div>
+                  <Badge
+                    variant={
+                      modelAvailabilityReport?.vision?.has_google_api_key ||
+                      modelAvailabilityReport?.vision?.has_gemini_api_key ||
+                      modelAvailabilityReport?.vision?.has_moonshot_api_key
+                        ? "success"
+                        : "warning"
+                    }
+                  >
+                    {modelAvailabilityReport?.vision?.has_google_api_key ||
+                    modelAvailabilityReport?.vision?.has_gemini_api_key ||
+                    modelAvailabilityReport?.vision?.has_moonshot_api_key
+                      ? "Configured"
+                      : "Missing"}
+                  </Badge>
+                </div>
+                <div className="text-xs text-muted-foreground">
+                  GOOGLE_API_KEY:{" "}
+                  {modelAvailabilityReport?.vision?.has_google_api_key ? "set" : "missing"} • GEMINI_API_KEY:{" "}
+                  {modelAvailabilityReport?.vision?.has_gemini_api_key ? "set" : "missing"} • Moonshot:{" "}
+                  {modelAvailabilityReport?.vision?.has_moonshot_api_key ? "set" : "missing"}
+                </div>
+                {modelAvailabilityReport?.vision?.vision_backend && (
+                  <div className="text-xs text-muted-foreground">
+                    OPENCLAW_VISION_BACKEND:{" "}
+                    <code className="text-xs bg-muted px-1 rounded">{modelAvailabilityReport.vision.vision_backend}</code>
+                  </div>
+                )}
+                {modelAvailabilityReport?.vision?.vision_model && (
+                  <div className="text-xs text-muted-foreground">
+                    Vision model override:{" "}
+                    <code className="text-xs bg-muted px-1 rounded">
+                      {modelAvailabilityReport.vision.vision_model}
+                    </code>
+                  </div>
+                )}
+
+                <div className="pt-3 border-t space-y-2">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="text-sm font-medium">GLM</div>
+                    <Badge
+                      variant={
+                        modelAvailabilityReport?.glm?.glm_enabled
+                          ? (modelAvailabilityReport.glm.has_glm_api_key || modelAvailabilityReport.glm.has_zai_profile)
+                            ? "success"
+                            : "warning"
+                          : "outline"
+                      }
+                    >
+                      {modelAvailabilityReport?.glm?.glm_enabled ? "Enabled" : "Disabled"}
+                    </Badge>
+                  </div>
+                  {modelAvailabilityReport?.glm?.glm_enabled && (
+                    <div className="text-xs text-muted-foreground">
+                      GLM_API_KEY: {modelAvailabilityReport.glm.has_glm_api_key ? "set" : "missing"} • zai profile:{" "}
+                      {modelAvailabilityReport.glm.has_zai_profile ? "present" : "missing"}
+                    </div>
+                  )}
+                  {!modelAvailabilityReport?.glm?.glm_enabled && (
+                    <div className="text-xs text-muted-foreground">
+                      OPENCLAW_GLM_ENABLED is not set to 1.
+                    </div>
+                  )}
+                </div>
+              </CardContent>
+            </Card>
+          </div>
+          <div className="text-xs text-muted-foreground">
+            This is a fast status view (no live probe). For details run:{" "}
+            <code className="text-xs bg-muted px-1 rounded">openclaw models status --agent translator-core --json</code>
+          </div>
+        </CardContent>
+      </Card>
 
       {/* Providers Grid */}
       <div className="grid gap-4">
