@@ -386,6 +386,9 @@ def main() -> int:
                 child_env = os.environ.copy()
                 # Ensure the pipeline subprocess uses the same queue DB regardless of work_root.
                 child_env["OPENCLAW_STATE_DB_PATH"] = str(paths.db_path)
+                # Let pipeline distinguish "current claimed run" vs a real duplicate run.
+                child_env["OPENCLAW_QUEUE_ID"] = str(queue_id)
+                child_env["OPENCLAW_WORKER_ID"] = str(worker_id)
 
                 effective_work_root = Path(os.getenv("V4_WORK_ROOT") or str(work_root)).expanduser()
                 effective_kb_root = Path(os.getenv("V4_KB_ROOT") or str(kb_root)).expanduser()

@@ -37,7 +37,14 @@ const themeOptions: { value: "light" | "dark" | "system"; icon: typeof Sun; labe
 ];
 
 export function Sidebar() {
-  const { activeTab, setActiveTab, theme, setTheme, sidebarCollapsed, setSidebarCollapsed, services, fetchServices } = useAppStore();
+  const activeTab = useAppStore((s) => s.activeTab);
+  const setActiveTab = useAppStore((s) => s.setActiveTab);
+  const theme = useAppStore((s) => s.theme);
+  const setTheme = useAppStore((s) => s.setTheme);
+  const sidebarCollapsed = useAppStore((s) => s.sidebarCollapsed);
+  const setSidebarCollapsed = useAppStore((s) => s.setSidebarCollapsed);
+  const services = useAppStore((s) => s.services);
+  const fetchServices = useAppStore((s) => s.fetchServices);
 
   // Poll service status every 15s
   useEffect(() => {

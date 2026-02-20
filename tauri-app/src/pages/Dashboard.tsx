@@ -34,11 +34,20 @@ const statusIcons: Record<ServiceStatusType, React.ReactNode> = {
 };
 
 export function Dashboard() {
-  const {
-    services, jobs, isLoading, isRefreshing,
-    refreshCurrentPage, fetchServices, fetchJobs, startServices, stopServices, restartServices,
-    dockerContainers, startDocker, stopDocker, fetchDockerStatus,
-  } = useAppStore();
+  const services = useAppStore((s) => s.services);
+  const jobs = useAppStore((s) => s.jobs);
+  const isLoading = useAppStore((s) => s.isLoading);
+  const isRefreshing = useAppStore((s) => s.isRefreshing);
+  const refreshCurrentPage = useAppStore((s) => s.refreshCurrentPage);
+  const fetchServices = useAppStore((s) => s.fetchServices);
+  const fetchJobs = useAppStore((s) => s.fetchJobs);
+  const startServices = useAppStore((s) => s.startServices);
+  const stopServices = useAppStore((s) => s.stopServices);
+  const restartServices = useAppStore((s) => s.restartServices);
+  const dockerContainers = useAppStore((s) => s.dockerContainers);
+  const startDocker = useAppStore((s) => s.startDocker);
+  const stopDocker = useAppStore((s) => s.stopDocker);
+  const fetchDockerStatus = useAppStore((s) => s.fetchDockerStatus);
 
   useEffect(() => {
     fetchServices();

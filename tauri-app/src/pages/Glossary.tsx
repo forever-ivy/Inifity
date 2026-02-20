@@ -17,7 +17,9 @@ import {
 } from "lucide-react";
 
 export function Glossary() {
-  const { addToast, config, fetchConfig } = useAppStore();
+  const addToast = useAppStore((s) => s.addToast);
+  const config = useAppStore((s) => s.config);
+  const fetchConfig = useAppStore((s) => s.fetchConfig);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [items, setItems] = useState<tauri.GlossaryTerm[]>([]);

@@ -538,6 +538,162 @@ def _validate_glossary_enforcer(context: dict[str, Any], draft: dict[str, Any]) 
     return findings, meta
 
 
+def _strip_redundant_glossary_suffixes(context: dict[str, Any], draft: dict[str, Any]) -> dict[str, Any]:
+    """Remove repeated glossary labels appended at sentence/cell tail.
+
+    Conservative behavior: only remove a trailing glossary English term when
+    the same term already appears earlier in that output text.
+    """
+    meta: dict[str, Any] = {
+        "enabled": False,
+        "cleaned_docx_units": 0,
+        "cleaned_xlsx_cells": 0,
+        "skipped_reason": "",
+    }
+    if not _env_flag("OPENCLAW_GLOSSARY_SUFFIX_STRIP_ENABLED", "1"):
+        meta["skipped_reason"] = "disabled"
+        return meta
+
+    enforcer = context.get("glossary_enforcer") if isinstance(context.get("glossary_enforcer"), dict) else {}
+    terms_raw = enforcer.get("terms")
+    if not bool(enforcer.get("enabled")) or not isinstance(terms_raw, list) or not terms_raw:
+        meta["skipped_reason"] = "no_enforcer_terms"
+        return meta
+
+    preserve = (context.get("format_preserve") or {}) if isinstance(context.get("format_preserve"), dict) else {}
+    if not preserve:
+        meta["skipped_reason"] = "no_format_preserve"
+        return meta
+
+    try:
+        from scripts.kb_glossary_enforcer import normalize_arabic
+    except Exception as exc:  # pragma: no cover
+        meta["skipped_reason"] = f"import_failed:{exc}"
+        return meta
+
+    terms: list[tuple[str, str]] = []
+    for item in terms_raw:
+        if not isinstance(item, dict):
+            continue
+        ar = str(item.get("ar") or item.get("arabic") or "").strip()
+        en = str(item.get("en") or item.get("english") or "").strip()
+        if not ar or not en:
+            continue
+        ar_norm = normalize_arabic(ar)
+        if not ar_norm:
+            continue
+        terms.append((ar_norm, en))
+    if not terms:
+        meta["skipped_reason"] = "no_valid_terms"
+        return meta
+
+    def _clean_tail_for_source(*, out_text: str, src_text: str) -> str:
+        src_norm = normalize_arabic(src_text)
+        if not src_norm:
+            return out_text
+        cleaned = str(out_text or "")
+        for ar_norm, en in terms:
+            if ar_norm not in src_norm:
+                continue
+            needle = en.strip()
+            if not needle:
+                continue
+            lower_text = cleaned.lower()
+            lower_term = needle.lower()
+            pattern = re.compile(
+                rf"(?:\s*[\|\-–—,:;，、。؟!\(\)\[\]]+\s*|\s+){re.escape(needle)}\s*$",
+                re.IGNORECASE,
+            )
+            m = pattern.search(cleaned)
+            if not m:
+                continue
+            prefix = cleaned[: m.start()]
+            # Primary signal: full glossary term already appears earlier.
+            duplicated_full_term = lower_text.count(lower_term) >= 2
+            # Secondary signal: trailing term has acronym "(AI)" and acronym appears earlier.
+            acronym_match = re.search(r"\(([^()]{1,12})\)\s*$", needle)
+            acronym = acronym_match.group(1).strip() if acronym_match else ""
+            duplicated_acronym = False
+            if acronym:
+                duplicated_acronym = bool(re.search(rf"\b{re.escape(acronym)}\b", prefix, re.IGNORECASE))
+            if not duplicated_full_term and not duplicated_acronym:
+                continue
+            cleaned = (prefix + cleaned[m.end() :]).rstrip()
+        return cleaned
+
+    meta["enabled"] = True
+
+    docx_source_map: dict[str, str] = {}
+    docx_t = preserve.get("docx_template") if isinstance(preserve.get("docx_template"), dict) else None
+    if docx_t and isinstance(docx_t.get("units"), list):
+        for unit in docx_t.get("units") or []:
+            if not isinstance(unit, dict):
+                continue
+            uid = str(unit.get("id") or "").strip()
+            src = str(unit.get("text") or "")
+            if uid and src:
+                docx_source_map[uid] = src
+
+    xlsx_source_map: dict[tuple[str, str, str], str] = {}
+    xlsx_sources = preserve.get("xlsx_sources") if isinstance(preserve.get("xlsx_sources"), list) else []
+    default_file = ""
+    if len(xlsx_sources) == 1 and isinstance(xlsx_sources[0], dict):
+        default_file = str(xlsx_sources[0].get("file") or "").strip()
+    for src in xlsx_sources:
+        if not isinstance(src, dict):
+            continue
+        file_name = str(src.get("file") or "").strip()
+        for cell_unit in (src.get("cell_units") or []):
+            if not isinstance(cell_unit, dict):
+                continue
+            sheet = str(cell_unit.get("sheet") or "").strip()
+            cell = str(cell_unit.get("cell") or "").strip().upper()
+            text = str(cell_unit.get("text") or "")
+            if file_name and sheet and cell and text:
+                xlsx_source_map[(file_name, sheet, cell)] = text
+        for row in (src.get("rows") or []):
+            if not isinstance(row, (list, tuple)) or len(row) < 3:
+                continue
+            sheet = str(row[0] or "").strip()
+            cell = str(row[1] or "").strip().upper()
+            text = str(row[2] or "")
+            if file_name and sheet and cell and text:
+                xlsx_source_map[(file_name, sheet, cell)] = text
+
+    d_entries = draft.get("docx_translation_map")
+    if isinstance(d_entries, list):
+        for row in d_entries:
+            if not isinstance(row, dict):
+                continue
+            uid = str(row.get("id") or row.get("unit_id") or row.get("block_id") or row.get("cell_id") or "").strip()
+            if not uid or uid not in docx_source_map:
+                continue
+            before = str(row.get("text") or "")
+            after = _clean_tail_for_source(out_text=before, src_text=docx_source_map[uid])
+            if after != before:
+                row["text"] = after
+                meta["cleaned_docx_units"] = int(meta["cleaned_docx_units"]) + 1
+
+    x_entries = draft.get("xlsx_translation_map")
+    if isinstance(x_entries, list):
+        for row in x_entries:
+            if not isinstance(row, dict):
+                continue
+            file_name = str(row.get("file") or "").strip() or default_file
+            sheet = str(row.get("sheet") or "").strip()
+            cell = str(row.get("cell") or "").strip().upper()
+            key = (file_name, sheet, cell)
+            if not file_name or not sheet or not cell or key not in xlsx_source_map:
+                continue
+            before = str(row.get("text") or "")
+            after = _clean_tail_for_source(out_text=before, src_text=xlsx_source_map[key])
+            if after != before:
+                row["text"] = after
+                meta["cleaned_xlsx_cells"] = int(meta["cleaned_xlsx_cells"]) + 1
+
+    return meta
+
+
 def _merge_docx_translation_map(prev_val: Any, new_val: Any) -> Any:
     """Merge docx translation maps by unit id, preferring new entries on conflict."""
     if not prev_val:
@@ -1400,6 +1556,22 @@ def _extract_openclaw_payload_model(payload: Any) -> dict[str, str]:
                 out.append((score, val, path))
         return out
 
+    # Fast path: read structured agentMeta from OpenClaw response.
+    if isinstance(payload, dict):
+        result = payload.get("result")
+        if isinstance(result, dict):
+            meta = result.get("meta")
+            if isinstance(meta, dict):
+                agent_meta = meta.get("agentMeta")
+                if isinstance(agent_meta, dict):
+                    am_model = str(agent_meta.get("model") or "").strip()
+                    am_provider = str(agent_meta.get("provider") or "").strip()
+                    if am_model:
+                        model_key = f"{am_provider}/{am_model}" if am_provider and "/" not in am_model else am_model
+                        provider = model_key.split("/", 1)[0] if "/" in model_key else am_provider
+                        return {"model": model_key, "provider": provider}
+
+    # Fallback: heuristic walk.
     best: tuple[int, str, tuple[str, ...]] | None = None
     if isinstance(payload, dict):
         result = payload.get("result")
@@ -1832,6 +2004,8 @@ Rules:
 - If execution_context.format_preserve.xlsx_sources is present, you MUST fill xlsx_translation_map for every provided (file, sheet, cell), whether entries are in cell_units objects or rows tuples [sheet, cell, source_text].
 - If execution_context.glossary_enforcer.terms is present, you MUST apply those term mappings strictly (Arabic => English).
   For every unit/cell whose source text contains a glossary Arabic term, the corresponding translated text MUST contain the required English translation.
+  Never append standalone glossary labels at the end (e.g., "... Artificial Intelligence (AI)").
+  Integrate terminology naturally in-place inside the translated sentence/cell.
 - FOR REVISION_UPDATE: You MUST copy texts from PRESERVED_TEXT_MAP exactly for unchanged sections. Do not modify preserved texts.
 - Do NOT output Markdown anywhere (no ``` fenced blocks, no **bold**, no headings like #/##, no "- " markdown bullets, no [text](url)).
   Use plain text only. For lists use "• " or "1) " style, not Markdown.
@@ -2125,6 +2299,10 @@ Rules:
         "reasoning_summary": str(parsed.get("reasoning_summary") or ""),
     }
 
+    call_meta = call.get("meta") if isinstance(call.get("meta"), dict) else {}
+    if isinstance(call, dict) and call.get("agent_id"):
+        call_meta = {"agent_id": str(call.get("agent_id") or ""), **call_meta}
+
     # Treat "empty but successful" reviews as unavailable. This happens when upstream
     # providers return placeholder zeros without any findings or explanation.
     if (
@@ -2143,11 +2321,9 @@ Rules:
             "error": "gemini_review_empty",
             "detail": call,
             "raw_text": call.get("text", ""),
+            "call_meta": call_meta,
         }
 
-    call_meta = call.get("meta") if isinstance(call.get("meta"), dict) else {}
-    if isinstance(call, dict) and call.get("agent_id"):
-        call_meta = {"agent_id": str(call.get("agent_id") or ""), **call_meta}
     return {"ok": True, "data": data, "raw": parsed, "call_meta": call_meta}
 
 
@@ -2367,6 +2543,8 @@ Rules:
 - If execution_context.format_preserve.xlsx_sources is present, you MUST fill xlsx_translation_map for every provided (file, sheet, cell), whether entries are in cell_units objects or rows tuples [sheet, cell, source_text].
 - If execution_context.glossary_enforcer.terms is present, you MUST apply those term mappings strictly (Arabic => English).
   For every unit/cell whose source text contains a glossary Arabic term, the corresponding translated text MUST contain the required English translation.
+  Never append standalone glossary labels at the end (e.g., "... Artificial Intelligence (AI)").
+  Integrate terminology naturally in-place inside the translated sentence/cell.
 - FOR REVISION_UPDATE: You MUST copy texts from PRESERVED_TEXT_MAP exactly for unchanged sections. Do not modify preserved texts.
 - Do NOT output Markdown anywhere (no ``` fenced blocks, no **bold**, no headings like #/##, no "- " markdown bullets, no [text](url)).
   Use plain text only. For lists use "• " or "1) " style, not Markdown.
@@ -3262,6 +3440,7 @@ def run(
                     else:
                         _write_raw_error_artifacts(round_dir, "gemini_review_codex", rev)
                         gemini_review_errors.append(str(rev.get("error", "gemini_review_failed:codex")))
+                        codex_review_meta = rev.get("call_meta") if isinstance(rev.get("call_meta"), dict) else {}
                 if glm_data:
                     rev = _gemini_review(execution_context, glm_data, round_idx)
                     if rev.get("ok"):
@@ -3270,6 +3449,7 @@ def run(
                     else:
                         _write_raw_error_artifacts(round_dir, "gemini_review_glm", rev)
                         gemini_review_errors.append(str(rev.get("error", "gemini_review_failed:glm")))
+                        glm_review_meta = rev.get("call_meta") if isinstance(rev.get("call_meta"), dict) else {}
 
                 if not codex_review and not glm_review:
                     gemini_enabled = False
@@ -3349,6 +3529,7 @@ def run(
                     )
                     did_fix = True
 
+            glossary_suffix_cleanup = _strip_redundant_glossary_suffixes(execution_context, selected_draft)
             if gemini_enabled:
                 if did_fix:
                     gemini_final = _gemini_review(execution_context, selected_draft, round_idx)
@@ -3449,6 +3630,7 @@ def run(
                     errors.append(f"hard_gate_fix_failed:{codex_fix.get('error')}")
                     break
                 selected_draft = _preserve_nonempty_translation_maps(selected_draft, codex_fix["data"])
+                glossary_suffix_cleanup = _strip_redundant_glossary_suffixes(execution_context, selected_draft)
                 if isinstance(codex_fix.get("call_meta"), dict):
                     selected_generator_meta = codex_fix["call_meta"]
                 did_fix = True
@@ -3511,6 +3693,7 @@ def run(
                 "warnings": hard_warnings,
                 "attempts": hard_fix_attempts,
             }
+            selection_meta["glossary_suffix_cleanup"] = glossary_suffix_cleanup
             _write_json(round_dir / "selection.json", selection_meta)
 
             selected_ref = _write_json(round_dir / "selected_output.json", selected_draft)

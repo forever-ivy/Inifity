@@ -48,23 +48,21 @@ const preflightVariants = {
 };
 
 export function Services() {
-  const {
-    services,
-    preflightChecks,
-    isLoading,
-    isRefreshing,
-    refreshCurrentPage,
-    fetchServices,
-    fetchPreflightChecks,
-    autoFixPreflight,
-    startOpenclaw,
-    startServices,
-    stopServices,
-    restartServices,
-    startService,
-    stopService,
-    setActiveTab,
-  } = useAppStore();
+  const services = useAppStore((s) => s.services);
+  const preflightChecks = useAppStore((s) => s.preflightChecks);
+  const isLoading = useAppStore((s) => s.isLoading);
+  const isRefreshing = useAppStore((s) => s.isRefreshing);
+  const refreshCurrentPage = useAppStore((s) => s.refreshCurrentPage);
+  const fetchServices = useAppStore((s) => s.fetchServices);
+  const fetchPreflightChecks = useAppStore((s) => s.fetchPreflightChecks);
+  const autoFixPreflight = useAppStore((s) => s.autoFixPreflight);
+  const startOpenclaw = useAppStore((s) => s.startOpenclaw);
+  const startServices = useAppStore((s) => s.startServices);
+  const stopServices = useAppStore((s) => s.stopServices);
+  const restartServices = useAppStore((s) => s.restartServices);
+  const startService = useAppStore((s) => s.startService);
+  const stopService = useAppStore((s) => s.stopService);
+  const setActiveTab = useAppStore((s) => s.setActiveTab);
 
   const [isPreflightRunning, setIsPreflightRunning] = useState(false);
   const [showAllPreflightDetails, setShowAllPreflightDetails] = useState(false);

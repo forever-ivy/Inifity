@@ -14,7 +14,10 @@ const levelColors: Record<string, string> = {
 };
 
 export function Logs() {
-  const { logs, selectedLogService, fetchLogs, isLoading } = useAppStore();
+  const logs = useAppStore((s) => s.logs);
+  const selectedLogService = useAppStore((s) => s.selectedLogService);
+  const fetchLogs = useAppStore((s) => s.fetchLogs);
+  const isLoading = useAppStore((s) => s.isLoading);
   const [filter, setFilter] = useState("");
   const [levelFilter, setLevelFilter] = useState<string | null>(null);
   const [autoScroll, setAutoScroll] = useState(true);

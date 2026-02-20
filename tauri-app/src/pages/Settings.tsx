@@ -75,7 +75,12 @@ const themeOptions = [
 ];
 
 export function Settings() {
-  const { config, isLoading, fetchConfig, saveConfig, theme, setTheme } = useAppStore();
+  const config = useAppStore((s) => s.config);
+  const isLoading = useAppStore((s) => s.isLoading);
+  const fetchConfig = useAppStore((s) => s.fetchConfig);
+  const saveConfig = useAppStore((s) => s.saveConfig);
+  const theme = useAppStore((s) => s.theme);
+  const setTheme = useAppStore((s) => s.setTheme);
   const [localConfig, setLocalConfig] = useState<Record<string, string | number | boolean>>({});
   const [hasChanges, setHasChanges] = useState(false);
 

@@ -339,17 +339,15 @@ function OAuthStatus({ provider }: { provider: ApiProvider }) {
 }
 
 export function ApiConfig() {
-  const {
-    apiProviders,
-    apiUsage,
-    modelAvailabilityReport,
-    fetchApiProviders,
-    fetchApiUsage,
-    fetchAllApiUsage,
-    fetchModelAvailabilityReport,
-    setApiKey,
-    deleteApiKey,
-  } = useAppStore();
+  const apiProviders = useAppStore((s) => s.apiProviders);
+  const apiUsage = useAppStore((s) => s.apiUsage);
+  const modelAvailabilityReport = useAppStore((s) => s.modelAvailabilityReport);
+  const fetchApiProviders = useAppStore((s) => s.fetchApiProviders);
+  const fetchApiUsage = useAppStore((s) => s.fetchApiUsage);
+  const fetchAllApiUsage = useAppStore((s) => s.fetchAllApiUsage);
+  const fetchModelAvailabilityReport = useAppStore((s) => s.fetchModelAvailabilityReport);
+  const setApiKey = useAppStore((s) => s.setApiKey);
+  const deleteApiKey = useAppStore((s) => s.deleteApiKey);
   const [isRefreshing, setIsRefreshing] = useState(false);
 
   // Initial fetch

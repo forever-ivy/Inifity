@@ -33,6 +33,7 @@ from scripts.v4_runtime import (
     append_log,
     db_connect,
     ensure_runtime_paths,
+    get_active_queue_item,
     get_job,
     json_dumps,
     list_job_files,
@@ -427,9 +428,23 @@ def run_job_pipeline(
         raise ValueError(f"Job not found: {job_id}")
 
     if str(job.get("status", "")) == "running":
-        log.warning("Job %s is already running — skipping duplicate", job_id)
-        conn.close()
-        return {"ok": False, "job_id": job_id, "status": "already_running", "skipped": True}
+        # Duplicate guard:
+        # When invoked from run-worker, job.status may already be "running"
+        # (set during queue claim). In that case, allow the invocation that owns
+        # the same queue_id to continue.
+        current_queue_id = int(str(os.getenv("OPENCLAW_QUEUE_ID", "0") or "0").strip() or 0)
+        active_queue = get_active_queue_item(conn, job_id=job_id) or {}
+        active_queue_id = int(active_queue.get("id") or 0)
+        active_state = str(active_queue.get("state") or "").strip().lower()
+        same_claimed_run = (
+            current_queue_id > 0
+            and active_queue_id == current_queue_id
+            and active_state == "running"
+        )
+        if not same_claimed_run:
+            log.warning("Job %s is already running — skipping duplicate", job_id)
+            conn.close()
+            return {"ok": False, "job_id": job_id, "status": "already_running", "skipped": True}
 
     update_job_status(conn, job_id=job_id, status="running", errors=[])
     set_sender_active_job(conn, sender=str(job.get("sender", "")).strip(), job_id=job_id)

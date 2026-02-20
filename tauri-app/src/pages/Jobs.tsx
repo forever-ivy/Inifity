@@ -41,7 +41,12 @@ const milestoneLabels: Record<string, string> = {
 };
 
 export function Jobs() {
-  const { jobs, selectedJobId, selectedJobMilestones, fetchJobs, fetchJobMilestones, isLoading } = useAppStore();
+  const jobs = useAppStore((s) => s.jobs);
+  const selectedJobId = useAppStore((s) => s.selectedJobId);
+  const selectedJobMilestones = useAppStore((s) => s.selectedJobMilestones);
+  const fetchJobs = useAppStore((s) => s.fetchJobs);
+  const fetchJobMilestones = useAppStore((s) => s.fetchJobMilestones);
+  const isLoading = useAppStore((s) => s.isLoading);
   const [statusFilter, setStatusFilter] = useState<string | null>(null);
   const selectedJob = selectedJobId ? jobs.find((j) => j.jobId === selectedJobId) : null;
 

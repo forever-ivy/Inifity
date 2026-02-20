@@ -17,8 +17,13 @@ import {
 } from "lucide-react";
 
 export function Verify() {
-  const { jobs, selectedJobArtifacts, selectedJobQuality, fetchJobs, fetchJobArtifacts, isLoading, addToast } =
-    useAppStore();
+  const jobs = useAppStore((s) => s.jobs);
+  const selectedJobArtifacts = useAppStore((s) => s.selectedJobArtifacts);
+  const selectedJobQuality = useAppStore((s) => s.selectedJobQuality);
+  const fetchJobs = useAppStore((s) => s.fetchJobs);
+  const fetchJobArtifacts = useAppStore((s) => s.fetchJobArtifacts);
+  const isLoading = useAppStore((s) => s.isLoading);
+  const addToast = useAppStore((s) => s.addToast);
   const [expandedJob, setExpandedJob] = useState<string | null>(null);
   const [artifactsLoadingJobId, setArtifactsLoadingJobId] = useState<string | null>(null);
 

@@ -1,17 +1,18 @@
-import { useEffect } from "react";
+import { useEffect, lazy, Suspense } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Sidebar } from "@/components/layout/Sidebar";
 import { useAppStore } from "@/stores/appStore";
 import { ToastContainer } from "@/components/ui/toast";
-import { Dashboard } from "@/pages/Dashboard";
-import { Services } from "@/pages/Services";
-import { Jobs } from "@/pages/Jobs";
-import { Verify } from "@/pages/Verify";
-import { Logs } from "@/pages/Logs";
-import { Settings } from "@/pages/Settings";
-import { KBHealth } from "@/pages/KBHealth";
-import { ApiConfig } from "@/pages/ApiConfig";
-import { Glossary } from "@/pages/Glossary";
+
+const Dashboard = lazy(() => import("@/pages/Dashboard").then(m => ({ default: m.Dashboard })));
+const Services = lazy(() => import("@/pages/Services").then(m => ({ default: m.Services })));
+const Jobs = lazy(() => import("@/pages/Jobs").then(m => ({ default: m.Jobs })));
+const Verify = lazy(() => import("@/pages/Verify").then(m => ({ default: m.Verify })));
+const Logs = lazy(() => import("@/pages/Logs").then(m => ({ default: m.Logs })));
+const Settings = lazy(() => import("@/pages/Settings").then(m => ({ default: m.Settings })));
+const KBHealth = lazy(() => import("@/pages/KBHealth").then(m => ({ default: m.KBHealth })));
+const ApiConfig = lazy(() => import("@/pages/ApiConfig").then(m => ({ default: m.ApiConfig })));
+const Glossary = lazy(() => import("@/pages/Glossary").then(m => ({ default: m.Glossary })));
 
 const pageVariants = {
   initial: { opacity: 0, y: 8 },
@@ -26,7 +27,10 @@ const pageTransition = {
 };
 
 function App() {
-  const { activeTab, theme, toasts, dismissToast } = useAppStore();
+  const activeTab = useAppStore((s) => s.activeTab);
+  const theme = useAppStore((s) => s.theme);
+  const toasts = useAppStore((s) => s.toasts);
+  const dismissToast = useAppStore((s) => s.dismissToast);
 
   useEffect(() => {
     // Apply theme class to document
@@ -68,18 +72,20 @@ function App() {
     <div className="flex h-screen bg-background overflow-hidden">
       <Sidebar />
       <main className="flex-1 overflow-y-auto overflow-x-hidden overscroll-none bg-gradient-to-br from-background via-background to-accent/5">
-        <AnimatePresence mode="sync">
-          <motion.div
-            key={activeTab}
-            variants={pageVariants}
-            initial="initial"
-            animate="enter"
-            exit="exit"
-            transition={pageTransition}
-          >
-            {renderPage()}
-          </motion.div>
-        </AnimatePresence>
+        <Suspense fallback={<div className="flex items-center justify-center h-full text-muted-foreground">Loading…</div>}>
+          <AnimatePresence mode="wait">
+            <motion.div
+              key={activeTab}
+              variants={pageVariants}
+              initial="initial"
+              animate="enter"
+              exit="exit"
+              transition={pageTransition}
+            >
+              {renderPage()}
+            </motion.div>
+          </AnimatePresence>
+        </Suspense>
       </main>
       <ToastContainer toasts={toasts} onDismiss={dismissToast} />
     </div>

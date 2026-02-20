@@ -14,6 +14,7 @@ from openpyxl import Workbook
 from scripts.openclaw_translation_orchestrator import (
     _agent_call,
     _available_slots,
+    _strip_redundant_glossary_suffixes,
     _compact_knowledge_context,
     _compact_xlsx_prompt_payload,
     _count_xlsx_prompt_rows,
@@ -583,6 +584,79 @@ class IntentFallbackLanguageInferenceTest(unittest.TestCase):
         src, tgt = _infer_language_pair_from_context("translate arabic to englsih", candidates)
         self.assertEqual(src, "ar")
         self.assertEqual(tgt, "en")
+
+
+class GlossarySuffixCleanupTest(unittest.TestCase):
+    def test_strips_redundant_tail_glossary_label_in_xlsx_cell(self):
+        context = {
+            "glossary_enforcer": {
+                "enabled": True,
+                "terms": [{"ar": "الذكاء الاصطناعي", "en": "Artificial Intelligence (AI)"}],
+            },
+            "format_preserve": {
+                "xlsx_sources": [
+                    {
+                        "file": "survey.xlsx",
+                        "cell_units": [
+                            {
+                                "sheet": "Sheet1",
+                                "cell": "A1",
+                                "text": "ما نوع التواصل الذي تلقيته بخصوص الذكاء الاصطناعي؟",
+                            }
+                        ],
+                    }
+                ]
+            },
+        }
+        draft = {
+            "xlsx_translation_map": [
+                {
+                    "file": "survey.xlsx",
+                    "sheet": "Sheet1",
+                    "cell": "A1",
+                    "text": "What communication did you receive regarding AI policies? Artificial Intelligence (AI)",
+                }
+            ]
+        }
+
+        meta = _strip_redundant_glossary_suffixes(context, draft)
+        self.assertTrue(bool(meta.get("enabled")))
+        self.assertEqual(int(meta.get("cleaned_xlsx_cells") or 0), 1)
+        self.assertEqual(
+            draft["xlsx_translation_map"][0]["text"],
+            "What communication did you receive regarding AI policies?",
+        )
+
+    def test_keeps_non_duplicated_term(self):
+        context = {
+            "glossary_enforcer": {
+                "enabled": True,
+                "terms": [{"ar": "الذكاء الاصطناعي", "en": "Artificial Intelligence (AI)"}],
+            },
+            "format_preserve": {
+                "xlsx_sources": [
+                    {
+                        "file": "survey.xlsx",
+                        "cell_units": [{"sheet": "Sheet1", "cell": "A1", "text": "الذكاء الاصطناعي"}],
+                    }
+                ]
+            },
+        }
+        draft = {
+            "xlsx_translation_map": [
+                {
+                    "file": "survey.xlsx",
+                    "sheet": "Sheet1",
+                    "cell": "A1",
+                    "text": "Artificial Intelligence (AI)",
+                }
+            ]
+        }
+
+        meta = _strip_redundant_glossary_suffixes(context, draft)
+        self.assertTrue(bool(meta.get("enabled")))
+        self.assertEqual(int(meta.get("cleaned_xlsx_cells") or 0), 0)
+        self.assertEqual(draft["xlsx_translation_map"][0]["text"], "Artificial Intelligence (AI)")
 
 
 class PromptCompactionHelpersTest(unittest.TestCase):

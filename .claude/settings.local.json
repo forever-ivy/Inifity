@@ -57,7 +57,8 @@
       "Bash(docker info:*)",
       "Bash(# 查看 zai provider 的当前配置 cat ~/.openclaw/agents/main/agent/auth-profiles.json)",
       "Bash(cargo check:*)",
-      "Bash(cat:*)"
+      "Bash(cat:*)",
+      "Bash(npx tsc:*)"
     ]
   }
 }

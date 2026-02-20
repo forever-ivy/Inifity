@@ -18,7 +18,14 @@ import {
 } from "lucide-react";
 
 export function KBHealth() {
-  const { kbSyncReport, kbStats, config, fetchConfig, fetchKbSyncReport, fetchKbStats, syncKbNow, isLoading } = useAppStore();
+  const kbSyncReport = useAppStore((s) => s.kbSyncReport);
+  const kbStats = useAppStore((s) => s.kbStats);
+  const config = useAppStore((s) => s.config);
+  const fetchConfig = useAppStore((s) => s.fetchConfig);
+  const fetchKbSyncReport = useAppStore((s) => s.fetchKbSyncReport);
+  const fetchKbStats = useAppStore((s) => s.fetchKbStats);
+  const syncKbNow = useAppStore((s) => s.syncKbNow);
+  const isLoading = useAppStore((s) => s.isLoading);
   const [isSyncing, setIsSyncing] = useState(false);
 
   const [kbFiles, setKbFiles] = useState<tauri.KbFileRow[]>([]);
