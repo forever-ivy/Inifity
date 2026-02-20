@@ -40,6 +40,7 @@ ensure_agent() {
   fi
 
   force_agent_model_in_config "$agent_id" "$model_id"
+  force_agent_workspace_in_config "$agent_id" "$WORKSPACE_DIR"
 }
 
 force_agent_model_in_config() {
@@ -62,6 +63,29 @@ force_agent_model_in_config() {
   else
     rm -f "$tmp"
     echo "WARN: failed to update $OPENCLAW_CONFIG_PATH for agent $agent_id"
+  fi
+}
+
+force_agent_workspace_in_config() {
+  local agent_id="$1"
+  local workspace="$2"
+  [[ -z "$agent_id" || -z "$workspace" ]] && return 0
+  [[ ! -f "$OPENCLAW_CONFIG_PATH" ]] && return 0
+
+  local tmp
+  tmp="$(mktemp)"
+  if jq --arg id "$agent_id" --arg ws "$workspace" '
+    if (.agents.list // [] | any(.id == $id)) then
+      .agents.list = ((.agents.list // []) | map(if .id == $id then .workspace = $ws else . end))
+    else
+      .
+    end
+  ' "$OPENCLAW_CONFIG_PATH" > "$tmp"; then
+    mv "$tmp" "$OPENCLAW_CONFIG_PATH"
+    echo "Agent workspace forced in config: $agent_id -> $workspace"
+  else
+    rm -f "$tmp"
+    echo "WARN: failed to update $OPENCLAW_CONFIG_PATH workspace for agent $agent_id"
   fi
 }
 
