@@ -159,6 +159,30 @@ pub struct GlossaryTermList {
     pub language_pairs: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GlossaryLookupItem {
+    pub company: String,
+    pub source_lang: String,
+    pub target_lang: String,
+    pub language_pair: String,
+    pub source_text: String,
+    pub target_text: String,
+    pub origin: String,
+    pub source_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+    pub matched_in: String,
+    pub match_score: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GlossaryLookupResult {
+    pub query: String,
+    pub total: u64,
+    pub items: Vec<GlossaryLookupItem>,
+    pub companies: Vec<String>,
+}
+
 // ============================================================================
 // API Provider Types
 // ============================================================================
@@ -2195,6 +2219,40 @@ fn delete_glossary_term(
     Ok(true)
 }
 
+#[tauri::command]
+fn lookup_glossary_text(
+    state: State<'_, AppState>,
+    text: String,
+    company: Option<String>,
+    limit: Option<u32>,
+) -> Result<GlossaryLookupResult, String> {
+    let config = get_config_inner(&state)?;
+    let mut args: Vec<String> = vec![
+        "lookup".to_string(),
+        "--kb-root".to_string(),
+        config.kb_root,
+        "--text".to_string(),
+        text,
+        "--limit".to_string(),
+        limit.unwrap_or(20).to_string(),
+    ];
+    if let Some(c) = company {
+        let c = c.trim();
+        if !c.is_empty() {
+            args.push("--company".to_string());
+            args.push(c.to_string());
+        }
+    }
+
+    let parsed = run_glossary_manager_json(&state, &args)?;
+    let result = parsed
+        .get("result")
+        .cloned()
+        .ok_or("glossary manager returned no result")?;
+    serde_json::from_value::<GlossaryLookupResult>(result)
+        .map_err(|e| format!("Failed to decode glossary lookup: {}", e))
+}
+
 // ============================================================================
 // Docker / ClawRAG Commands
 // ============================================================================
@@ -2665,6 +2723,7 @@ pub fn run() {
             list_glossary_terms,
             upsert_glossary_term,
             delete_glossary_term,
+            lookup_glossary_text,
             get_docker_status,
             start_docker_services,
             stop_docker_services,

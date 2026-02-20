@@ -192,7 +192,12 @@ TASK_TOOL_INSTRUCTIONS: dict[str, str] = {
     ),
 }
 GEMINI_AGENT = os.getenv("OPENCLAW_GEMINI_AGENT", "review-core")
-OPENCLAW_CMD_TIMEOUT = int(os.getenv("OPENCLAW_AGENT_CALL_TIMEOUT_SECONDS", "700"))
+GEMINI_FALLBACK_AGENTS = [
+    a.strip()
+    for a in os.getenv("OPENCLAW_GEMINI_FALLBACK_AGENTS", "translator-core,qa-gate").split(",")
+    if a.strip()
+]
+OPENCLAW_CMD_TIMEOUT = int(os.getenv("OPENCLAW_AGENT_CALL_TIMEOUT_SECONDS", "300"))
 DOC_CONTEXT_CHARS = int(os.getenv("OPENCLAW_DOC_CONTEXT_CHARS", "45000"))
 VALID_THINKING_LEVELS = {"off", "minimal", "low", "medium", "high"}
 OPENCLAW_TRANSLATION_THINKING = os.getenv("OPENCLAW_TRANSLATION_THINKING", "high").strip().lower()
@@ -2273,6 +2278,13 @@ Rules:
 - JSON only.
 """.strip()
     call = _agent_call(GEMINI_AGENT, prompt)
+    if not call.get("ok") and GEMINI_FALLBACK_AGENTS:
+        for fb_agent in GEMINI_FALLBACK_AGENTS:
+            if fb_agent == GEMINI_AGENT:
+                continue
+            call = _agent_call(fb_agent, prompt)
+            if call.get("ok"):
+                break
     if not call.get("ok"):
         return {"ok": False, "error": call.get("error"), "detail": call}
     try:
@@ -3353,6 +3365,7 @@ def run(
         current_draft: dict[str, Any] | None = None
         errors: list[str] = []
         gemini_enabled = bool(meta.get("gemini_available", True))
+        gemini_initially_enabled = gemini_enabled
         glm_enabled = _glm_enabled()
         system_round_root = Path(review_dir) / ".system" / "rounds"
         system_round_root.mkdir(parents=True, exist_ok=True)
@@ -3387,6 +3400,10 @@ def run(
         for round_idx in range(1, thresholds.max_rounds + 1):
             round_dir = system_round_root / f"round_{round_idx}"
             round_dir.mkdir(parents=True, exist_ok=True)
+            # Re-enable gemini each round so a transient failure doesn't permanently
+            # disable review when fallback agents are available.
+            if gemini_initially_enabled and not gemini_enabled and GEMINI_FALLBACK_AGENTS:
+                gemini_enabled = True
             # Hard-gate retries are per round; otherwise a noisy first round can
             # consume the entire budget and prevent convergence in later rounds.
             vision_fix_used = 0
@@ -4094,7 +4111,7 @@ def run(
             "estimated_minutes": estimated_minutes,
             "runtime_timeout_minutes": runtime_timeout_minutes,
             "actual_duration_minutes": round((time.time() - started) / 60.0, 3),
-            "status_flags": status_flags,
+            "status_flags": [f for f in status_flags if f != "degraded_single_model"] if gemini_enabled else status_flags,
             "thinking_level": OPENCLAW_TRANSLATION_THINKING,
             "router_mode": router_mode,
             "token_guard_applied": token_guard_applied,

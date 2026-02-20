@@ -210,6 +210,85 @@ def list_terms(
     }
 
 
+def lookup_text(
+    *,
+    kb_root: Path,
+    text: str,
+    company: str | None = None,
+    limit: int = 20,
+) -> dict[str, Any]:
+    query = _normalize_space(text)
+    if not query:
+        raise ValueError("text is required")
+
+    base = list_terms(
+        kb_root=kb_root,
+        company=(company or "").strip() or None,
+        language_pair=None,
+        query=None,
+        limit=200000,
+        offset=0,
+    )
+    all_items = list(base.get("items") or [])
+    q_lower = query.lower()
+
+    def _score(item: dict[str, Any]) -> tuple[int, int]:
+        src = str(item.get("source_text") or "")
+        tgt = str(item.get("target_text") or "")
+        src_l = src.lower()
+        tgt_l = tgt.lower()
+
+        # Higher score first: exact > contains > token overlap.
+        if src_l == q_lower:
+            return (300, 2)
+        if tgt_l == q_lower:
+            return (300, 1)
+        if q_lower in src_l:
+            return (220, 2)
+        if q_lower in tgt_l:
+            return (220, 1)
+
+        tokens = [x for x in q_lower.split(" ") if x]
+        if not tokens:
+            return (0, 0)
+        src_hits = sum(1 for t in tokens if t in src_l)
+        tgt_hits = sum(1 for t in tokens if t in tgt_l)
+        if src_hits == 0 and tgt_hits == 0:
+            return (0, 0)
+        if src_hits >= tgt_hits:
+            return (100 + src_hits, 2)
+        return (100 + tgt_hits, 1)
+
+    ranked: list[tuple[tuple[int, int], dict[str, Any]]] = []
+    for item in all_items:
+        score, side = _score(item)
+        if score <= 0:
+            continue
+        rec = dict(item)
+        rec["match_score"] = score
+        rec["matched_in"] = "source" if side == 2 else "target"
+        ranked.append(((score, side), rec))
+
+    ranked.sort(
+        key=lambda x: (
+            -int(x[0][0]),
+            -int(x[0][1]),
+            str((x[1] or {}).get("company") or "").lower(),
+            str((x[1] or {}).get("language_pair") or "").lower(),
+            str((x[1] or {}).get("source_text") or "").lower(),
+        )
+    )
+    safe_limit = max(1, int(limit))
+    items = [x[1] for x in ranked[:safe_limit]]
+
+    return {
+        "query": query,
+        "total": len(ranked),
+        "items": items,
+        "companies": base.get("companies") or [],
+    }
+
+
 def upsert_term(
     *,
     kb_root: Path,
@@ -353,6 +432,12 @@ def main() -> int:
     p_delete.add_argument("--target-lang", default="en")
     p_delete.add_argument("--source-text", required=True)
 
+    p_lookup = sub.add_parser("lookup")
+    p_lookup.add_argument("--kb-root", required=True)
+    p_lookup.add_argument("--text", required=True)
+    p_lookup.add_argument("--company", default="")
+    p_lookup.add_argument("--limit", type=int, default=20)
+
     args = parser.parse_args()
     kb_root = Path(str(args.kb_root)).expanduser().resolve()
 
@@ -390,6 +475,16 @@ def main() -> int:
                 source_text=args.source_text,
             )
             print(json.dumps(result, ensure_ascii=False))
+            return 0
+
+        if args.cmd == "lookup":
+            result = lookup_text(
+                kb_root=kb_root,
+                text=args.text,
+                company=(args.company or "").strip() or None,
+                limit=int(args.limit),
+            )
+            print(json.dumps({"ok": True, "result": result}, ensure_ascii=False))
             return 0
 
         print(json.dumps({"ok": False, "error": f"unsupported cmd: {args.cmd}"}, ensure_ascii=False))

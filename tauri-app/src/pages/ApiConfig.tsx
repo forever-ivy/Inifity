@@ -17,6 +17,46 @@ import {
 } from "lucide-react";
 
 const USAGE_REFRESH_INTERVAL = 60000; // 1 minute
+const AVAILABILITY_REFRESH_INTERVAL = 30000; // 30 seconds
+
+function useRelativeTime(epochMs: number | undefined) {
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    if (!epochMs) return;
+    const id = setInterval(() => setTick((t) => t + 1), 1000);
+    return () => clearInterval(id);
+  }, [epochMs]);
+  if (!epochMs) return "";
+  const diff = Math.max(0, Math.floor((Date.now() - epochMs) / 1000));
+  if (diff < 60) return `${diff}s ago`;
+  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+  return `${Math.floor(diff / 3600)}h ago`;
+}
+
+function LivePulse() {
+  return (
+    <span className="relative flex h-2 w-2">
+      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75" />
+      <span className="relative inline-flex rounded-full h-2 w-2 bg-green-500" />
+    </span>
+  );
+}
+
+const stateColor: Record<string, string> = {
+  ok: "bg-green-500",
+  cooldown: "bg-yellow-500",
+  unavailable: "bg-red-500",
+  expired: "bg-yellow-500",
+  unknown: "bg-gray-400",
+};
+
+const stateRing: Record<string, string> = {
+  ok: "ring-green-500/40",
+  cooldown: "ring-yellow-500/40",
+  unavailable: "ring-red-500/40",
+  expired: "ring-yellow-500/40",
+  unknown: "ring-gray-400/40",
+};
 
 function getStatusBadge(status: ApiProvider["status"]) {
   switch (status) {
@@ -44,22 +84,6 @@ function getAuthTypeLabel(authType: ApiProvider["authType"]) {
   }
 }
 
-function getRouteStateBadge(state: string) {
-  switch (state) {
-    case "ok":
-      return <Badge variant="success">OK</Badge>;
-    case "cooldown":
-      return <Badge variant="warning">Cooldown</Badge>;
-    case "unavailable":
-      return <Badge variant="destructive">Unavailable</Badge>;
-    case "expired":
-      return <Badge variant="warning">Expired</Badge>;
-    case "unknown":
-    default:
-      return <Badge variant="outline">Unknown</Badge>;
-  }
-}
-
 function AgentAvailabilityCard({
   title,
   agent,
@@ -70,75 +94,78 @@ function AgentAvailabilityCard({
   if (!agent) {
     return (
       <Card variant="glass">
-        <CardHeader className="pb-3">
-          <CardTitle className="text-base flex items-center gap-2">
-            <Zap className="h-4 w-4 text-primary" />
-            {title}
-          </CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="text-sm text-muted-foreground">
-            Availability data unavailable.
+        <CardContent className="flex flex-col items-center justify-center py-8">
+          <div className="h-14 w-14 rounded-full border-2 border-dashed border-muted-foreground/30 flex items-center justify-center mb-3">
+            <Zap className="h-5 w-5 text-muted-foreground/40" />
           </div>
+          <div className="text-sm font-medium text-muted-foreground">{title}</div>
+          <div className="text-xs text-muted-foreground/60 mt-1">No data</div>
         </CardContent>
       </Card>
     );
   }
 
+  const isRunnable = agent.runnable_now;
+
   return (
     <Card variant="glass">
-      <CardHeader className="pb-3">
-        <div className="flex items-center justify-between gap-3">
-          <CardTitle className="text-base flex items-center gap-2">
-            <Zap className="h-4 w-4 text-primary" />
-            {title}
-          </CardTitle>
-          <Badge variant={agent.runnable_now ? "success" : "destructive"}>
-            {agent.runnable_now ? "Runnable" : "Blocked"}
-          </Badge>
-        </div>
-      </CardHeader>
-      <CardContent className="space-y-3">
-        <div className="text-xs text-muted-foreground">
-          Default:{" "}
-          <code className="text-xs bg-muted px-1 rounded">
-            {agent.default_model}
-          </code>
-        </div>
-
-        <div className="space-y-2">
-          {agent.route.map((r) => (
-            <div
-              key={r.model}
-              className="flex items-start justify-between gap-3 p-2 rounded-xl border bg-background/40"
-            >
-              <div className="min-w-0">
-                <div className="text-xs font-mono break-all">{r.model}</div>
-                <div className="text-[10px] text-muted-foreground">
-                  Provider: {r.provider}
-                  {typeof r.available === "boolean" && (
-                    <> • Available: {r.available ? "yes" : "no"}</>
-                  )}
-                </div>
-                {r.cooldown_until_ms && (
-                  <div className="text-[10px] text-muted-foreground">
-                    Cooldown until: {new Date(r.cooldown_until_ms).toLocaleString()}
-                  </div>
-                )}
-                {r.note && (
-                  <div className="text-[10px] text-muted-foreground">
-                    Note: {r.note}
-                  </div>
-                )}
-              </div>
-              <div className="shrink-0">{getRouteStateBadge(r.state)}</div>
+      <CardContent className="pt-5 pb-4 px-4 space-y-4">
+        {/* Status ring + agent name */}
+        <div className="flex items-center gap-3">
+          <div
+            className={`h-10 w-10 rounded-full border-[3px] flex items-center justify-center shrink-0 ${
+              isRunnable
+                ? "border-green-500 bg-green-500/10"
+                : "border-red-500 bg-red-500/10"
+            }`}
+          >
+            <Zap
+              className={`h-4 w-4 ${isRunnable ? "text-green-500" : "text-red-500"}`}
+            />
+          </div>
+          <div className="min-w-0">
+            <div className="text-sm font-semibold truncate">{title}</div>
+            <div className="text-[10px] text-muted-foreground">
+              {isRunnable ? "Runnable" : "Blocked"}
             </div>
-          ))}
+          </div>
         </div>
 
-        {!agent.runnable_now && agent.blocked_reasons.length > 0 && (
+        {/* Model route pipeline */}
+        <div className="flex items-center gap-0 overflow-x-auto py-1">
+          {agent.route.map((r, i) => {
+            const isFirst = r.model === agent.first_runnable_model;
+            const dotColor = stateColor[r.state] || stateColor.unknown;
+            const ringColor = stateRing[r.state] || stateRing.unknown;
+            const shortName = r.model.split("/").pop() || r.model;
+            return (
+              <div key={r.model} className="flex items-center">
+                {i > 0 && (
+                  <div className="w-4 h-px bg-muted-foreground/25 shrink-0" />
+                )}
+                <div className="flex flex-col items-center gap-1 min-w-0" title={`${r.model} (${r.provider}) — ${r.state}${r.note ? `: ${r.note}` : ""}`}>
+                  <div
+                    className={`h-4 w-4 rounded-full ${dotColor} shrink-0 ${
+                      isFirst ? `ring-[3px] ${ringColor}` : ""
+                    }`}
+                  />
+                  <span className="text-[9px] text-muted-foreground truncate max-w-[72px] leading-tight text-center">
+                    {shortName}
+                  </span>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        {/* Default model label */}
+        <div className="text-[10px] text-muted-foreground/70">
+          default: <code className="text-[10px] bg-muted px-1 rounded">{agent.default_model.split("/").pop()}</code>
+        </div>
+
+        {/* Blocked reasons */}
+        {!isRunnable && agent.blocked_reasons.length > 0 && (
           <div className="rounded-xl border bg-red-500/5 border-red-500/20 p-3">
-            <div className="text-sm font-medium mb-2">Blocked reasons</div>
             <ul className="text-xs text-muted-foreground list-disc pl-4 space-y-1">
               {agent.blocked_reasons.map((reason, idx) => (
                 <li key={idx}>{reason}</li>
@@ -349,6 +376,7 @@ export function ApiConfig() {
   const setApiKey = useAppStore((s) => s.setApiKey);
   const deleteApiKey = useAppStore((s) => s.deleteApiKey);
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const relativeTime = useRelativeTime(modelAvailabilityReport?.fetched_at);
 
   // Initial fetch
   useEffect(() => {
@@ -367,6 +395,18 @@ export function ApiConfig() {
     const interval = setInterval(refreshUsage, USAGE_REFRESH_INTERVAL);
     return () => clearInterval(interval);
   }, [refreshUsage]);
+
+  // Auto-refresh availability every 30s when page is visible
+  const refreshAvailability = useCallback(() => {
+    if (document.visibilityState === "visible") {
+      fetchModelAvailabilityReport();
+    }
+  }, [fetchModelAvailabilityReport]);
+
+  useEffect(() => {
+    const interval = setInterval(refreshAvailability, AVAILABILITY_REFRESH_INTERVAL);
+    return () => clearInterval(interval);
+  }, [refreshAvailability]);
 
   const handleRefresh = async () => {
     if (isRefreshing) return;
@@ -414,8 +454,9 @@ export function ApiConfig() {
               Runtime Availability
             </CardTitle>
             {modelAvailabilityReport?.fetched_at ? (
-              <div className="text-[10px] text-muted-foreground">
-                Updated: {new Date(modelAvailabilityReport.fetched_at).toLocaleString()}
+              <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
+                <LivePulse />
+                {relativeTime}
               </div>
             ) : null}
           </div>
@@ -430,81 +471,62 @@ export function ApiConfig() {
               title="review-core"
               agent={modelAvailabilityReport?.agents?.["review-core"]}
             />
+            {/* Vision / GLM credential grid */}
             <Card variant="glass">
-              <CardHeader className="pb-3">
-                <CardTitle className="text-base flex items-center gap-2">
-                  <Zap className="h-4 w-4 text-primary" />
-                  Vision / GLM
-                </CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-3">
-                <div className="flex items-center justify-between gap-3">
-                  <div className="text-sm font-medium">Vision QA credentials</div>
-                  <Badge
-                    variant={
-                      modelAvailabilityReport?.vision?.has_google_api_key ||
-                      modelAvailabilityReport?.vision?.has_gemini_api_key ||
-                      modelAvailabilityReport?.vision?.has_moonshot_api_key ||
-                      modelAvailabilityReport?.vision?.has_openai_api_key
-                        ? "success"
-                        : "warning"
-                    }
-                  >
-                    {modelAvailabilityReport?.vision?.has_google_api_key ||
-                    modelAvailabilityReport?.vision?.has_gemini_api_key ||
-                    modelAvailabilityReport?.vision?.has_moonshot_api_key ||
-                    modelAvailabilityReport?.vision?.has_openai_api_key
-                      ? "Configured"
-                      : "Missing"}
-                  </Badge>
-                </div>
-                <div className="text-xs text-muted-foreground">
-                  GOOGLE_API_KEY:{" "}
-                  {modelAvailabilityReport?.vision?.has_google_api_key ? "set" : "missing"} • GEMINI_API_KEY:{" "}
-                  {modelAvailabilityReport?.vision?.has_gemini_api_key ? "set" : "missing"} • Moonshot:{" "}
-                  {modelAvailabilityReport?.vision?.has_moonshot_api_key ? "set" : "missing"} • OPENAI_API_KEY:{" "}
-                  {modelAvailabilityReport?.vision?.has_openai_api_key ? "set" : "missing"}
-                </div>
-                {modelAvailabilityReport?.vision?.vision_backend && (
-                  <div className="text-xs text-muted-foreground">
-                    OPENCLAW_VISION_BACKEND:{" "}
-                    <code className="text-xs bg-muted px-1 rounded">{modelAvailabilityReport.vision.vision_backend}</code>
-                  </div>
-                )}
-                {modelAvailabilityReport?.vision?.vision_model && (
-                  <div className="text-xs text-muted-foreground">
-                    Vision model override:{" "}
-                    <code className="text-xs bg-muted px-1 rounded">
-                      {modelAvailabilityReport.vision.vision_model}
-                    </code>
-                  </div>
-                )}
-
-                <div className="pt-3 border-t space-y-2">
-                  <div className="flex items-center justify-between gap-3">
-                    <div className="text-sm font-medium">GLM</div>
-                    <Badge
-                      variant={
-                        modelAvailabilityReport?.glm?.glm_enabled
-                          ? (modelAvailabilityReport.glm.has_glm_api_key || modelAvailabilityReport.glm.has_zai_profile)
-                            ? "success"
-                            : "warning"
-                          : "outline"
-                      }
+              <CardContent className="pt-5 pb-4 px-4 space-y-4">
+                <div className="text-sm font-semibold">Vision / GLM</div>
+                {/* 2x2 credential grid */}
+                <div className="grid grid-cols-2 gap-2">
+                  {([
+                    ["Google", modelAvailabilityReport?.vision?.has_google_api_key],
+                    ["Gemini", modelAvailabilityReport?.vision?.has_gemini_api_key],
+                    ["Moonshot", modelAvailabilityReport?.vision?.has_moonshot_api_key],
+                    ["OpenAI", modelAvailabilityReport?.vision?.has_openai_api_key],
+                  ] as [string, boolean | undefined][]).map(([name, hasKey]) => (
+                    <div
+                      key={name}
+                      className="flex items-center gap-2 rounded-lg border bg-background/40 px-2.5 py-2"
                     >
-                      {modelAvailabilityReport?.glm?.glm_enabled ? "Enabled" : "Disabled"}
-                    </Badge>
+                      <Key className="h-3 w-3 text-muted-foreground shrink-0" />
+                      <span className="text-xs truncate">{name}</span>
+                      <span
+                        className={`ml-auto h-2 w-2 rounded-full shrink-0 ${
+                          hasKey ? "bg-green-500" : "bg-red-500"
+                        }`}
+                      />
+                    </div>
+                  ))}
+                </div>
+                {/* Vision backend info */}
+                {modelAvailabilityReport?.vision?.vision_backend && (
+                  <div className="text-[10px] text-muted-foreground/70">
+                    backend: <code className="text-[10px] bg-muted px-1 rounded">{modelAvailabilityReport.vision.vision_backend}</code>
+                    {modelAvailabilityReport.vision.vision_model && (
+                      <> · model: <code className="text-[10px] bg-muted px-1 rounded">{modelAvailabilityReport.vision.vision_model}</code></>
+                    )}
+                  </div>
+                )}
+                {/* GLM row */}
+                <div className="flex items-center gap-2 rounded-lg border bg-background/40 px-2.5 py-2">
+                  <span className="text-xs font-medium">GLM</span>
+                  <div
+                    className={`ml-1 px-1.5 py-0.5 rounded text-[10px] font-medium ${
+                      modelAvailabilityReport?.glm?.glm_enabled
+                        ? "bg-green-500/15 text-green-600 dark:text-green-400"
+                        : "bg-muted text-muted-foreground"
+                    }`}
+                  >
+                    {modelAvailabilityReport?.glm?.glm_enabled ? "ON" : "OFF"}
                   </div>
                   {modelAvailabilityReport?.glm?.glm_enabled && (
-                    <div className="text-xs text-muted-foreground">
-                      GLM_API_KEY: {modelAvailabilityReport.glm.has_glm_api_key ? "set" : "missing"} • zai profile:{" "}
-                      {modelAvailabilityReport.glm.has_zai_profile ? "present" : "missing"}
-                    </div>
-                  )}
-                  {!modelAvailabilityReport?.glm?.glm_enabled && (
-                    <div className="text-xs text-muted-foreground">
-                      OPENCLAW_GLM_ENABLED is not set to 1.
-                    </div>
+                    <span
+                      className={`ml-auto h-2 w-2 rounded-full shrink-0 ${
+                        modelAvailabilityReport.glm.has_glm_api_key || modelAvailabilityReport.glm.has_zai_profile
+                          ? "bg-green-500"
+                          : "bg-red-500"
+                      }`}
+                      title={`API key: ${modelAvailabilityReport.glm.has_glm_api_key ? "set" : "missing"} · zai: ${modelAvailabilityReport.glm.has_zai_profile ? "present" : "missing"}`}
+                    />
                   )}
                 </div>
               </CardContent>

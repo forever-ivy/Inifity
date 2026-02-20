@@ -93,6 +93,18 @@ export interface GlossaryTermList {
   language_pairs: string[];
 }
 
+export interface GlossaryLookupItem extends GlossaryTerm {
+  matched_in: "source" | "target" | string;
+  match_score: number;
+}
+
+export interface GlossaryLookupResult {
+  query: string;
+  total: number;
+  items: GlossaryLookupItem[];
+  companies: string[];
+}
+
 export interface PreflightCheck {
   name: string;
   key: string;
@@ -295,6 +307,17 @@ export const deleteGlossaryTerm = (args: {
     sourceLang: args.sourceLang,
     targetLang: args.targetLang,
     sourceText: args.sourceText,
+  });
+
+export const lookupGlossaryText = (args: {
+  text: string;
+  company?: string;
+  limit?: number;
+}): Promise<GlossaryLookupResult> =>
+  tInvoke<GlossaryLookupResult>("lookup_glossary_text", {
+    text: args.text,
+    company: args.company,
+    limit: args.limit,
   });
 
 // ============================================================================

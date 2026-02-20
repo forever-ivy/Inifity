@@ -16,6 +16,7 @@ The orchestrator loads glossary pairs, then:
 
 from __future__ import annotations
 
+import json
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -270,6 +271,33 @@ def load_company_glossary_pairs(
             meta["errors"].append({"path": str(p), "error": str(exc)})
 
     meta["pairs_extracted"] = len(pairs)
+
+    # Merge custom overrides from UI (.openclaw_glossary_overrides.json)
+    overrides_path = glossary_dir / ".openclaw_glossary_overrides.json"
+    if overrides_path.exists():
+        try:
+            data = json.loads(overrides_path.read_text(encoding="utf-8"))
+            override_terms = data.get("terms") if isinstance(data, dict) else None
+            if isinstance(override_terms, list):
+                added = 0
+                for t in override_terms:
+                    if not isinstance(t, dict):
+                        continue
+                    if t.get("deleted"):
+                        continue
+                    src = _normalize_space(t.get("source_text", ""))
+                    tgt = _normalize_space(t.get("target_text", ""))
+                    if src and tgt:
+                        pairs.append(GlossaryPair(
+                            arabic=src,
+                            english=tgt,
+                            source_path=str(overrides_path),
+                        ))
+                        added += 1
+                meta["custom_overrides_loaded"] = added
+        except Exception as exc:
+            meta["errors"].append({"path": str(overrides_path), "error": str(exc)})
+
     return pairs, meta
 
 
