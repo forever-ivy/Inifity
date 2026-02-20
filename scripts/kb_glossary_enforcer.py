@@ -34,6 +34,8 @@ except Exception:  # pragma: no cover
     Document = None
 
 _ARABIC_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]")
+# Letter-only class for boundary checks (avoid treating punctuation like "؟" as letters).
+_ARABIC_LETTER_CLASS = r"\u0621-\u063A\u0641-\u064A\u066E-\u066F\u0671-\u06D3\u06FA-\u06FF"
 _LATIN_RE = re.compile(r"[A-Za-z]")
 _ARABIC_DIACRITICS_RE = re.compile(r"[\u064B-\u065F\u0670\u06D6-\u06ED]")
 _WS_RE = re.compile(r"\s+")
@@ -75,6 +77,21 @@ def looks_arabic(text: str) -> bool:
 def looks_english(text: str) -> bool:
     ar, latin = _script_counts(text)
     return latin > 0 and latin >= ar
+
+
+def contains_arabic_term(text_norm: str, term_norm: str) -> bool:
+    """Whole-term Arabic match on normalized text.
+
+    Prevents false positives such as matching "قوي" inside "تقويم".
+    """
+    t = (text_norm or "").strip()
+    term = (term_norm or "").strip()
+    if not t or not term:
+        return False
+    pattern = re.compile(
+        rf"(?<![{_ARABIC_LETTER_CLASS}]){re.escape(term)}(?![{_ARABIC_LETTER_CLASS}])"
+    )
+    return bool(pattern.search(t))
 
 
 _HEADER_EN = {
@@ -372,7 +389,7 @@ def select_terms_for_sources(
     for ar_norm, pair in glossary_map.items():
         hits = 0
         for t in texts_norm:
-            if ar_norm and ar_norm in t:
+            if ar_norm and contains_arabic_term(t, ar_norm):
                 hits += 1
         if hits <= 0:
             continue
@@ -387,4 +404,3 @@ def select_terms_for_sources(
     selected = [glossary_map[n] for n in selected_norms if n in glossary_map]
     meta["matched_terms"] = len(selected)
     return selected, meta
-

@@ -9,6 +9,7 @@ from openpyxl import Workbook
 
 from scripts.kb_glossary_enforcer import (
     build_glossary_map,
+    contains_arabic_term,
     load_company_glossary_pairs,
     select_terms_for_sources,
 )
@@ -95,7 +96,27 @@ class KbGlossaryEnforcerTest(unittest.TestCase):
             self.assertEqual(selected[0].arabic, "مدرسة")
             self.assertEqual(selected[0].english, "School")
 
+    def test_contains_arabic_term_avoids_substring_false_positive(self):
+        self.assertTrue(contains_arabic_term("هذا مؤشر قوي", "قوي"))
+        self.assertFalse(contains_arabic_term("هذا تقويم شامل", "قوي"))
+
+    def test_select_terms_avoids_substring_false_positive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            kb_root = Path(tmp) / "Knowledge Repository"
+            company_dir = kb_root / "00_Glossary" / "Eventranz"
+
+            _make_xlsx(company_dir / "g.xlsx", rows=[["قوي", "Strong"]])
+            pairs, _meta = load_company_glossary_pairs(kb_root=kb_root, company="Eventranz")
+            glossary_map, _conflicts = build_glossary_map(pairs)
+
+            selected, sel_meta = select_terms_for_sources(
+                glossary_map=glossary_map,
+                source_texts=["لا يوجد تقويم مستقل"],
+                max_terms=80,
+            )
+            self.assertEqual(sel_meta.get("matched_terms"), 0)
+            self.assertEqual(selected, [])
+
 
 if __name__ == "__main__":
     unittest.main()
-

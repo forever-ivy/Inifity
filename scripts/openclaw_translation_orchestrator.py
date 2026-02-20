@@ -404,7 +404,7 @@ def _validate_glossary_enforcer(context: dict[str, Any], draft: dict[str, Any]) 
         return findings, meta
 
     try:
-        from scripts.kb_glossary_enforcer import normalize_arabic, normalize_english
+        from scripts.kb_glossary_enforcer import contains_arabic_term, normalize_arabic, normalize_english
     except Exception as exc:  # pragma: no cover - optional in some minimal runtimes
         meta["enabled"] = True
         meta["skipped_reason"] = f"import_failed:{exc}"
@@ -486,6 +486,29 @@ def _validate_glossary_enforcer(context: dict[str, Any], draft: dict[str, Any]) 
 
     max_violations = max(1, int(os.getenv("OPENCLAW_GLOSSARY_ENFORCER_MAX_VIOLATIONS", "60")))
 
+    prefer_longest = _env_flag("OPENCLAW_GLOSSARY_ENFORCER_PREFER_LONGEST", "1")
+
+    def _active_terms_for_source(src_norm: str) -> list[tuple[str, str, str, str]]:
+        matched = [t for t in terms if t[0] and contains_arabic_term(src_norm, t[0])]
+        if not prefer_longest or len(matched) <= 1:
+            return matched
+        out: list[tuple[str, str, str, str]] = []
+        for term in matched:
+            ar_norm = term[0]
+            shadowed = False
+            for other in matched:
+                if other is term:
+                    continue
+                other_ar = other[0]
+                if len(other_ar) <= len(ar_norm):
+                    continue
+                if ar_norm in other_ar and other_ar in src_norm:
+                    shadowed = True
+                    break
+            if not shadowed:
+                out.append(term)
+        return out or matched
+
     def _check_unit(*, where: str, unit_key: str, src_text: str, out_text: str) -> None:
         nonlocal findings
         if len(findings) >= max_violations:
@@ -494,9 +517,7 @@ def _validate_glossary_enforcer(context: dict[str, Any], draft: dict[str, Any]) 
         out_norm = normalize_english(out_text)
         if not src_norm:
             return
-        for ar_norm, en_norm, ar_disp, en_disp in terms:
-            if not ar_norm or ar_norm not in src_norm:
-                continue
+        for ar_norm, en_norm, ar_disp, en_disp in _active_terms_for_source(src_norm):
             if en_norm and en_norm in out_norm:
                 continue
             findings.append(f"glossary_enforcer_missing:{where}:{unit_key}:{ar_disp}=>{en_disp}")
@@ -571,7 +592,7 @@ def _strip_redundant_glossary_suffixes(context: dict[str, Any], draft: dict[str,
         return meta
 
     try:
-        from scripts.kb_glossary_enforcer import normalize_arabic
+        from scripts.kb_glossary_enforcer import contains_arabic_term, normalize_arabic
     except Exception as exc:  # pragma: no cover
         meta["skipped_reason"] = f"import_failed:{exc}"
         return meta
@@ -598,7 +619,7 @@ def _strip_redundant_glossary_suffixes(context: dict[str, Any], draft: dict[str,
             return out_text
         cleaned = str(out_text or "")
         for ar_norm, en in terms:
-            if ar_norm not in src_norm:
+            if not contains_arabic_term(src_norm, ar_norm):
                 continue
             needle = en.strip()
             if not needle:

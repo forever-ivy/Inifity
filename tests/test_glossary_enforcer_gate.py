@@ -60,7 +60,53 @@ class GlossaryEnforcerGateTest(unittest.TestCase):
         self.assertTrue(meta.get("enabled"))
         self.assertEqual(findings, [])
 
+    def test_glossary_enforcer_prefers_longer_overlapping_term(self):
+        context = {
+            "format_preserve": {
+                "docx_template": {
+                    "units": [
+                        {"id": "p:1", "text": "توظيف الذكاء الاصطناعي في المدارس"},
+                    ]
+                }
+            },
+            "glossary_enforcer": {
+                "enabled": True,
+                "terms": [
+                    {"ar": "الذكاء الاصطناعي", "en": "Artificial Intelligence (AI)"},
+                    {"ar": "توظيف الذكاء الاصطناعي", "en": "AI adoption"},
+                ],
+            },
+        }
+        draft = {
+            "docx_translation_map": [{"id": "p:1", "text": "AI adoption in schools"}],
+        }
+        findings, meta = _validate_glossary_enforcer(context, draft)
+        self.assertTrue(meta.get("enabled"))
+        self.assertEqual(findings, [])
+
+    def test_glossary_enforcer_avoids_substring_false_positive(self):
+        context = {
+            "format_preserve": {
+                "docx_template": {
+                    "units": [
+                        {"id": "p:1", "text": "لا يوجد تقويم مستقل"},
+                    ]
+                }
+            },
+            "glossary_enforcer": {
+                "enabled": True,
+                "terms": [
+                    {"ar": "قوي", "en": "Strong"},
+                ],
+            },
+        }
+        draft = {
+            "docx_translation_map": [{"id": "p:1", "text": "No independent evaluation exists"}],
+        }
+        findings, meta = _validate_glossary_enforcer(context, draft)
+        self.assertTrue(meta.get("enabled"))
+        self.assertEqual(findings, [])
+
 
 if __name__ == "__main__":
     unittest.main()
-
