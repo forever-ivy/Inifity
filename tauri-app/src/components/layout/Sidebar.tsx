@@ -9,6 +9,7 @@ import {
   ScrollText,
   Settings,
   Database,
+  BookText,
   Key,
   ChevronLeft,
   Sun,
@@ -24,6 +25,7 @@ const navItems = [
   { id: "verify", label: "Verify", icon: FileCheck },
   { id: "logs", label: "Logs", icon: ScrollText },
   { id: "kb-health", label: "KB Health", icon: Database },
+  { id: "glossary", label: "Glossary", icon: BookText },
   { id: "api-config", label: "API Config", icon: Key },
   { id: "settings", label: "Settings", icon: Settings },
 ];

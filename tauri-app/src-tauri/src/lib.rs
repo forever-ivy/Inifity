@@ -137,6 +137,28 @@ pub struct KbFileList {
     pub items: Vec<KbFileRow>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GlossaryTerm {
+    pub company: String,
+    pub source_lang: String,
+    pub target_lang: String,
+    pub language_pair: String,
+    pub source_text: String,
+    pub target_text: String,
+    pub origin: String, // "extracted" | "custom"
+    pub source_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GlossaryTermList {
+    pub total: u64,
+    pub items: Vec<GlossaryTerm>,
+    pub companies: Vec<String>,
+    pub language_pairs: Vec<String>,
+}
+
 // ============================================================================
 // API Provider Types
 // ============================================================================
@@ -234,15 +256,42 @@ pub struct AppState {
     pub db_path: String,
 }
 
+fn detect_project_root() -> String {
+    if let Ok(explicit_root) = std::env::var("OPENCLAW_PROJECT_ROOT") {
+        let explicit = PathBuf::from(explicit_root.trim());
+        if explicit.join("scripts/start.sh").exists() {
+            return explicit.to_string_lossy().to_string();
+        }
+    }
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.clone());
+        candidates.push(cwd.join(".."));
+        candidates.push(cwd.join("../.."));
+    }
+    candidates.push(PathBuf::from("/Users/Code/workflow/Inifity"));
+
+    for candidate in candidates {
+        let normalized = fs::canonicalize(&candidate).unwrap_or(candidate);
+        if normalized.join("scripts/start.sh").exists() {
+            return normalized.to_string_lossy().to_string();
+        }
+    }
+
+    "/Users/Code/workflow/Inifity".to_string()
+}
+
 impl Default for AppState {
     fn default() -> Self {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/ivy".to_string());
         let runtime_dir = format!("{}/.openclaw/runtime/translation", home);
+        let project_root = detect_project_root();
 
         Self {
             services: Mutex::new(HashMap::new()),
-            config_path: "/Users/Code/workflow/translation".to_string(),
-            scripts_path: "/Users/Code/workflow/translation/scripts".to_string(),
+            config_path: project_root.clone(),
+            scripts_path: format!("{}/scripts", project_root),
             pids_dir: format!("{}/pids", runtime_dir),
             logs_dir: format!("{}/logs", runtime_dir),
             db_path: format!("{}/state.sqlite", runtime_dir),
@@ -1998,6 +2047,154 @@ fn list_kb_files(
     Ok(KbFileList { total, items })
 }
 
+fn run_glossary_manager_json(state: &AppState, args: &[String]) -> Result<serde_json::Value, String> {
+    let config = get_config_inner(state)?;
+    let python_bin = find_python_bin(state);
+
+    let mut cmd_args = vec![
+        "-m".to_string(),
+        "scripts.glossary_manager".to_string(),
+    ];
+    cmd_args.extend_from_slice(args);
+
+    let output = Command::new(&python_bin)
+        .args(&cmd_args)
+        .current_dir(&state.config_path)
+        .output()
+        .map_err(|e| format!("Failed to run glossary manager: {}", e))?;
+
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let detail = if !stderr.trim().is_empty() { stderr } else { stdout };
+        return Err(format!("glossary manager failed: {}", detail));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let parsed: serde_json::Value = serde_json::from_str(&stdout)
+        .map_err(|e| format!("Failed to parse glossary manager output: {}", e))?;
+    if !parsed.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+        let err = parsed
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown glossary manager error");
+        return Err(format!("glossary manager error: {}", err));
+    }
+    let _ = config; // keep parity with other command helpers that load config.
+    Ok(parsed)
+}
+
+#[tauri::command]
+fn list_glossary_terms(
+    state: State<'_, AppState>,
+    company: Option<String>,
+    language_pair: Option<String>,
+    query: Option<String>,
+    limit: Option<u32>,
+    offset: Option<u32>,
+) -> Result<GlossaryTermList, String> {
+    let config = get_config_inner(&state)?;
+    let mut args: Vec<String> = vec![
+        "list".to_string(),
+        "--kb-root".to_string(),
+        config.kb_root,
+        "--limit".to_string(),
+        limit.unwrap_or(500).to_string(),
+        "--offset".to_string(),
+        offset.unwrap_or(0).to_string(),
+    ];
+
+    if let Some(c) = company {
+        let c = c.trim();
+        if !c.is_empty() {
+            args.push("--company".to_string());
+            args.push(c.to_string());
+        }
+    }
+    if let Some(lp) = language_pair {
+        let lp = lp.trim();
+        if !lp.is_empty() {
+            args.push("--language-pair".to_string());
+            args.push(lp.to_string());
+        }
+    }
+    if let Some(q) = query {
+        let q = q.trim();
+        if !q.is_empty() {
+            args.push("--query".to_string());
+            args.push(q.to_string());
+        }
+    }
+
+    let parsed = run_glossary_manager_json(&state, &args)?;
+    let result = parsed
+        .get("result")
+        .cloned()
+        .ok_or("glossary manager returned no result")?;
+    serde_json::from_value::<GlossaryTermList>(result)
+        .map_err(|e| format!("Failed to decode glossary terms: {}", e))
+}
+
+#[tauri::command]
+fn upsert_glossary_term(
+    state: State<'_, AppState>,
+    company: String,
+    source_lang: String,
+    target_lang: String,
+    source_text: String,
+    target_text: String,
+) -> Result<GlossaryTerm, String> {
+    let config = get_config_inner(&state)?;
+    let args: Vec<String> = vec![
+        "upsert".to_string(),
+        "--kb-root".to_string(),
+        config.kb_root,
+        "--company".to_string(),
+        company,
+        "--source-lang".to_string(),
+        source_lang,
+        "--target-lang".to_string(),
+        target_lang,
+        "--source-text".to_string(),
+        source_text,
+        "--target-text".to_string(),
+        target_text,
+    ];
+    let parsed = run_glossary_manager_json(&state, &args)?;
+    let item = parsed
+        .get("item")
+        .cloned()
+        .ok_or("glossary manager returned no item")?;
+    serde_json::from_value::<GlossaryTerm>(item)
+        .map_err(|e| format!("Failed to decode glossary term: {}", e))
+}
+
+#[tauri::command]
+fn delete_glossary_term(
+    state: State<'_, AppState>,
+    company: String,
+    source_lang: String,
+    target_lang: String,
+    source_text: String,
+) -> Result<bool, String> {
+    let config = get_config_inner(&state)?;
+    let args: Vec<String> = vec![
+        "delete".to_string(),
+        "--kb-root".to_string(),
+        config.kb_root,
+        "--company".to_string(),
+        company,
+        "--source-lang".to_string(),
+        source_lang,
+        "--target-lang".to_string(),
+        target_lang,
+        "--source-text".to_string(),
+        source_text,
+    ];
+    let _ = run_glossary_manager_json(&state, &args)?;
+    Ok(true)
+}
+
 // ============================================================================
 // Docker / ClawRAG Commands
 // ============================================================================
@@ -2465,6 +2662,9 @@ pub fn run() {
             get_kb_stats,
             kb_sync_now,
             list_kb_files,
+            list_glossary_terms,
+            upsert_glossary_term,
+            delete_glossary_term,
             get_docker_status,
             start_docker_services,
             stop_docker_services,

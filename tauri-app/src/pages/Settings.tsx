@@ -392,7 +392,7 @@ export function Settings() {
                 variant="outline"
                 size="sm"
                 onClick={async () => {
-                  await tauri.openInFinder("/Users/Code/workflow/translation/.env.v4.local");
+                  await tauri.openInFinder("/Users/Code/workflow/Inifity/.env.v4.local");
                 }}
               >
                 <FolderOpen className="h-4 w-4 mr-2" />

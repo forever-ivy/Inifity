@@ -57,6 +57,25 @@ export interface KbFileList {
   items: KbFileRow[];
 }
 
+export interface GlossaryTerm {
+  company: string;
+  source_lang: string;
+  target_lang: string;
+  language_pair: string;
+  source_text: string;
+  target_text: string;
+  origin: "extracted" | "custom" | string;
+  source_path: string;
+  updated_at?: string;
+}
+
+export interface GlossaryTermList {
+  total: number;
+  items: GlossaryTerm[];
+  companies: string[];
+  language_pairs: string[];
+}
+
 export interface PreflightCheck {
   name: string;
   key: string;
@@ -216,6 +235,49 @@ export const listKbFiles = (args?: {
     sourceGroup: args?.sourceGroup,
     limit: args?.limit,
     offset: args?.offset,
+  });
+
+export const listGlossaryTerms = (args?: {
+  company?: string;
+  languagePair?: string;
+  query?: string;
+  limit?: number;
+  offset?: number;
+}): Promise<GlossaryTermList> =>
+  invoke<GlossaryTermList>("list_glossary_terms", {
+    company: args?.company,
+    languagePair: args?.languagePair,
+    query: args?.query,
+    limit: args?.limit,
+    offset: args?.offset,
+  });
+
+export const upsertGlossaryTerm = (args: {
+  company: string;
+  sourceLang: string;
+  targetLang: string;
+  sourceText: string;
+  targetText: string;
+}): Promise<GlossaryTerm> =>
+  invoke<GlossaryTerm>("upsert_glossary_term", {
+    company: args.company,
+    sourceLang: args.sourceLang,
+    targetLang: args.targetLang,
+    sourceText: args.sourceText,
+    targetText: args.targetText,
+  });
+
+export const deleteGlossaryTerm = (args: {
+  company: string;
+  sourceLang: string;
+  targetLang: string;
+  sourceText: string;
+}): Promise<boolean> =>
+  invoke<boolean>("delete_glossary_term", {
+    company: args.company,
+    sourceLang: args.sourceLang,
+    targetLang: args.targetLang,
+    sourceText: args.sourceText,
   });
 
 // ============================================================================

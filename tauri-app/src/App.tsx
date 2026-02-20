@@ -11,6 +11,7 @@ import { Logs } from "@/pages/Logs";
 import { Settings } from "@/pages/Settings";
 import { KBHealth } from "@/pages/KBHealth";
 import { ApiConfig } from "@/pages/ApiConfig";
+import { Glossary } from "@/pages/Glossary";
 
 const pageVariants = {
   initial: { opacity: 0, y: 8 },
@@ -57,6 +58,7 @@ function App() {
       case "logs": return <Logs />;
       case "settings": return <Settings />;
       case "kb-health": return <KBHealth />;
+      case "glossary": return <Glossary />;
       case "api-config": return <ApiConfig />;
       default: return <Dashboard />;
     }
