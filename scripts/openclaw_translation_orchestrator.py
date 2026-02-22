@@ -1416,8 +1416,6 @@ def _group_xlsx_rows_as_sources(rows: list[dict[str, Any]]) -> list[dict[str, An
         if file_name not in grouped:
             grouped[file_name] = {
                 "file": file_name,
-                "path": str(row.get("path") or "").strip(),
-                "meta": row.get("meta") if isinstance(row.get("meta"), dict) else {},
                 "rows": [],
             }
             order.append(file_name)
@@ -2332,8 +2330,24 @@ Rules:
 - JSON only.
 """.strip()
 
-    def _execute_prompt(prompt: str) -> dict[str, Any]:
-        call = _agent_call(CODEX_AGENT, prompt)
+    def _execute_prompt(prompt: str, *, prefer_direct: bool = False) -> dict[str, Any]:
+        call: dict[str, Any] = {"ok": False, "error": "not_called"}
+        if prefer_direct:
+            if _env_flag("OPENCLAW_GLM_DIRECT_FALLBACK_ENABLED", "1"):
+                glm_call = _glm_direct_api_call(prompt)
+                if glm_call.get("ok"):
+                    call = glm_call
+                else:
+                    call = {"ok": False, "error": str(glm_call.get("error") or "glm_direct_failed")}
+            if not call.get("ok") and _env_flag("OPENCLAW_KIMI_CODING_DIRECT_FALLBACK_ENABLED", "1"):
+                kimi_call = _kimi_coding_direct_api_call(prompt)
+                if kimi_call.get("ok"):
+                    call = kimi_call
+                else:
+                    call = {"ok": False, "error": str(kimi_call.get("error") or "kimi_coding_direct_failed")}
+
+        if not call.get("ok"):
+            call = _agent_call(CODEX_AGENT, prompt)
         raw_text = str(call.get("text") or call.get("stdout") or call.get("stderr") or "")
         if call.get("ok") and _looks_like_provider_schema_error(raw_text):
             call = {
@@ -2493,6 +2507,30 @@ Rules:
         if task_type == "SPREADSHEET_TRANSLATION":
             safe_spreadsheet_max = max(120000, int(os.getenv("OPENCLAW_XLSX_PROMPT_SAFE_MAX_BYTES", "700000")))
             prompt_max_bytes = min(prompt_max_bytes, safe_spreadsheet_max)
+            # Keep spreadsheet prompts lean; large context fields do not improve cell-by-cell quality.
+            context_payload["knowledge_context"] = []
+            context_payload["cross_job_memories"] = []
+            context_payload["subject"] = _truncate_text(context_payload.get("subject") or "", max_chars=200)
+            context_payload["message_text"] = _truncate_text(context_payload.get("message_text") or "", max_chars=1200)
+            candidate_rows = context_payload.get("candidate_files")
+            if isinstance(candidate_rows, list):
+                slim_rows: list[dict[str, Any]] = []
+                for row in candidate_rows[:8]:
+                    if not isinstance(row, dict):
+                        continue
+                    slim_rows.append(
+                        {
+                            "name": row.get("name"),
+                            "path": row.get("path"),
+                            "language": row.get("language"),
+                            "version": row.get("version"),
+                            "role": row.get("role"),
+                        }
+                    )
+                context_payload["candidate_files"] = slim_rows
+            preserve = context_payload.get("format_preserve")
+            if isinstance(preserve, dict) and "docx_template" in preserve:
+                preserve.pop("docx_template", None)
 
         prompt = _render_prompt(
             context_payload=context_payload,
@@ -2620,7 +2658,11 @@ Rules:
                 "raw_text": "",
             }
 
-        return _execute_prompt(prompt)
+        prefer_direct = False
+        if task_type == "SPREADSHEET_TRANSLATION":
+            direct_min = max(10000, int(os.getenv("OPENCLAW_XLSX_DIRECT_FIRST_MIN_PROMPT_BYTES", "50000")))
+            prefer_direct = prompt_bytes >= direct_min and _env_flag("OPENCLAW_XLSX_PREFER_DIRECT_API_ON_LARGE_PROMPT", "1")
+        return _execute_prompt(prompt, prefer_direct=prefer_direct)
 
     context_for_prompt = copy.deepcopy(context)
     previous_for_prompt = copy.deepcopy(previous_draft or {})
