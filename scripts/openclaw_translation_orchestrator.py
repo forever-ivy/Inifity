@@ -2691,6 +2691,10 @@ Rules:
         max_cells=batch_max_cells,
         max_source_chars=batch_max_chars,
     )
+    chunk_queue: list[dict[str, Any]] = [
+        {"label": str(i), "rows": list(chunk)}
+        for i, chunk in enumerate(chunks, start=1)
+    ]
 
     merged_xlsx_map: Any = previous_for_prompt.get("xlsx_translation_map") if isinstance(previous_for_prompt, dict) else []
     merged_docx_map: Any = previous_for_prompt.get("docx_translation_map") if isinstance(previous_for_prompt, dict) else []
@@ -2710,7 +2714,12 @@ Rules:
     failed_batches: list[dict[str, Any]] = []
     xlsx_files = sorted({str(row.get("file") or "").strip() for row in all_rows if str(row.get("file") or "").strip()})
 
-    for idx, chunk_rows in enumerate(chunks, start=1):
+    while chunk_queue:
+        chunk_item = chunk_queue.pop(0)
+        chunk_label = str(chunk_item.get("label") or "?")
+        chunk_rows = chunk_item.get("rows") if isinstance(chunk_item.get("rows"), list) else []
+        if not chunk_rows:
+            continue
         expected_keys = _xlsx_batch_key_set(chunk_rows)
         batch_context = copy.deepcopy(context_for_prompt)
         preserve = batch_context.get("format_preserve")
@@ -2729,9 +2738,10 @@ Rules:
         batch_result: dict[str, Any] | None = None
         local_findings = list(findings or [])
         batch_collected_map: Any = batch_previous.get("xlsx_translation_map") if isinstance(batch_previous, dict) else []
+        split_for_size = False
         while attempt <= batch_retry:
             attempt += 1
-            hint = f"batch={idx}/{len(chunks)} cells={len(chunk_rows)} attempt={attempt}"
+            hint = f"batch={chunk_label} cells={len(chunk_rows)} attempt={attempt} queue={len(chunk_queue)}"
             batch_result = _run_single_generation(
                 context_payload=copy.deepcopy(batch_context),
                 previous_payload=copy.deepcopy(batch_previous),
@@ -2740,6 +2750,33 @@ Rules:
                 xlsx_batch_hint=hint,
             )
             if not batch_result.get("ok"):
+                err = str(batch_result.get("error") or "")
+                detail = str(batch_result.get("detail") or "")
+                raw_text = str(batch_result.get("raw_text") or "")
+                if len(chunk_rows) > 1 and (
+                    err.startswith("agent_request_too_large:")
+                    or _looks_like_model_request_too_large(detail)
+                    or _looks_like_model_request_too_large(raw_text)
+                ):
+                    split_for_size = True
+                    mid = max(1, len(chunk_rows) // 2)
+                    left_rows = list(chunk_rows[:mid])
+                    right_rows = list(chunk_rows[mid:])
+                    chunk_queue = [
+                        {"label": f"{chunk_label}a", "rows": left_rows},
+                        {"label": f"{chunk_label}b", "rows": right_rows},
+                        *chunk_queue,
+                    ]
+                    failed_batches.append(
+                        {
+                            "batch": chunk_label,
+                            "error": "agent_request_too_large",
+                            "action": "split_retry",
+                            "cells": len(chunk_rows),
+                            "split_cells": [len(left_rows), len(right_rows)],
+                        }
+                    )
+                    break
                 continue
             data = batch_result.get("data") if isinstance(batch_result.get("data"), dict) else {}
             batch_collected_map = _merge_xlsx_translation_map(batch_collected_map, data.get("xlsx_translation_map"))
@@ -2755,8 +2792,11 @@ Rules:
             ]
             batch_previous["xlsx_translation_map"] = batch_collected_map if isinstance(batch_collected_map, list) else []
 
+        if split_for_size:
+            continue
+
         if not batch_result or not batch_result.get("ok"):
-            failed_batches.append({"batch": idx, "error": str((batch_result or {}).get("error") or "batch_failed")})
+            failed_batches.append({"batch": chunk_label, "error": str((batch_result or {}).get("error") or "batch_failed")})
             continue
 
         if not first_call_meta:

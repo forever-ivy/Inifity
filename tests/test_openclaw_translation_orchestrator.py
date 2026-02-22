@@ -983,6 +983,75 @@ class CodexGenerateFallbackTest(unittest.TestCase):
         self.assertEqual(len((out.get("data") or {}).get("xlsx_translation_map") or []), 4)
         self.assertEqual(mocked_agent_call.call_count, 2)
 
+    @patch("scripts.openclaw_translation_orchestrator._agent_call")
+    def test_codex_generate_spreadsheet_batch_splits_on_request_too_large(self, mocked_agent_call):
+        units = [
+            {"file": "fd.xlsx", "sheet": "S1", "cell": "A1", "text": "نص 1"},
+            {"file": "fd.xlsx", "sheet": "S1", "cell": "A2", "text": "نص 2"},
+        ]
+
+        mocked_agent_call.side_effect = [
+            {
+                "ok": False,
+                "error": "agent_request_too_large:translator-core",
+                "detail": "LLM request rejected: total message size 3000000 exceeds limit 2097152",
+                "raw_text": "LLM request rejected: total message size 3000000 exceeds limit 2097152",
+            },
+            _agent_ok(
+                {
+                    "final_text": "",
+                    "final_reflow_text": "",
+                    "docx_translation_map": [],
+                    "xlsx_translation_map": [{"file": "fd.xlsx", "sheet": "S1", "cell": "A1", "text": "text 1"}],
+                    "review_brief_points": [],
+                    "change_log_points": [],
+                    "resolved": [],
+                    "unresolved": [],
+                    "codex_pass": True,
+                    "reasoning_summary": "split a",
+                }
+            ),
+            _agent_ok(
+                {
+                    "final_text": "",
+                    "final_reflow_text": "",
+                    "docx_translation_map": [],
+                    "xlsx_translation_map": [{"file": "fd.xlsx", "sheet": "S1", "cell": "A2", "text": "text 2"}],
+                    "review_brief_points": [],
+                    "change_log_points": [],
+                    "resolved": [],
+                    "unresolved": [],
+                    "codex_pass": True,
+                    "reasoning_summary": "split b",
+                }
+            ),
+        ]
+
+        context = {
+            "task_intent": {"task_type": "SPREADSHEET_TRANSLATION"},
+            "subject": "Translate",
+            "message_text": "translate",
+            "candidate_files": [],
+            "format_preserve": {
+                "xlsx_sources": [{"file": "fd.xlsx", "cell_units": units}]
+            },
+        }
+        with patch("scripts.openclaw_translation_orchestrator.CODEX_FALLBACK_AGENT", ""), patch.dict(
+            os.environ,
+            {
+                "OPENCLAW_XLSX_BATCH_MAX_CELLS": "10",
+                "OPENCLAW_XLSX_BATCH_RETRY": "0",
+                "OPENCLAW_GLM_DIRECT_FALLBACK_ENABLED": "0",
+                "OPENCLAW_KIMI_CODING_DIRECT_FALLBACK_ENABLED": "0",
+            },
+            clear=False,
+        ):
+            out = _codex_generate(context, None, [], 1)
+
+        self.assertTrue(out.get("ok"))
+        self.assertEqual(len((out.get("data") or {}).get("xlsx_translation_map") or []), 2)
+        self.assertEqual(mocked_agent_call.call_count, 3)
+
     @patch("scripts.openclaw_translation_orchestrator._kimi_coding_direct_api_call")
     @patch("scripts.openclaw_translation_orchestrator._agent_call")
     def test_codex_generate_uses_fallback_agent_on_request_too_large(self, mocked_agent_call, mocked_kimi_call):
