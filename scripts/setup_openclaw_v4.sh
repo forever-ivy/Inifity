@@ -5,10 +5,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="${OPENCLAW_PROJECT_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 cd "$ROOT_DIR"
 WORKSPACE_DIR="${OPENCLAW_WORKSPACE_DIR:-$ROOT_DIR}"
-KIMI_MODEL="${OPENCLAW_KIMI_MODEL:-moonshot/kimi-k2.5}"
-KIMI_ALT_MODEL="${OPENCLAW_KIMI_ALT_MODEL:-kimi-coding/k2p5}"
+KIMI_CODING_MODEL="${OPENCLAW_KIMI_CODING_MODEL:-kimi-coding/k2p5}"
 PRIMARY_MODEL="${OPENCLAW_PRIMARY_MODEL:-openai-codex/gpt-5.2}"
-FALLBACK_MODEL="${OPENCLAW_FALLBACK_MODEL:-$KIMI_ALT_MODEL}"
+FALLBACK_MODEL="${OPENCLAW_FALLBACK_MODEL:-$KIMI_CODING_MODEL}"
 IMAGE_MODEL="${OPENCLAW_IMAGE_MODEL:-$PRIMARY_MODEL}"
 OPENCLAW_WORKSPACE_SKILL_ROOT="${OPENCLAW_WORKSPACE_SKILL_ROOT:-$HOME/.openclaw/workspace}"
 SKILL_LOCK_FILE="${SKILL_LOCK_FILE:-$ROOT_DIR/config/skill-lock.v6.json}"
@@ -155,11 +154,11 @@ fi
 echo "Configuring model routing..."
 openclaw models set "$PRIMARY_MODEL"
 
-# Enforce Kimi-first fallback order (Kimi + Kimi alt first, GLM last) while preserving all other entries.
-if [[ -n "$KIMI_MODEL" || -n "$KIMI_ALT_MODEL" ]]; then
+# Enforce fallback order: GLM first, then Kimi Coding, while preserving non-GLM/Kimi entries.
+if [[ -n "$KIMI_CODING_MODEL" || -n "$GLM_MODEL" ]]; then
   FALLBACKS_JSON="$(openclaw models fallbacks list --json 2>/dev/null || echo '{"fallbacks": []}')"
   CURRENT_LIST="$(jq -c '(.fallbacks // [])' <<<"$FALLBACKS_JSON")"
-  DESIRED_LIST="$(jq -c --arg kimi "$KIMI_MODEL" --arg kimi_alt "$KIMI_ALT_MODEL" --arg fallback "$FALLBACK_MODEL" '
+  DESIRED_LIST="$(jq -c --arg kimi "$KIMI_CODING_MODEL" --arg fallback "$FALLBACK_MODEL" --arg glm "$GLM_MODEL" '
     def norm: map(tostring | gsub("^\\s+|\\s+$"; "")) | map(select(length > 0));
     def dedupe:
       reduce .[] as $x ({"seen": {}, "out": []};
@@ -171,15 +170,16 @@ if [[ -n "$KIMI_MODEL" || -n "$KIMI_ALT_MODEL" ]]; then
     (.fallbacks // [])
     | norm
     | dedupe as $base
-    | ($base | map(select(. != $kimi and . != $kimi_alt and . != $fallback))) as $rest
+    | ($base | map(select(. != $kimi and . != $fallback and . != $glm))) as $rest
     | ($rest | map(select(startswith("zai/glm-") | not))) as $non_glm
     | ($rest | map(select(startswith("zai/glm-")))) as $glm
-    | ([ $kimi, $kimi_alt, $fallback ] | norm | dedupe) as $kimi_head
-    | ($kimi_head + $non_glm + $glm) | dedupe
+    | ([ $glm ] | norm | dedupe) as $glm_head
+    | ([ $kimi, $fallback ] | norm | dedupe) as $kimi_head
+    | ($glm_head + $kimi_head + $non_glm + $glm) | dedupe
   ' <<<"$FALLBACKS_JSON")"
 
   if [[ "$DESIRED_LIST" != "$CURRENT_LIST" ]]; then
-    echo "Updating OpenClaw fallbacks (Kimi defaults)..."
+    echo "Updating OpenClaw fallbacks (GLM -> Kimi Coding)..."
     openclaw models fallbacks clear || true
     while IFS= read -r model; do
       [[ -z "$model" ]] && continue

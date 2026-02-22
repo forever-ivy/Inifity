@@ -23,6 +23,7 @@ from scripts.openclaw_translation_orchestrator import (
     _codex_generate,
     _infer_language_pair_from_context,
     _trim_xlsx_prompt_text,
+    _validate_format_preserve_coverage,
     run,
 )
 
@@ -761,9 +762,82 @@ class PromptCompactionHelpersTest(unittest.TestCase):
         self.assertEqual(kept, 2)
         self.assertEqual(_count_xlsx_prompt_rows(context), 2)
 
+    def test_cap_xlsx_prompt_rows_cell_units(self):
+        context = {
+            "format_preserve": {
+                "xlsx_sources": [
+                    {
+                        "file": "a.xlsx",
+                        "cell_units": [
+                            {"sheet": "S1", "cell": "A1", "text": "x"},
+                            {"sheet": "S1", "cell": "A2", "text": "y"},
+                        ],
+                    },
+                    {"file": "b.xlsx", "cell_units": [{"sheet": "S2", "cell": "B1", "text": "z"}]},
+                ]
+            }
+        }
+        self.assertEqual(_count_xlsx_prompt_rows(context), 3)
+        kept = _cap_xlsx_prompt_rows(context, max_rows=2)
+        self.assertEqual(kept, 2)
+        self.assertEqual(_count_xlsx_prompt_rows(context), 2)
+        self.assertEqual(len(context["format_preserve"]["xlsx_sources"][0]["cell_units"]), 2)
+        self.assertEqual(context["format_preserve"]["xlsx_sources"][1]["cell_units"], [])
+
+    def test_validate_format_preserve_coverage_classifies_translation_vs_source_truncation(self):
+        context = {
+            "format_preserve": {
+                "xlsx_sources": [
+                    {
+                        "file": "a.xlsx",
+                        "cell_units": [
+                            {"file": "a.xlsx", "sheet": "S1", "cell": "D18", "text": "complete source sentence."},
+                            {"file": "a.xlsx", "sheet": "S1", "cell": "D19", "text": "incomplete source sentence"},
+                        ],
+                    }
+                ]
+            }
+        }
+        draft = {
+            "xlsx_translation_map": [
+                {"file": "a.xlsx", "sheet": "S1", "cell": "D18", "text": "truncated output tail " * 8},
+                {"file": "a.xlsx", "sheet": "S1", "cell": "D19", "text": "truncated output tail " * 8},
+            ]
+        }
+        findings, meta = _validate_format_preserve_coverage(context, draft)
+        self.assertIn("xlsx_translation_truncated:cells=1", findings)
+        self.assertEqual(meta.get("xlsx_source_truncated_count"), 1)
+
+    def test_validate_format_preserve_coverage_source_truncated_marker_not_hard_fail(self):
+        context = {
+            "format_preserve": {
+                "xlsx_sources": [
+                    {
+                        "file": "a.xlsx",
+                        "cell_units": [
+                            {"file": "a.xlsx", "sheet": "S1", "cell": "D19", "text": "incomplete source sentence"},
+                        ],
+                    }
+                ]
+            }
+        }
+        draft = {
+            "xlsx_translation_map": [
+                {
+                    "file": "a.xlsx",
+                    "sheet": "S1",
+                    "cell": "D19",
+                    "text": ("incomplete output " * 8) + "[SOURCE TRUNCATED]",
+                },
+            ]
+        }
+        findings, meta = _validate_format_preserve_coverage(context, draft)
+        self.assertEqual(findings, [])
+        self.assertIn(meta.get("xlsx_source_truncated_count"), (None, 0))
+
 
 class CodexGenerateFallbackTest(unittest.TestCase):
-    @patch("scripts.openclaw_translation_orchestrator._moonshot_direct_api_call")
+    @patch("scripts.openclaw_translation_orchestrator._kimi_coding_direct_api_call")
     @patch("scripts.openclaw_translation_orchestrator._agent_call")
     def test_codex_generate_uses_fallback_agent_on_request_too_large(self, mocked_agent_call, mocked_kimi_call):
         mocked_agent_call.side_effect = [
@@ -808,7 +882,7 @@ class CodexGenerateFallbackTest(unittest.TestCase):
         self.assertEqual((out.get("call_meta") or {}).get("model"), "moonshot/kimi-k2.5")
         mocked_kimi_call.assert_not_called()
 
-    @patch("scripts.openclaw_translation_orchestrator._moonshot_direct_api_call")
+    @patch("scripts.openclaw_translation_orchestrator._kimi_coding_direct_api_call")
     @patch("scripts.openclaw_translation_orchestrator._agent_call")
     def test_codex_generate_uses_fallback_agent_before_direct_api(self, mocked_agent_call, mocked_kimi_call):
         mocked_agent_call.side_effect = [
@@ -858,9 +932,15 @@ class CodexGenerateFallbackTest(unittest.TestCase):
         self.assertEqual((out.get("call_meta") or {}).get("model"), "gpt-5.2")
         mocked_kimi_call.assert_not_called()
 
-    @patch("scripts.openclaw_translation_orchestrator._moonshot_direct_api_call")
+    @patch("scripts.openclaw_translation_orchestrator._kimi_coding_direct_api_call")
+    @patch("scripts.openclaw_translation_orchestrator._glm_direct_api_call")
     @patch("scripts.openclaw_translation_orchestrator._agent_call")
-    def test_codex_generate_falls_back_to_kimi_direct_api_on_schema_error(self, mocked_agent_call, mocked_kimi_call):
+    def test_codex_generate_falls_back_to_kimi_direct_api_on_schema_error(
+        self,
+        mocked_agent_call,
+        mocked_glm_call,
+        mocked_kimi_call,
+    ):
         mocked_agent_call.return_value = {
             "ok": True,
             "agent_id": "translator-core",
@@ -872,6 +952,7 @@ class CodexGenerateFallbackTest(unittest.TestCase):
             ),
             "meta": {"provider": "google-antigravity", "model": "claude-opus-4-6-thinking"},
         }
+        mocked_glm_call.return_value = {"ok": False, "error": "glm_direct_failed"}
         mocked_kimi_call.return_value = {
             "ok": True,
             "text": json.dumps(
@@ -888,9 +969,9 @@ class CodexGenerateFallbackTest(unittest.TestCase):
                     "reasoning_summary": "ok",
                 }
             ),
-            "source": "direct_api_kimi",
-            "provider": "moonshot",
-            "model": "moonshot/kimi-k2.5",
+            "source": "direct_api_kimi_coding",
+            "provider": "kimi-coding",
+            "model": "kimi-coding/k2p5",
         }
 
         context = {
@@ -901,13 +982,20 @@ class CodexGenerateFallbackTest(unittest.TestCase):
         }
         out = _codex_generate(context, None, [], 1)
         self.assertTrue(out.get("ok"))
-        self.assertEqual((out.get("call_meta") or {}).get("provider"), "moonshot")
-        self.assertEqual((out.get("call_meta") or {}).get("model"), "moonshot/kimi-k2.5")
+        self.assertEqual((out.get("call_meta") or {}).get("provider"), "kimi-coding")
+        self.assertEqual((out.get("call_meta") or {}).get("model"), "kimi-coding/k2p5")
+        mocked_glm_call.assert_called_once()
         mocked_kimi_call.assert_called_once()
 
-    @patch("scripts.openclaw_translation_orchestrator._moonshot_direct_api_call")
+    @patch("scripts.openclaw_translation_orchestrator._kimi_coding_direct_api_call")
+    @patch("scripts.openclaw_translation_orchestrator._glm_direct_api_call")
     @patch("scripts.openclaw_translation_orchestrator._agent_call")
-    def test_codex_generate_falls_back_to_kimi_direct_api_on_json_parse_error(self, mocked_agent_call, mocked_kimi_call):
+    def test_codex_generate_falls_back_to_kimi_direct_api_on_json_parse_error(
+        self,
+        mocked_agent_call,
+        mocked_glm_call,
+        mocked_kimi_call,
+    ):
         mocked_agent_call.return_value = {
             "ok": True,
             "agent_id": "translator-core",
@@ -915,6 +1003,7 @@ class CodexGenerateFallbackTest(unittest.TestCase):
             "text": "not a json payload",
             "meta": {"provider": "kimi-coding", "model": "kimi-coding/k2p5"},
         }
+        mocked_glm_call.return_value = {"ok": False, "error": "glm_direct_failed"}
         mocked_kimi_call.return_value = {
             "ok": True,
             "text": json.dumps(
@@ -931,9 +1020,9 @@ class CodexGenerateFallbackTest(unittest.TestCase):
                     "reasoning_summary": "ok",
                 }
             ),
-            "source": "direct_api_kimi",
-            "provider": "moonshot",
-            "model": "moonshot/kimi-k2.5",
+            "source": "direct_api_kimi_coding",
+            "provider": "kimi-coding",
+            "model": "kimi-coding/k2p5",
         }
 
         context = {
@@ -944,8 +1033,9 @@ class CodexGenerateFallbackTest(unittest.TestCase):
         }
         out = _codex_generate(context, None, [], 1)
         self.assertTrue(out.get("ok"))
-        self.assertEqual((out.get("call_meta") or {}).get("provider"), "moonshot")
-        self.assertEqual((out.get("call_meta") or {}).get("model"), "moonshot/kimi-k2.5")
+        self.assertEqual((out.get("call_meta") or {}).get("provider"), "kimi-coding")
+        self.assertEqual((out.get("call_meta") or {}).get("model"), "kimi-coding/k2p5")
+        mocked_glm_call.assert_called_once()
         mocked_kimi_call.assert_called_once()
 
 

@@ -168,7 +168,13 @@ TASK_TOOL_INSTRUCTIONS: dict[str, str] = {
         "every cell listed in xlsx_sources[].cell_units OR xlsx_sources[].rows "
         "(even if the sheet notes say a column \"auto-populates\"). "
         "In rows mode, each row is [sheet, cell, source_text]. "
-        "Do not omit any provided (file, sheet, cell)."
+        "Do not omit any provided (file, sheet, cell). "
+        "CRITICAL OUTPUT COMPLETENESS: Every cell translation MUST be COMPLETE — translate the "
+        "ENTIRE source text from beginning to end. NEVER stop mid-sentence, NEVER truncate, "
+        "NEVER abbreviate, NEVER summarize. If the source text is 500 characters, the translation "
+        "must cover ALL 500 characters of meaning. A partial translation is WRONG. "
+        "If a cell contains a question, translate it as a question — do NOT answer it. "
+        "It is better to translate fewer cells completely than to translate all cells partially."
     ),
     "FORMAT_CRITICAL_TASK": (
         "Structural fidelity is the top priority. Preserve all headings, numbering, "
@@ -197,7 +203,7 @@ GEMINI_FALLBACK_AGENTS = [
     for a in os.getenv("OPENCLAW_GEMINI_FALLBACK_AGENTS", "translator-core,qa-gate").split(",")
     if a.strip()
 ]
-OPENCLAW_CMD_TIMEOUT = int(os.getenv("OPENCLAW_AGENT_CALL_TIMEOUT_SECONDS", "300"))
+OPENCLAW_CMD_TIMEOUT = int(os.getenv("OPENCLAW_AGENT_CALL_TIMEOUT_SECONDS", "600"))
 DOC_CONTEXT_CHARS = int(os.getenv("OPENCLAW_DOC_CONTEXT_CHARS", "45000"))
 VALID_THINKING_LEVELS = {"off", "minimal", "low", "medium", "high"}
 OPENCLAW_TRANSLATION_THINKING = os.getenv("OPENCLAW_TRANSLATION_THINKING", "high").strip().lower()
@@ -216,14 +222,18 @@ OPENCLAW_AGENT_PROMPT_MAX_BYTES = max(
 )
 OPENCLAW_KB_CONTEXT_MAX_HITS = max(0, int(os.getenv("OPENCLAW_KB_CONTEXT_MAX_HITS", "6")))
 OPENCLAW_KB_CONTEXT_MAX_CHARS = max(120, int(os.getenv("OPENCLAW_KB_CONTEXT_MAX_CHARS", "1200")))
-OPENCLAW_XLSX_PROMPT_TEXT_MAX_CHARS = max(40, int(os.getenv("OPENCLAW_XLSX_PROMPT_TEXT_MAX_CHARS", "160")))
+OPENCLAW_XLSX_PROMPT_TEXT_MAX_CHARS = max(40, int(os.getenv("OPENCLAW_XLSX_PROMPT_TEXT_MAX_CHARS", "2000")))
 OPENCLAW_PREVIOUS_MAP_MAX_ENTRIES = max(100, int(os.getenv("OPENCLAW_PREVIOUS_MAP_MAX_ENTRIES", "1200")))
+OPENCLAW_XLSX_TRUNCATED_SAMPLE_LIMIT = max(1, int(os.getenv("OPENCLAW_XLSX_TRUNCATED_SAMPLE_LIMIT", "50")))
+SOURCE_TRUNCATED_MARKER = str(os.getenv("OPENCLAW_SOURCE_TRUNCATED_MARKER", "[SOURCE TRUNCATED]")).strip() or "[SOURCE TRUNCATED]"
 
 GLM_AGENT = os.getenv("OPENCLAW_GLM_AGENT", "glm-reviewer")
 GLM_GENERATOR_AGENT = os.getenv("OPENCLAW_GLM_GENERATOR_AGENT", GLM_AGENT)
 GLM_API_KEY = os.getenv("GLM_API_KEY", "")
 GLM_API_BASE_URL = os.getenv("GLM_API_BASE_URL", "https://open.bigmodel.cn/api/paas/v4")
 GLM_MODEL = os.getenv("OPENCLAW_GLM_MODEL", "zai/glm-5")
+KIMI_CODING_MODEL = os.getenv("OPENCLAW_KIMI_CODING_MODEL", "kimi-coding/k2p5")
+KIMI_CODING_API_BASE_URL = os.getenv("OPENCLAW_KIMI_CODING_BASE_URL", "https://api.moonshot.cn/v1")
 
 
 def _glm_enabled() -> bool:
@@ -287,6 +297,15 @@ def _normalize_xlsx_translation_map_keys(entries: Any, *, xlsx_files: list[str])
         if file_name and sheet and cell:
             keys.add((file_name, sheet, cell))
     return keys
+
+
+def _has_terminal_punctuation(text: str) -> bool:
+    value = str(text or "").strip()
+    if not value:
+        return False
+    if value.endswith(SOURCE_TRUNCATED_MARKER):
+        return True
+    return value[-1] in ".!?\"'):]}>"
 
 
 def _validate_format_preserve_coverage(context: dict[str, Any], draft: dict[str, Any]) -> tuple[list[str], dict[str, Any]]:
@@ -359,6 +378,56 @@ def _validate_format_preserve_coverage(context: dict[str, Any], draft: dict[str,
                 {"file": f, "sheet": s, "cell": c, "text": expected_text_by_key.get((f, s, c), "")}
                 for (f, s, c) in missing_list[:max_units]
             ]
+
+    # --- Truncation detection for xlsx_translation_map ---
+    x_entries = draft.get("xlsx_translation_map")
+    if isinstance(x_entries, list):
+        translation_truncated_cells: list[dict[str, Any]] = []
+        source_truncated_cells: list[dict[str, Any]] = []
+        for entry in x_entries:
+            if not isinstance(entry, dict):
+                continue
+            text = str(entry.get("text") or "").strip()
+            if not text:
+                continue
+            file_name = str(entry.get("file") or "").strip()
+            cell = str(entry.get("cell") or "")
+            sheet = str(entry.get("sheet") or "")
+            key = (file_name, sheet, str(cell).upper())
+            src_text = expected_text_by_key.get(key, "")
+            source_has_terminal = _has_terminal_punctuation(src_text)
+            translated_has_terminal = _has_terminal_punctuation(text)
+            marker_present = bool(SOURCE_TRUNCATED_MARKER and text.endswith(SOURCE_TRUNCATED_MARKER))
+            if text.endswith("...") or text.endswith("…"):
+                reason = "ellipsis"
+            elif len(text) > 100 and not translated_has_terminal:
+                reason = "no_terminal_punct"
+            else:
+                continue
+            row = {
+                "file": file_name,
+                "cell": cell,
+                "sheet": sheet,
+                "tail": text[-60:],
+                "reason": reason,
+                "source_has_terminal": source_has_terminal,
+                "marker_present": marker_present,
+            }
+            if src_text and not source_has_terminal:
+                source_truncated_cells.append(row)
+            else:
+                translation_truncated_cells.append(row)
+        if translation_truncated_cells:
+            findings.append(f"xlsx_translation_truncated:cells={len(translation_truncated_cells)}")
+            meta["xlsx_translation_truncated_sample"] = translation_truncated_cells[:OPENCLAW_XLSX_TRUNCATED_SAMPLE_LIMIT]
+            # Backward compatibility for existing readers.
+            meta["xlsx_truncated_sample"] = translation_truncated_cells[:OPENCLAW_XLSX_TRUNCATED_SAMPLE_LIMIT]
+        if source_truncated_cells:
+            meta["xlsx_source_truncated_count"] = len(source_truncated_cells)
+            meta["xlsx_source_truncated_sample"] = source_truncated_cells[:OPENCLAW_XLSX_TRUNCATED_SAMPLE_LIMIT]
+            meta["xlsx_source_truncated_marker_missing_count"] = sum(
+                1 for item in source_truncated_cells if not bool(item.get("marker_present"))
+            )
 
     return findings, meta
 
@@ -1085,6 +1154,33 @@ def _collect_translated_xlsx_keys(previous_payload: dict[str, Any] | None) -> se
     return keys
 
 
+def _estimate_xlsx_source_chars(context_payload: dict[str, Any]) -> int:
+    """Estimate total source text characters in xlsx_sources for output size prediction."""
+    preserve = context_payload.get("format_preserve")
+    if not isinstance(preserve, dict):
+        return 0
+    sources = preserve.get("xlsx_sources")
+    if not isinstance(sources, list):
+        return 0
+    total = 0
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        rows = src.get("rows")
+        if isinstance(rows, list):
+            for row in rows:
+                if isinstance(row, list) and len(row) >= 3:
+                    total += len(str(row[2] or ""))
+                elif isinstance(row, dict):
+                    total += len(str(row.get("text") or ""))
+        units = src.get("cell_units")
+        if isinstance(units, list):
+            for unit in units:
+                if isinstance(unit, dict):
+                    total += len(str(unit.get("text") or ""))
+    return total
+
+
 def _count_xlsx_prompt_rows(context_payload: dict[str, Any]) -> int:
     preserve = context_payload.get("format_preserve")
     if not isinstance(preserve, dict):
@@ -1119,15 +1215,26 @@ def _cap_xlsx_prompt_rows(context_payload: dict[str, Any], *, max_rows: int) -> 
     for src in sources:
         if not isinstance(src, dict):
             continue
+        bucket_key = ""
+        items: list[Any] = []
         rows = src.get("rows")
         if isinstance(rows, list):
-            remaining = keep - kept
-            if remaining <= 0:
-                src["rows"] = []
-                continue
-            if len(rows) > remaining:
-                src["rows"] = rows[:remaining]
-            kept += min(len(src.get("rows") or []), remaining)
+            bucket_key = "rows"
+            items = rows
+        else:
+            units = src.get("cell_units")
+            if isinstance(units, list):
+                bucket_key = "cell_units"
+                items = units
+        if not bucket_key:
+            continue
+        remaining = keep - kept
+        if remaining <= 0:
+            src[bucket_key] = []
+            continue
+        if len(items) > remaining:
+            src[bucket_key] = items[:remaining]
+        kept += min(len(src.get(bucket_key) or []), remaining)
     return kept
 
 
@@ -1539,7 +1646,7 @@ def _extract_openclaw_payload_model(payload: Any) -> dict[str, str]:
 
     This is intentionally heuristic: OpenClaw gateway payload formats may vary across
     versions and backends. We prefer returning OpenClaw-style model keys
-    (e.g. "moonshot/kimi-k2.5") when present, but will fall back to any model-like
+    (e.g. "kimi-coding/k2p5") when present, but will fall back to any model-like
     string.
     """
     def _is_model_key(s: str) -> bool:
@@ -2028,6 +2135,10 @@ Rules:
 - Produce complete output text for the selected task.
 - If execution_context.format_preserve.docx_template is present, you MUST fill docx_translation_map for every unit id provided.
 - If execution_context.format_preserve.xlsx_sources is present, you MUST fill xlsx_translation_map for every provided (file, sheet, cell), whether entries are in cell_units objects or rows tuples [sheet, cell, source_text].
+- XLSX COMPLETENESS: For each cell in xlsx_translation_map, your translated text MUST cover the ENTIRE source text.
+  Compare your translation against the source: if the source has 5 sentences, your translation must have 5 sentences.
+  A translation that only covers the first half of the source is WRONG and will be rejected.
+  If you cannot fit all cells completely, translate FEWER cells but translate each one FULLY.
 - If execution_context.glossary_enforcer.terms is present, you MUST apply those term mappings strictly (Arabic => English).
   For every unit/cell whose source text contains a glossary Arabic term, the corresponding translated text MUST contain the required English translation.
   Never append standalone glossary labels at the end (e.g., "... Artificial Intelligence (AI)").
@@ -2042,6 +2153,28 @@ Rules:
     context_for_prompt = copy.deepcopy(context)
     previous_for_prompt = copy.deepcopy(previous_draft or {})
     prompt_max_bytes = OPENCLAW_AGENT_PROMPT_MAX_BYTES
+
+    # --- Output-size safety cap for SPREADSHEET_TRANSLATION ---
+    # Estimate output tokens from source text volume; cap rows to avoid model output truncation.
+    # Models tend to compress/truncate individual cell translations when too many cells are present.
+    # Rough heuristic: 1 source char ≈ 1.3 output chars (AR→EN), 3.5 chars ≈ 1 token, plus JSON overhead.
+    max_output_tokens = int(os.getenv("OPENCLAW_XLSX_MAX_OUTPUT_TOKENS", "4000"))
+    if task_type == "SPREADSHEET_TRANSLATION":
+        total_src_chars = _estimate_xlsx_source_chars(context_for_prompt)
+        estimated_output_tokens = int(total_src_chars * 1.3 / 3.5) + 500  # translation + JSON overhead
+        if estimated_output_tokens > max_output_tokens and total_src_chars > 0:
+            # Calculate how many chars we can afford
+            affordable_chars = int((max_output_tokens - 500) * 3.5 / 1.3)
+            cap_ratio = max(0.1, affordable_chars / total_src_chars)
+            total_rows = _count_xlsx_prompt_rows(context_for_prompt)
+            target_rows = max(1, int(total_rows * cap_ratio))
+            if target_rows < total_rows:
+                kept = _cap_xlsx_prompt_rows(context_for_prompt, max_rows=target_rows)
+                log.info(
+                    "output_cap: estimated_output_tokens=%d > max=%d, capped rows %d→%d (src_chars=%d)",
+                    estimated_output_tokens, max_output_tokens, total_rows, kept, total_src_chars,
+                )
+
     prompt = _render_prompt(
         context_payload=context_for_prompt,
         previous_payload=previous_for_prompt,
@@ -2176,19 +2309,19 @@ Rules:
                     fallback_call.get("error") or f"agent_call_failed:{CODEX_FALLBACK_AGENT}"
                 )
 
-        if not call.get("ok") and _env_flag("OPENCLAW_KIMI_DIRECT_FALLBACK_ENABLED", "1"):
-            kimi_call = _moonshot_direct_api_call(prompt)
-            if kimi_call.get("ok"):
-                call = kimi_call
-            else:
-                fallback_errors["kimi"] = str(kimi_call.get("error") or "kimi_direct_failed")
-
         if not call.get("ok") and _env_flag("OPENCLAW_GLM_DIRECT_FALLBACK_ENABLED", "1"):
             glm_call = _glm_direct_api_call(prompt)
             if glm_call.get("ok"):
                 call = glm_call
             else:
                 fallback_errors["glm"] = str(glm_call.get("error") or "glm_direct_failed")
+
+        if not call.get("ok") and _env_flag("OPENCLAW_KIMI_CODING_DIRECT_FALLBACK_ENABLED", "1"):
+            kimi_call = _kimi_coding_direct_api_call(prompt)
+            if kimi_call.get("ok"):
+                call = kimi_call
+            else:
+                fallback_errors["kimi_coding"] = str(kimi_call.get("error") or "kimi_coding_direct_failed")
 
         if not call.get("ok"):
             detail = dict(call)
@@ -2203,19 +2336,37 @@ Rules:
         parse_error = str(exc)
         parsed = None
 
-    if parsed is None and _env_flag("OPENCLAW_KIMI_DIRECT_FALLBACK_ENABLED", "1"):
-        # If the routed model produced non-JSON output, retry once via direct Kimi API
-        # (JSON-object mode) before declaring hard failure.
-        kimi_call = _moonshot_direct_api_call(prompt)
+    if parsed is None and _env_flag("OPENCLAW_GLM_DIRECT_FALLBACK_ENABLED", "1"):
+        glm_call = _glm_direct_api_call(prompt)
+        if glm_call.get("ok"):
+            try:
+                parsed = _extract_json_from_text(str(glm_call.get("text", "")))
+                call = glm_call
+            except Exception as glm_exc:
+                parse_error = f"{parse_error}; glm_direct_parse_failed:{glm_exc}" if parse_error else f"glm_direct_parse_failed:{glm_exc}"
+        else:
+            glm_err = str(glm_call.get("error") or "glm_direct_failed")
+            parse_error = f"{parse_error}; glm_direct_failed:{glm_err}" if parse_error else f"glm_direct_failed:{glm_err}"
+
+    if parsed is None and _env_flag("OPENCLAW_KIMI_CODING_DIRECT_FALLBACK_ENABLED", "1"):
+        kimi_call = _kimi_coding_direct_api_call(prompt)
         if kimi_call.get("ok"):
             try:
                 parsed = _extract_json_from_text(str(kimi_call.get("text", "")))
                 call = kimi_call
             except Exception as kimi_exc:
-                parse_error = f"{parse_error}; kimi_direct_parse_failed:{kimi_exc}" if parse_error else f"kimi_direct_parse_failed:{kimi_exc}"
+                parse_error = (
+                    f"{parse_error}; kimi_coding_direct_parse_failed:{kimi_exc}"
+                    if parse_error
+                    else f"kimi_coding_direct_parse_failed:{kimi_exc}"
+                )
         else:
-            kimi_err = str(kimi_call.get("error") or "kimi_direct_failed")
-            parse_error = f"{parse_error}; kimi_direct_failed:{kimi_err}" if parse_error else f"kimi_direct_failed:{kimi_err}"
+            kimi_err = str(kimi_call.get("error") or "kimi_coding_direct_failed")
+            parse_error = (
+                f"{parse_error}; kimi_coding_direct_failed:{kimi_err}"
+                if parse_error
+                else f"kimi_coding_direct_failed:{kimi_err}"
+            )
 
     if parsed is None:
         return {
@@ -2228,11 +2379,11 @@ Rules:
     call_meta = call.get("meta") if isinstance(call.get("meta"), dict) else {}
     if isinstance(call, dict) and call.get("agent_id"):
         call_meta = {"agent_id": str(call.get("agent_id") or ""), **call_meta}
-    if isinstance(call, dict) and call.get("source") == "direct_api_kimi":
+    if isinstance(call, dict) and call.get("source") == "direct_api_kimi_coding":
         call_meta = {
-            "agent_id": "direct_api_kimi",
-            "provider": "moonshot",
-            "model": str(call.get("model") or os.getenv("OPENCLAW_KIMI_MODEL", "moonshot/kimi-k2.5")),
+            "agent_id": "direct_api_kimi_coding",
+            "provider": "kimi-coding",
+            "model": str(call.get("model") or KIMI_CODING_MODEL or "kimi-coding/k2p5"),
             **call_meta,
         }
     if isinstance(call, dict) and call.get("source") == "direct_api":
@@ -2440,16 +2591,16 @@ def _looks_like_model_request_too_large(text: str) -> bool:
     )
 
 
-def _moonshot_direct_api_call(prompt: str) -> dict[str, Any]:
+def _kimi_coding_direct_api_call(prompt: str) -> dict[str, Any]:
     import urllib.request
 
-    model_key = str(os.getenv("OPENCLAW_KIMI_MODEL", "moonshot/kimi-k2.5") or "moonshot/kimi-k2.5").strip()
+    model_key = str(KIMI_CODING_MODEL or "kimi-coding/k2p5").strip()
     model = model_key.rsplit("/", 1)[-1] if "/" in model_key else model_key
-    api_key = str(os.getenv("MOONSHOT_API_KEY") or "").strip() or _read_openclaw_api_key("moonshot")
+    api_key = str(os.getenv("OPENCLAW_KIMI_CODING_API_KEY") or "").strip() or _read_openclaw_api_key("kimi-coding")
     if not api_key:
-        return {"ok": False, "error": "moonshot_api_key_not_set"}
+        return {"ok": False, "error": "kimi_coding_api_key_not_set"}
 
-    base_url = os.environ.get("OPENCLAW_MOONSHOT_BASE_URL", "https://api.moonshot.cn/v1").strip().rstrip("/")
+    base_url = str(KIMI_CODING_API_BASE_URL or "").strip().rstrip("/")
     url = f"{base_url}/chat/completions"
     body = json.dumps(
         {
@@ -2485,12 +2636,12 @@ def _moonshot_direct_api_call(prompt: str) -> dict[str, Any]:
         return {
             "ok": True,
             "text": content,
-            "source": "direct_api_kimi",
-            "provider": "moonshot",
+            "source": "direct_api_kimi_coding",
+            "provider": "kimi-coding",
             "model": model_key,
         }
     except Exception as exc:
-        return {"ok": False, "error": f"moonshot_direct_api_failed:{exc}"}
+        return {"ok": False, "error": f"kimi_coding_direct_api_failed:{exc}"}
 
 
 def _glm_direct_api_call(prompt: str) -> dict[str, Any]:
@@ -2574,6 +2725,10 @@ Rules:
 - Produce complete output text for the selected task.
 - If execution_context.format_preserve.docx_template is present, you MUST fill docx_translation_map for every unit id provided.
 - If execution_context.format_preserve.xlsx_sources is present, you MUST fill xlsx_translation_map for every provided (file, sheet, cell), whether entries are in cell_units objects or rows tuples [sheet, cell, source_text].
+- XLSX COMPLETENESS: For each cell in xlsx_translation_map, your translated text MUST cover the ENTIRE source text.
+  Compare your translation against the source: if the source has 5 sentences, your translation must have 5 sentences.
+  A translation that only covers the first half of the source is WRONG and will be rejected.
+  If you cannot fit all cells completely, translate FEWER cells but translate each one FULLY.
 - If execution_context.glossary_enforcer.terms is present, you MUST apply those term mappings strictly (Arabic => English).
   For every unit/cell whose source text contains a glossary Arabic term, the corresponding translated text MUST contain the required English translation.
   Never append standalone glossary labels at the end (e.g., "... Artificial Intelligence (AI)").
@@ -2973,6 +3128,12 @@ def _compute_hard_gates(
     findings.extend(preserve_findings)
     findings.extend(glossary_findings)
     warnings: list[str] = []
+    source_truncated_count = int(preserve_meta.get("xlsx_source_truncated_count", 0) or 0)
+    if source_truncated_count > 0:
+        warnings.append(f"xlsx_source_truncated:cells={source_truncated_count}")
+        missing_marker_count = int(preserve_meta.get("xlsx_source_truncated_marker_missing_count", 0) or 0)
+        if missing_marker_count > 0:
+            warnings.append(f"xlsx_source_truncated_marker_missing:cells={missing_marker_count}")
 
     vision_results: dict[str, Any] = {}
     if vision_in_round and (FORMAT_QA_ENABLED or DOCX_QA_ENABLED) and not findings:
@@ -3244,9 +3405,10 @@ def run(
                 for c in candidates
                 if str(c.get("path") or "") and Path(str(c.get("path") or "")).suffix.lower() == ".xlsx"
             ]
+            log.info("format_preserve: xlsx_sources=%d candidates=%d", len(xlsx_sources), len(candidates))
             if xlsx_sources:
                 max_cells = int(os.getenv("OPENCLAW_XLSX_TRANSLATION_MAX_CELLS", "2000"))
-                max_chars = int(os.getenv("OPENCLAW_XLSX_MAX_CHARS_PER_CELL", "160"))
+                max_chars = int(os.getenv("OPENCLAW_XLSX_MAX_CHARS_PER_CELL", "2000"))
                 src_lang = str(intent.get("source_language") or "").strip().lower()
                 arabic_only = False
                 if src_lang in {"ar", "arabic"}:
@@ -3278,6 +3440,9 @@ def run(
                         }
                     )
                 format_preserve["xlsx_sources"] = sources_payload
+                log.info("format_preserve: xlsx_sources built with %d files, %d total units",
+                         len(sources_payload),
+                         sum(len(s.get("cell_units", [])) for s in sources_payload))
 
             # DOCX template units (used for preserve output)
             template_docx = _select_docx_template(candidates, target_language=str(intent.get("target_language") or ""))
@@ -3294,9 +3459,13 @@ def run(
         except Exception as exc:
             status_flags.append("format_preserve_payload_error")
             format_preserve["error"] = str(exc)
+            log.error("format_preserve build failed: %s", exc, exc_info=True)
 
         if format_preserve:
             execution_context["format_preserve"] = format_preserve
+            log.info("format_preserve attached to execution_context, keys=%s", list(format_preserve.keys()))
+        else:
+            log.warning("format_preserve is EMPTY — xlsx cell-level translation will not be available")
 
         # --- KB Glossary Enforcer (company-scoped) ---
         try:
@@ -3641,6 +3810,15 @@ def run(
                     if isinstance(xlsx_sample, list) and xlsx_sample:
                         hints.append(f"xlsx_missing_sample:{json.dumps(xlsx_sample, ensure_ascii=False)}")
 
+                # Truncation hints — tell the model which cells need complete translation
+                xlsx_truncated = preserve_meta.get("xlsx_translation_truncated_sample")
+                if not isinstance(xlsx_truncated, list) or not xlsx_truncated:
+                    xlsx_truncated = preserve_meta.get("xlsx_truncated_sample")
+                if isinstance(xlsx_truncated, list) and xlsx_truncated:
+                    hints.append(
+                        f"xlsx_truncated_cells_need_complete_translation:{json.dumps(xlsx_truncated, ensure_ascii=False)}"
+                    )
+
                 docx_sample = preserve_meta.get("docx_missing_sample")
                 if isinstance(docx_sample, list) and docx_sample:
                     hints.append(f"docx_missing_sample:{json.dumps(docx_sample, ensure_ascii=False)}")
@@ -3757,6 +3935,12 @@ def run(
             rec["warnings"] = hard_warnings
             rec["hard_fix_attempts"] = hard_fix_attempts
             rec["metrics"]["hard_fail_items"] = list(hard_findings)
+            if any(str(item).startswith("xlsx_translation_truncated:") for item in hard_findings):
+                if "translation_truncation_detected" not in status_flags:
+                    status_flags.append("translation_truncation_detected")
+            if any(str(item).startswith("xlsx_source_truncated:") for item in hard_warnings):
+                if "source_data_truncated_warning" not in status_flags:
+                    status_flags.append("source_data_truncated_warning")
             if hard_findings:
                 rec["unresolved"] = sorted(set([str(x) for x in (rec.get("unresolved") or [])] + [str(x) for x in hard_findings]))
                 rec["pass"] = False
@@ -4091,7 +4275,7 @@ def run(
 
                     if results_list:
                         generator = ValidationReportGenerator()
-                        report_md = generator.generate_markdown(results_list, job_id=job_id)
+                        report_md = generator.generate_markdown(results_list)
                         detail_report_path = Path(review_dir) / ".system" / "detail_validation_report.md"
                         detail_report_path.parent.mkdir(parents=True, exist_ok=True)
                         detail_report_path.write_text(report_md, encoding="utf-8")

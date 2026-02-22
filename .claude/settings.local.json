@@ -63,7 +63,10 @@
       "Bash(# Check stderr/stdout from the subprocess - worker might capture it ls -la /proc/52993/fd/ ; sample 52993 1 2>&1)",
       "Bash(lsof:*)",
       "Bash(sample:*)",
-      "Bash(ps:*)"
+      "Bash(ps:*)",
+      "Bash(# Check if there''s a log file for this run find /Users/ivy/.openclaw -name \"\"*.log\"\" -newer /Users/ivy/.openclaw/runtime/translation/state.sqlite -type f)",
+      "Bash(find:*)",
+      "Bash(head:*)"
     ]
   }
 }

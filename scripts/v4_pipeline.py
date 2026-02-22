@@ -922,10 +922,7 @@ def run_job_pipeline(
                 if validation_results:
                     # Generate markdown report
                     generator = ValidationReportGenerator()
-                    report = generator.generate_markdown(
-                        list(validation_results.values()),
-                        job_id=job_id,
-                    )
+                    report = generator.generate_markdown(list(validation_results.values()))
 
                     # Write to .system directory
                     system_dir = review_dir / ".system"
