@@ -232,8 +232,11 @@ GLM_GENERATOR_AGENT = os.getenv("OPENCLAW_GLM_GENERATOR_AGENT", GLM_AGENT)
 GLM_API_KEY = os.getenv("GLM_API_KEY", "")
 GLM_API_BASE_URL = os.getenv("GLM_API_BASE_URL", "https://open.bigmodel.cn/api/paas/v4")
 GLM_MODEL = os.getenv("OPENCLAW_GLM_MODEL", "zai/glm-5")
-KIMI_CODING_MODEL = os.getenv("OPENCLAW_KIMI_CODING_MODEL", "kimi-coding/k2p5")
-KIMI_CODING_API_BASE_URL = os.getenv("OPENCLAW_KIMI_CODING_BASE_URL", "https://api.moonshot.cn/v1")
+KIMI_CODING_MODEL = os.getenv("OPENCLAW_KIMI_CODING_MODEL", os.getenv("ANTHROPIC_MODEL", "kimi-coding/k2p5"))
+KIMI_CODING_API_BASE_URL = os.getenv(
+    "OPENCLAW_KIMI_CODING_BASE_URL",
+    os.getenv("ANTHROPIC_BASE_URL", "https://api.kimi.com/coding/v1"),
+)
 
 
 def _glm_enabled() -> bool:
@@ -1334,6 +1337,172 @@ def _compact_previous_draft_for_prompt(previous_payload: dict[str, Any]) -> tupl
     return out, changed
 
 
+def _flatten_xlsx_prompt_rows(context_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Flatten xlsx_sources into canonical row dicts for batch planning."""
+    preserve = context_payload.get("format_preserve")
+    if not isinstance(preserve, dict):
+        return []
+    sources = preserve.get("xlsx_sources")
+    if not isinstance(sources, list):
+        return []
+
+    rows: list[dict[str, Any]] = []
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        file_name = str(src.get("file") or "").strip()
+        path = str(src.get("path") or "").strip()
+        meta = src.get("meta") if isinstance(src.get("meta"), dict) else {}
+        units = src.get("cell_units")
+        if isinstance(units, list):
+            for unit in units:
+                if not isinstance(unit, dict):
+                    continue
+                sheet = str(unit.get("sheet") or "").strip()
+                cell = str(unit.get("cell") or "").strip().upper()
+                text = str(unit.get("text") or "")
+                if not sheet or not cell:
+                    continue
+                row_file = str(unit.get("file") or file_name).strip()
+                rows.append(
+                    {
+                        "file": row_file,
+                        "path": path,
+                        "meta": meta,
+                        "sheet": sheet,
+                        "cell": cell,
+                        "text": text,
+                    }
+                )
+            continue
+
+        data_rows = src.get("rows")
+        if isinstance(data_rows, list):
+            for row in data_rows:
+                if isinstance(row, list) and len(row) >= 3:
+                    sheet = str(row[0] or "").strip()
+                    cell = str(row[1] or "").strip().upper()
+                    text = str(row[2] or "")
+                elif isinstance(row, dict):
+                    sheet = str(row.get("sheet") or "").strip()
+                    cell = str(row.get("cell") or "").strip().upper()
+                    text = str(row.get("text") or "")
+                else:
+                    continue
+                if not sheet or not cell:
+                    continue
+                rows.append(
+                    {
+                        "file": file_name,
+                        "path": path,
+                        "meta": meta,
+                        "sheet": sheet,
+                        "cell": cell,
+                        "text": text,
+                    }
+                )
+    return rows
+
+
+def _group_xlsx_rows_as_sources(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        file_name = str(row.get("file") or "").strip()
+        if not file_name:
+            continue
+        if file_name not in grouped:
+            grouped[file_name] = {
+                "file": file_name,
+                "path": str(row.get("path") or "").strip(),
+                "meta": row.get("meta") if isinstance(row.get("meta"), dict) else {},
+                "rows": [],
+            }
+            order.append(file_name)
+        grouped[file_name]["rows"].append(
+            [
+                str(row.get("sheet") or "").strip(),
+                str(row.get("cell") or "").strip().upper(),
+                str(row.get("text") or ""),
+            ]
+        )
+    out: list[dict[str, Any]] = []
+    for file_name in order:
+        src = grouped[file_name]
+        if src.get("rows"):
+            out.append(src)
+    return out
+
+
+def _chunk_xlsx_rows_for_translation(
+    rows: list[dict[str, Any]],
+    *,
+    max_cells: int,
+    max_source_chars: int,
+) -> list[list[dict[str, Any]]]:
+    if not rows:
+        return []
+    cell_cap = max(1, int(max_cells))
+    char_cap = max(200, int(max_source_chars))
+    chunks: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    current_chars = 0
+    for row in rows:
+        text_len = len(str(row.get("text") or ""))
+        if current and (len(current) >= cell_cap or current_chars + text_len > char_cap):
+            chunks.append(current)
+            current = []
+            current_chars = 0
+        current.append(row)
+        current_chars += text_len
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _xlsx_batch_key_set(rows: list[dict[str, Any]]) -> set[tuple[str, str, str]]:
+    keys: set[tuple[str, str, str]] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        file_name = str(row.get("file") or "").strip()
+        sheet = str(row.get("sheet") or "").strip()
+        cell = str(row.get("cell") or "").strip().upper()
+        if file_name and sheet and cell:
+            keys.add(_normalize_xlsx_key(file_name, sheet, cell))
+    return keys
+
+
+def _filter_xlsx_map_for_keys(entries: Any, keys: set[tuple[str, str, str]]) -> list[dict[str, Any]]:
+    if not isinstance(entries, list) or not keys:
+        return []
+    out: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for item in entries:
+        if not isinstance(item, dict):
+            continue
+        file_name = str(item.get("file") or "").strip()
+        sheet = str(item.get("sheet") or "").strip()
+        cell = str(item.get("cell") or "").strip().upper()
+        if not (file_name and sheet and cell):
+            continue
+        key = _normalize_xlsx_key(file_name, sheet, cell)
+        if key not in keys or key in seen:
+            continue
+        out.append(
+            {
+                "file": file_name,
+                "sheet": sheet,
+                "cell": cell,
+                "text": str(item.get("text") or ""),
+            }
+        )
+        seen.add(key)
+    return out
+
+
 LANGUAGE_ALIASES: dict[str, str] = {
     "ar": "ar",
     "arabic": "ar",
@@ -2084,7 +2253,6 @@ def _codex_generate(context: dict[str, Any], previous_draft: dict[str, Any] | No
     task_type = str((context.get("task_intent") or {}).get("task_type", "LOW_CONTEXT_TASK"))
     tool_instructions = TASK_TOOL_INSTRUCTIONS.get(task_type, TASK_TOOL_INSTRUCTIONS["LOW_CONTEXT_TASK"])
 
-    # Build revision context section for REVISION_UPDATE tasks
     revision_context_section = ""
     if task_type == "REVISION_UPDATE" and context.get("revision_context_prompt"):
         revision_context_section = f"""
@@ -2100,12 +2268,25 @@ PRESERVED_TEXT_MAP (copy these texts EXACTLY for the corresponding unit IDs):
         context_payload: dict[str, Any],
         previous_payload: dict[str, Any] | None,
         revision_section: str,
+        local_findings: list[str],
+        xlsx_batch_mode: bool = False,
+        xlsx_batch_hint: str = "",
     ) -> str:
+        batch_rules = ""
+        if xlsx_batch_mode:
+            batch_rules = f"""
+- This is XLSX BATCH MODE. Translate ONLY the cells present in this batch payload.
+- You MUST return xlsx_translation_map for every cell in this batch; do not skip any cell.
+- Return JSON only with complete per-cell translations; no summarization.
+- If you detect a source cell itself is truncated/incomplete, append {SOURCE_TRUNCATED_MARKER} at the end of that cell's translation.
+- XLSX batch hint: {xlsx_batch_hint}
+"""
+
         return f"""
 You are Codex translator. Work on this translation job and return strict JSON only.
 
 Round: {round_index}
-Previous unresolved findings: {json.dumps(findings, ensure_ascii=False)}
+Previous unresolved findings: {json.dumps(local_findings, ensure_ascii=False)}
 {revision_section}
 Execution context:
 {json.dumps(context_payload, ensure_ascii=False)}
@@ -2139,6 +2320,7 @@ Rules:
   Compare your translation against the source: if the source has 5 sentences, your translation must have 5 sentences.
   A translation that only covers the first half of the source is WRONG and will be rejected.
   If you cannot fit all cells completely, translate FEWER cells but translate each one FULLY.
+{batch_rules}
 - If execution_context.glossary_enforcer.terms is present, you MUST apply those term mappings strictly (Arabic => English).
   For every unit/cell whose source text contains a glossary Arabic term, the corresponding translated text MUST contain the required English translation.
   Never append standalone glossary labels at the end (e.g., "... Artificial Intelligence (AI)").
@@ -2150,271 +2332,448 @@ Rules:
 - JSON only.
 """.strip()
 
-    context_for_prompt = copy.deepcopy(context)
-    previous_for_prompt = copy.deepcopy(previous_draft or {})
-    prompt_max_bytes = OPENCLAW_AGENT_PROMPT_MAX_BYTES
+    def _execute_prompt(prompt: str) -> dict[str, Any]:
+        call = _agent_call(CODEX_AGENT, prompt)
+        raw_text = str(call.get("text") or call.get("stdout") or call.get("stderr") or "")
+        if call.get("ok") and _looks_like_provider_schema_error(raw_text):
+            call = {
+                "ok": False,
+                "error": "agent_provider_schema_rejected",
+                "detail": raw_text[:2000],
+                "raw_text": raw_text,
+            }
 
-    # --- Output-size safety cap for SPREADSHEET_TRANSLATION ---
-    # Estimate output tokens from source text volume; cap rows to avoid model output truncation.
-    # Models tend to compress/truncate individual cell translations when too many cells are present.
-    # Rough heuristic: 1 source char ≈ 1.3 output chars (AR→EN), 3.5 chars ≈ 1 token, plus JSON overhead.
-    max_output_tokens = int(os.getenv("OPENCLAW_XLSX_MAX_OUTPUT_TOKENS", "4000"))
-    if task_type == "SPREADSHEET_TRANSLATION":
-        total_src_chars = _estimate_xlsx_source_chars(context_for_prompt)
-        estimated_output_tokens = int(total_src_chars * 1.3 / 3.5) + 500  # translation + JSON overhead
-        if estimated_output_tokens > max_output_tokens and total_src_chars > 0:
-            # Calculate how many chars we can afford
-            affordable_chars = int((max_output_tokens - 500) * 3.5 / 1.3)
-            cap_ratio = max(0.1, affordable_chars / total_src_chars)
-            total_rows = _count_xlsx_prompt_rows(context_for_prompt)
-            target_rows = max(1, int(total_rows * cap_ratio))
-            if target_rows < total_rows:
-                kept = _cap_xlsx_prompt_rows(context_for_prompt, max_rows=target_rows)
-                log.info(
-                    "output_cap: estimated_output_tokens=%d > max=%d, capped rows %d→%d (src_chars=%d)",
-                    estimated_output_tokens, max_output_tokens, total_rows, kept, total_src_chars,
+        if not call.get("ok"):
+            fallback_errors: dict[str, str] = {}
+
+            if CODEX_FALLBACK_AGENT and CODEX_FALLBACK_AGENT != CODEX_AGENT:
+                fallback_call = _agent_call(CODEX_FALLBACK_AGENT, prompt)
+                fallback_text = str(
+                    fallback_call.get("text") or fallback_call.get("stdout") or fallback_call.get("stderr") or ""
+                )
+                if fallback_call.get("ok") and _looks_like_provider_schema_error(fallback_text):
+                    fallback_call = {
+                        "ok": False,
+                        "error": "agent_provider_schema_rejected",
+                        "detail": fallback_text[:2000],
+                        "raw_text": fallback_text,
+                    }
+                if fallback_call.get("ok"):
+                    call = fallback_call
+                else:
+                    fallback_errors["agent"] = str(
+                        fallback_call.get("error") or f"agent_call_failed:{CODEX_FALLBACK_AGENT}"
+                    )
+
+            if not call.get("ok") and _env_flag("OPENCLAW_GLM_DIRECT_FALLBACK_ENABLED", "1"):
+                glm_call = _glm_direct_api_call(prompt)
+                if glm_call.get("ok"):
+                    call = glm_call
+                else:
+                    fallback_errors["glm"] = str(glm_call.get("error") or "glm_direct_failed")
+
+            if not call.get("ok") and _env_flag("OPENCLAW_KIMI_CODING_DIRECT_FALLBACK_ENABLED", "1"):
+                kimi_call = _kimi_coding_direct_api_call(prompt)
+                if kimi_call.get("ok"):
+                    call = kimi_call
+                else:
+                    fallback_errors["kimi_coding"] = str(kimi_call.get("error") or "kimi_coding_direct_failed")
+
+            if not call.get("ok"):
+                detail = dict(call)
+                if fallback_errors:
+                    detail["fallback_errors"] = fallback_errors
+                return {"ok": False, "error": call.get("error"), "detail": detail, "raw_text": raw_text}
+
+        parse_error: str | None = None
+        try:
+            parsed = _extract_json_from_text(str(call.get("text", "")))
+        except Exception as exc:
+            parse_error = str(exc)
+            parsed = None
+
+        if parsed is None and _env_flag("OPENCLAW_GLM_DIRECT_FALLBACK_ENABLED", "1"):
+            glm_call = _glm_direct_api_call(prompt)
+            if glm_call.get("ok"):
+                try:
+                    parsed = _extract_json_from_text(str(glm_call.get("text", "")))
+                    call = glm_call
+                except Exception as glm_exc:
+                    parse_error = (
+                        f"{parse_error}; glm_direct_parse_failed:{glm_exc}"
+                        if parse_error
+                        else f"glm_direct_parse_failed:{glm_exc}"
+                    )
+            else:
+                glm_err = str(glm_call.get("error") or "glm_direct_failed")
+                parse_error = f"{parse_error}; glm_direct_failed:{glm_err}" if parse_error else f"glm_direct_failed:{glm_err}"
+
+        if parsed is None and _env_flag("OPENCLAW_KIMI_CODING_DIRECT_FALLBACK_ENABLED", "1"):
+            kimi_call = _kimi_coding_direct_api_call(prompt)
+            if kimi_call.get("ok"):
+                try:
+                    parsed = _extract_json_from_text(str(kimi_call.get("text", "")))
+                    call = kimi_call
+                except Exception as kimi_exc:
+                    parse_error = (
+                        f"{parse_error}; kimi_coding_direct_parse_failed:{kimi_exc}"
+                        if parse_error
+                        else f"kimi_coding_direct_parse_failed:{kimi_exc}"
+                    )
+            else:
+                kimi_err = str(kimi_call.get("error") or "kimi_coding_direct_failed")
+                parse_error = (
+                    f"{parse_error}; kimi_coding_direct_failed:{kimi_err}"
+                    if parse_error
+                    else f"kimi_coding_direct_failed:{kimi_err}"
                 )
 
-    prompt = _render_prompt(
-        context_payload=context_for_prompt,
-        previous_payload=previous_for_prompt,
-        revision_section=revision_context_section,
-    )
-    prompt_bytes = len(prompt.encode("utf-8"))
-    compactions: list[str] = []
+        if parsed is None:
+            return {
+                "ok": False,
+                "error": "codex_json_parse_failed",
+                "detail": parse_error or "invalid_json_payload",
+                "raw_text": call.get("text", ""),
+            }
 
-    if prompt_bytes > prompt_max_bytes:
-        context_for_prompt["knowledge_context"] = []
-        context_for_prompt["cross_job_memories"] = []
-        compactions.append("drop_knowledge_context")
-        prompt = _render_prompt(
-            context_payload=context_for_prompt,
-            previous_payload=previous_for_prompt,
-            revision_section=revision_context_section,
-        )
-        prompt_bytes = len(prompt.encode("utf-8"))
+        call_meta = call.get("meta") if isinstance(call.get("meta"), dict) else {}
+        if isinstance(call, dict) and call.get("agent_id"):
+            call_meta = {"agent_id": str(call.get("agent_id") or ""), **call_meta}
+        if isinstance(call, dict) and call.get("source") == "direct_api_kimi_coding":
+            call_meta = {
+                "agent_id": "direct_api_kimi_coding",
+                "provider": "kimi-coding",
+                "model": str(call.get("model") or KIMI_CODING_MODEL or "kimi-coding/k2p5"),
+                **call_meta,
+            }
+        if isinstance(call, dict) and call.get("source") == "direct_api":
+            call_meta = {
+                "agent_id": "direct_api_glm",
+                "provider": str(GLM_MODEL or "").split("/", 1)[0] if "/" in str(GLM_MODEL or "") else "zai",
+                "model": str(GLM_MODEL or "zai/glm-5"),
+                **call_meta,
+            }
 
-    if prompt_bytes > prompt_max_bytes and task_type == "SPREADSHEET_TRANSLATION":
-        trimmed_cells = _trim_xlsx_prompt_text(
-            context_for_prompt,
-            max_chars_per_cell=OPENCLAW_XLSX_PROMPT_TEXT_MAX_CHARS,
-        )
-        if trimmed_cells > 0:
-            compactions.append(f"trim_xlsx_text:{trimmed_cells}")
-            prompt = _render_prompt(
-                context_payload=context_for_prompt,
-                previous_payload=previous_for_prompt,
-                revision_section=revision_context_section,
-            )
-            prompt_bytes = len(prompt.encode("utf-8"))
-
-    if prompt_bytes > prompt_max_bytes and task_type == "SPREADSHEET_TRANSLATION":
-        compact_stats = _compact_xlsx_prompt_payload(
-            context_for_prompt,
-            previous_payload=previous_for_prompt,
-        )
-        if compact_stats.get("changed"):
-            compactions.append(
-                "compact_xlsx_rows:"
-                f"{int(compact_stats.get('kept_rows') or 0)}/{int(compact_stats.get('total_rows') or 0)}"
-            )
-            prompt = _render_prompt(
-                context_payload=context_for_prompt,
-                previous_payload=previous_for_prompt,
-                revision_section=revision_context_section,
-            )
-            prompt_bytes = len(prompt.encode("utf-8"))
-
-    if prompt_bytes > prompt_max_bytes and task_type == "SPREADSHEET_TRANSLATION":
-        total_rows = _count_xlsx_prompt_rows(context_for_prompt)
-        shrink_round = 0
-        while prompt_bytes > prompt_max_bytes and total_rows > 1 and shrink_round < 8:
-            target_rows = max(1, int(total_rows * 0.7))
-            kept = _cap_xlsx_prompt_rows(context_for_prompt, max_rows=target_rows)
-            compactions.append(f"cap_xlsx_rows:{kept}/{total_rows}")
-            prompt = _render_prompt(
-                context_payload=context_for_prompt,
-                previous_payload=previous_for_prompt,
-                revision_section=revision_context_section,
-            )
-            prompt_bytes = len(prompt.encode("utf-8"))
-            total_rows = _count_xlsx_prompt_rows(context_for_prompt)
-            shrink_round += 1
-
-    if prompt_bytes > prompt_max_bytes and previous_for_prompt:
-        previous_for_prompt, changed = _compact_previous_draft_for_prompt(previous_for_prompt)
-        if changed:
-            compactions.append("compact_previous_draft")
-            prompt = _render_prompt(
-                context_payload=context_for_prompt,
-                previous_payload=previous_for_prompt,
-                revision_section=revision_context_section,
-            )
-            prompt_bytes = len(prompt.encode("utf-8"))
-
-    if compactions:
-        context_for_prompt["prompt_compaction"] = {
-            "applied": compactions,
-            "max_bytes": prompt_max_bytes,
+        return {
+            "ok": True,
+            "data": {
+                "final_text": str(parsed.get("final_text") or parsed.get("draft_a_text") or parsed.get("draft_b_text") or ""),
+                "final_reflow_text": str(
+                    parsed.get("final_reflow_text")
+                    or parsed.get("draft_b_text")
+                    or parsed.get("final_text")
+                    or parsed.get("draft_a_text")
+                    or ""
+                ),
+                "docx_translation_map": parsed.get("docx_translation_map")
+                or parsed.get("docx_translation_blocks")
+                or parsed.get("docx_table_cells")
+                or [],
+                "xlsx_translation_map": parsed.get("xlsx_translation_map") or [],
+                "review_brief_points": [str(x) for x in (parsed.get("review_brief_points") or [])],
+                "change_log_points": [str(x) for x in (parsed.get("change_log_points") or [])],
+                "resolved": [str(x) for x in (parsed.get("resolved") or [])],
+                "unresolved": [str(x) for x in (parsed.get("unresolved") or [])],
+                "codex_pass": bool(parsed.get("codex_pass")),
+                "reasoning_summary": str(parsed.get("reasoning_summary") or ""),
+            },
+            "raw": parsed,
+            "call_meta": call_meta,
         }
+
+    def _run_single_generation(
+        *,
+        context_payload: dict[str, Any],
+        previous_payload: dict[str, Any],
+        local_findings: list[str],
+        xlsx_batch_mode: bool = False,
+        xlsx_batch_hint: str = "",
+    ) -> dict[str, Any]:
+        prompt_max_bytes = OPENCLAW_AGENT_PROMPT_MAX_BYTES
+        if task_type == "SPREADSHEET_TRANSLATION":
+            safe_spreadsheet_max = max(120000, int(os.getenv("OPENCLAW_XLSX_PROMPT_SAFE_MAX_BYTES", "700000")))
+            prompt_max_bytes = min(prompt_max_bytes, safe_spreadsheet_max)
+
         prompt = _render_prompt(
-            context_payload=context_for_prompt,
-            previous_payload=previous_for_prompt,
+            context_payload=context_payload,
+            previous_payload=previous_payload,
             revision_section=revision_context_section,
+            local_findings=local_findings,
+            xlsx_batch_mode=xlsx_batch_mode,
+            xlsx_batch_hint=xlsx_batch_hint,
         )
         prompt_bytes = len(prompt.encode("utf-8"))
+        compactions: list[str] = []
 
-    if prompt_bytes > prompt_max_bytes:
+        if prompt_bytes > prompt_max_bytes:
+            context_payload["knowledge_context"] = []
+            context_payload["cross_job_memories"] = []
+            compactions.append("drop_knowledge_context")
+            prompt = _render_prompt(
+                context_payload=context_payload,
+                previous_payload=previous_payload,
+                revision_section=revision_context_section,
+                local_findings=local_findings,
+                xlsx_batch_mode=xlsx_batch_mode,
+                xlsx_batch_hint=xlsx_batch_hint,
+            )
+            prompt_bytes = len(prompt.encode("utf-8"))
+
+        if prompt_bytes > prompt_max_bytes and task_type == "SPREADSHEET_TRANSLATION":
+            trimmed_cells = _trim_xlsx_prompt_text(
+                context_payload,
+                max_chars_per_cell=OPENCLAW_XLSX_PROMPT_TEXT_MAX_CHARS,
+            )
+            if trimmed_cells > 0:
+                compactions.append(f"trim_xlsx_text:{trimmed_cells}")
+                prompt = _render_prompt(
+                    context_payload=context_payload,
+                    previous_payload=previous_payload,
+                    revision_section=revision_context_section,
+                    local_findings=local_findings,
+                    xlsx_batch_mode=xlsx_batch_mode,
+                    xlsx_batch_hint=xlsx_batch_hint,
+                )
+                prompt_bytes = len(prompt.encode("utf-8"))
+
+        if prompt_bytes > prompt_max_bytes and task_type == "SPREADSHEET_TRANSLATION":
+            compact_stats = _compact_xlsx_prompt_payload(
+                context_payload,
+                previous_payload=previous_payload,
+            )
+            if compact_stats.get("changed"):
+                compactions.append(
+                    "compact_xlsx_rows:"
+                    f"{int(compact_stats.get('kept_rows') or 0)}/{int(compact_stats.get('total_rows') or 0)}"
+                )
+                prompt = _render_prompt(
+                    context_payload=context_payload,
+                    previous_payload=previous_payload,
+                    revision_section=revision_context_section,
+                    local_findings=local_findings,
+                    xlsx_batch_mode=xlsx_batch_mode,
+                    xlsx_batch_hint=xlsx_batch_hint,
+                )
+                prompt_bytes = len(prompt.encode("utf-8"))
+
+        if prompt_bytes > prompt_max_bytes and task_type == "SPREADSHEET_TRANSLATION":
+            total_rows = _count_xlsx_prompt_rows(context_payload)
+            shrink_round = 0
+            while prompt_bytes > prompt_max_bytes and total_rows > 1 and shrink_round < 8:
+                target_rows = max(1, int(total_rows * 0.7))
+                kept = _cap_xlsx_prompt_rows(context_payload, max_rows=target_rows)
+                compactions.append(f"cap_xlsx_rows:{kept}/{total_rows}")
+                prompt = _render_prompt(
+                    context_payload=context_payload,
+                    previous_payload=previous_payload,
+                    revision_section=revision_context_section,
+                    local_findings=local_findings,
+                    xlsx_batch_mode=xlsx_batch_mode,
+                    xlsx_batch_hint=xlsx_batch_hint,
+                )
+                prompt_bytes = len(prompt.encode("utf-8"))
+                total_rows = _count_xlsx_prompt_rows(context_payload)
+                shrink_round += 1
+
+        if prompt_bytes > prompt_max_bytes and previous_payload:
+            compact_prev, changed = _compact_previous_draft_for_prompt(previous_payload)
+            if changed:
+                previous_payload = compact_prev
+                compactions.append("compact_previous_draft")
+                prompt = _render_prompt(
+                    context_payload=context_payload,
+                    previous_payload=previous_payload,
+                    revision_section=revision_context_section,
+                    local_findings=local_findings,
+                    xlsx_batch_mode=xlsx_batch_mode,
+                    xlsx_batch_hint=xlsx_batch_hint,
+                )
+                prompt_bytes = len(prompt.encode("utf-8"))
+
+        if compactions:
+            context_payload["prompt_compaction"] = {
+                "applied": compactions,
+                "max_bytes": prompt_max_bytes,
+            }
+            prompt = _render_prompt(
+                context_payload=context_payload,
+                previous_payload=previous_payload,
+                revision_section=revision_context_section,
+                local_findings=local_findings,
+                xlsx_batch_mode=xlsx_batch_mode,
+                xlsx_batch_hint=xlsx_batch_hint,
+            )
+            prompt_bytes = len(prompt.encode("utf-8"))
+
+        if prompt_bytes > prompt_max_bytes:
+            return {
+                "ok": False,
+                "error": "prompt_too_large",
+                "detail": {
+                    "bytes": prompt_bytes,
+                    "max_bytes": prompt_max_bytes,
+                    "configured_agent_message_max_bytes": OPENCLAW_AGENT_MESSAGE_MAX_BYTES,
+                    "provider_total_limit_bytes": OPENCLAW_PROVIDER_MESSAGE_LIMIT_BYTES,
+                    "reserved_overhead_bytes": OPENCLAW_AGENT_MESSAGE_OVERHEAD_BYTES,
+                    "compactions": compactions,
+                },
+                "raw_text": "",
+            }
+
+        return _execute_prompt(prompt)
+
+    context_for_prompt = copy.deepcopy(context)
+    previous_for_prompt = copy.deepcopy(previous_draft or {})
+
+    if task_type != "SPREADSHEET_TRANSLATION":
+        return _run_single_generation(
+            context_payload=context_for_prompt,
+            previous_payload=previous_for_prompt,
+            local_findings=list(findings or []),
+        )
+
+    # Quality-first spreadsheet path: split into small batches and backfill misses.
+    all_rows = _flatten_xlsx_prompt_rows(context_for_prompt)
+    if not all_rows:
+        return _run_single_generation(
+            context_payload=context_for_prompt,
+            previous_payload=previous_for_prompt,
+            local_findings=list(findings or []),
+        )
+
+    batch_max_cells = max(1, int(os.getenv("OPENCLAW_XLSX_BATCH_MAX_CELLS", "6")))
+    batch_max_chars = max(200, int(os.getenv("OPENCLAW_XLSX_BATCH_MAX_SOURCE_CHARS", "8000")))
+    batch_retry = max(0, int(os.getenv("OPENCLAW_XLSX_BATCH_RETRY", "1")))
+    chunks = _chunk_xlsx_rows_for_translation(
+        all_rows,
+        max_cells=batch_max_cells,
+        max_source_chars=batch_max_chars,
+    )
+
+    merged_xlsx_map: Any = previous_for_prompt.get("xlsx_translation_map") if isinstance(previous_for_prompt, dict) else []
+    merged_docx_map: Any = previous_for_prompt.get("docx_translation_map") if isinstance(previous_for_prompt, dict) else []
+    aggregate_data: dict[str, Any] = {
+        "final_text": "",
+        "final_reflow_text": "",
+        "docx_translation_map": merged_docx_map if isinstance(merged_docx_map, list) else [],
+        "xlsx_translation_map": merged_xlsx_map if isinstance(merged_xlsx_map, list) else [],
+        "review_brief_points": [],
+        "change_log_points": [],
+        "resolved": [],
+        "unresolved": [],
+        "codex_pass": True,
+        "reasoning_summary": "",
+    }
+    first_call_meta: dict[str, Any] = {}
+    failed_batches: list[dict[str, Any]] = []
+    xlsx_files = sorted({str(row.get("file") or "").strip() for row in all_rows if str(row.get("file") or "").strip()})
+
+    for idx, chunk_rows in enumerate(chunks, start=1):
+        expected_keys = _xlsx_batch_key_set(chunk_rows)
+        batch_context = copy.deepcopy(context_for_prompt)
+        preserve = batch_context.get("format_preserve")
+        if not isinstance(preserve, dict):
+            preserve = {}
+            batch_context["format_preserve"] = preserve
+        preserve["xlsx_sources"] = _group_xlsx_rows_as_sources(chunk_rows)
+
+        batch_previous = copy.deepcopy(previous_for_prompt)
+        batch_previous["xlsx_translation_map"] = _filter_xlsx_map_for_keys(
+            aggregate_data.get("xlsx_translation_map"),
+            expected_keys,
+        )
+
+        attempt = 0
+        batch_result: dict[str, Any] | None = None
+        local_findings = list(findings or [])
+        batch_collected_map: Any = batch_previous.get("xlsx_translation_map") if isinstance(batch_previous, dict) else []
+        while attempt <= batch_retry:
+            attempt += 1
+            hint = f"batch={idx}/{len(chunks)} cells={len(chunk_rows)} attempt={attempt}"
+            batch_result = _run_single_generation(
+                context_payload=copy.deepcopy(batch_context),
+                previous_payload=copy.deepcopy(batch_previous),
+                local_findings=local_findings,
+                xlsx_batch_mode=True,
+                xlsx_batch_hint=hint,
+            )
+            if not batch_result.get("ok"):
+                continue
+            data = batch_result.get("data") if isinstance(batch_result.get("data"), dict) else {}
+            batch_collected_map = _merge_xlsx_translation_map(batch_collected_map, data.get("xlsx_translation_map"))
+            if isinstance(batch_collected_map, list):
+                data["xlsx_translation_map"] = batch_collected_map
+            got_keys = _normalize_xlsx_translation_map_keys(batch_collected_map, xlsx_files=xlsx_files)
+            missing = sorted(expected_keys - got_keys)
+            if not missing:
+                break
+            missing_sample = [{"file": f, "sheet": s, "cell": c} for (f, s, c) in missing[:50]]
+            local_findings = list(findings or []) + [
+                f"xlsx_missing_batch_cells:{json.dumps(missing_sample, ensure_ascii=False)}"
+            ]
+            batch_previous["xlsx_translation_map"] = batch_collected_map if isinstance(batch_collected_map, list) else []
+
+        if not batch_result or not batch_result.get("ok"):
+            failed_batches.append({"batch": idx, "error": str((batch_result or {}).get("error") or "batch_failed")})
+            continue
+
+        if not first_call_meta:
+            first_call_meta = batch_result.get("call_meta") if isinstance(batch_result.get("call_meta"), dict) else {}
+
+        data = batch_result.get("data") if isinstance(batch_result.get("data"), dict) else {}
+        aggregate_data["docx_translation_map"] = _merge_docx_translation_map(
+            aggregate_data.get("docx_translation_map"),
+            data.get("docx_translation_map"),
+        )
+        aggregate_data["xlsx_translation_map"] = _merge_xlsx_translation_map(
+            aggregate_data.get("xlsx_translation_map"),
+            data.get("xlsx_translation_map"),
+        )
+        aggregate_data["review_brief_points"] = sorted(
+            set([str(x) for x in (aggregate_data.get("review_brief_points") or [])] + [str(x) for x in (data.get("review_brief_points") or [])])
+        )
+        aggregate_data["change_log_points"] = sorted(
+            set([str(x) for x in (aggregate_data.get("change_log_points") or [])] + [str(x) for x in (data.get("change_log_points") or [])])
+        )
+        aggregate_data["resolved"] = sorted(
+            set([str(x) for x in (aggregate_data.get("resolved") or [])] + [str(x) for x in (data.get("resolved") or [])])
+        )
+        aggregate_data["unresolved"] = sorted(
+            set([str(x) for x in (aggregate_data.get("unresolved") or [])] + [str(x) for x in (data.get("unresolved") or [])])
+        )
+        aggregate_data["codex_pass"] = bool(aggregate_data.get("codex_pass")) and bool(data.get("codex_pass", True))
+        if not aggregate_data.get("final_text") and str(data.get("final_text") or "").strip():
+            aggregate_data["final_text"] = str(data.get("final_text") or "")
+        if not aggregate_data.get("final_reflow_text") and str(data.get("final_reflow_text") or "").strip():
+            aggregate_data["final_reflow_text"] = str(data.get("final_reflow_text") or "")
+        aggregate_data["reasoning_summary"] = str(data.get("reasoning_summary") or aggregate_data.get("reasoning_summary") or "")
+
+    expected_all_keys = _xlsx_batch_key_set(all_rows)
+    got_all_keys = _normalize_xlsx_translation_map_keys(aggregate_data.get("xlsx_translation_map"), xlsx_files=xlsx_files)
+    missing_all = sorted(expected_all_keys - got_all_keys)
+    if missing_all:
+        aggregate_data["unresolved"] = sorted(
+            set([str(x) for x in (aggregate_data.get("unresolved") or [])] + [f"xlsx_translation_map_incomplete:missing={len(missing_all)}"])
+        )
+        aggregate_data["codex_pass"] = False
+        failed_batches.append({"batch": "backfill", "missing_cells": len(missing_all)})
+
+    if failed_batches and not aggregate_data.get("reasoning_summary"):
+        aggregate_data["reasoning_summary"] = "Spreadsheet batch translation partially failed."
+
+    if not aggregate_data.get("xlsx_translation_map") and failed_batches:
         return {
             "ok": False,
-            "error": "prompt_too_large",
-            "detail": {
-                "bytes": prompt_bytes,
-                "max_bytes": prompt_max_bytes,
-                "configured_agent_message_max_bytes": OPENCLAW_AGENT_MESSAGE_MAX_BYTES,
-                "provider_total_limit_bytes": OPENCLAW_PROVIDER_MESSAGE_LIMIT_BYTES,
-                "reserved_overhead_bytes": OPENCLAW_AGENT_MESSAGE_OVERHEAD_BYTES,
-                "compactions": compactions,
-            },
+            "error": "xlsx_batch_generation_failed",
+            "detail": {"failed_batches": failed_batches},
             "raw_text": "",
         }
 
-    call = _agent_call(CODEX_AGENT, prompt)
-    raw_text = str(call.get("text") or call.get("stdout") or call.get("stderr") or "")
-    if call.get("ok") and _looks_like_provider_schema_error(raw_text):
-        call = {
-            "ok": False,
-            "error": "agent_provider_schema_rejected",
-            "detail": raw_text[:2000],
-            "raw_text": raw_text,
-        }
-
-    if not call.get("ok"):
-        fallback_errors: dict[str, str] = {}
-
-        if CODEX_FALLBACK_AGENT and CODEX_FALLBACK_AGENT != CODEX_AGENT:
-            fallback_call = _agent_call(CODEX_FALLBACK_AGENT, prompt)
-            fallback_text = str(fallback_call.get("text") or fallback_call.get("stdout") or fallback_call.get("stderr") or "")
-            if fallback_call.get("ok") and _looks_like_provider_schema_error(fallback_text):
-                fallback_call = {
-                    "ok": False,
-                    "error": "agent_provider_schema_rejected",
-                    "detail": fallback_text[:2000],
-                    "raw_text": fallback_text,
-                }
-            if fallback_call.get("ok"):
-                call = fallback_call
-            else:
-                fallback_errors["agent"] = str(
-                    fallback_call.get("error") or f"agent_call_failed:{CODEX_FALLBACK_AGENT}"
-                )
-
-        if not call.get("ok") and _env_flag("OPENCLAW_GLM_DIRECT_FALLBACK_ENABLED", "1"):
-            glm_call = _glm_direct_api_call(prompt)
-            if glm_call.get("ok"):
-                call = glm_call
-            else:
-                fallback_errors["glm"] = str(glm_call.get("error") or "glm_direct_failed")
-
-        if not call.get("ok") and _env_flag("OPENCLAW_KIMI_CODING_DIRECT_FALLBACK_ENABLED", "1"):
-            kimi_call = _kimi_coding_direct_api_call(prompt)
-            if kimi_call.get("ok"):
-                call = kimi_call
-            else:
-                fallback_errors["kimi_coding"] = str(kimi_call.get("error") or "kimi_coding_direct_failed")
-
-        if not call.get("ok"):
-            detail = dict(call)
-            if fallback_errors:
-                detail["fallback_errors"] = fallback_errors
-            return {"ok": False, "error": call.get("error"), "detail": detail, "raw_text": raw_text}
-
-    parse_error: str | None = None
-    try:
-        parsed = _extract_json_from_text(str(call.get("text", "")))
-    except Exception as exc:
-        parse_error = str(exc)
-        parsed = None
-
-    if parsed is None and _env_flag("OPENCLAW_GLM_DIRECT_FALLBACK_ENABLED", "1"):
-        glm_call = _glm_direct_api_call(prompt)
-        if glm_call.get("ok"):
-            try:
-                parsed = _extract_json_from_text(str(glm_call.get("text", "")))
-                call = glm_call
-            except Exception as glm_exc:
-                parse_error = f"{parse_error}; glm_direct_parse_failed:{glm_exc}" if parse_error else f"glm_direct_parse_failed:{glm_exc}"
-        else:
-            glm_err = str(glm_call.get("error") or "glm_direct_failed")
-            parse_error = f"{parse_error}; glm_direct_failed:{glm_err}" if parse_error else f"glm_direct_failed:{glm_err}"
-
-    if parsed is None and _env_flag("OPENCLAW_KIMI_CODING_DIRECT_FALLBACK_ENABLED", "1"):
-        kimi_call = _kimi_coding_direct_api_call(prompt)
-        if kimi_call.get("ok"):
-            try:
-                parsed = _extract_json_from_text(str(kimi_call.get("text", "")))
-                call = kimi_call
-            except Exception as kimi_exc:
-                parse_error = (
-                    f"{parse_error}; kimi_coding_direct_parse_failed:{kimi_exc}"
-                    if parse_error
-                    else f"kimi_coding_direct_parse_failed:{kimi_exc}"
-                )
-        else:
-            kimi_err = str(kimi_call.get("error") or "kimi_coding_direct_failed")
-            parse_error = (
-                f"{parse_error}; kimi_coding_direct_failed:{kimi_err}"
-                if parse_error
-                else f"kimi_coding_direct_failed:{kimi_err}"
-            )
-
-    if parsed is None:
-        return {
-            "ok": False,
-            "error": "codex_json_parse_failed",
-            "detail": parse_error or "invalid_json_payload",
-            "raw_text": call.get("text", ""),
-        }
-
-    call_meta = call.get("meta") if isinstance(call.get("meta"), dict) else {}
-    if isinstance(call, dict) and call.get("agent_id"):
-        call_meta = {"agent_id": str(call.get("agent_id") or ""), **call_meta}
-    if isinstance(call, dict) and call.get("source") == "direct_api_kimi_coding":
-        call_meta = {
-            "agent_id": "direct_api_kimi_coding",
-            "provider": "kimi-coding",
-            "model": str(call.get("model") or KIMI_CODING_MODEL or "kimi-coding/k2p5"),
-            **call_meta,
-        }
-    if isinstance(call, dict) and call.get("source") == "direct_api":
-        call_meta = {
-            "agent_id": "direct_api_glm",
-            "provider": str(GLM_MODEL or "").split("/", 1)[0] if "/" in str(GLM_MODEL or "") else "zai",
-            "model": str(GLM_MODEL or "zai/glm-5"),
-            **call_meta,
-        }
     return {
         "ok": True,
-        "data": {
-            "final_text": str(parsed.get("final_text") or parsed.get("draft_a_text") or parsed.get("draft_b_text") or ""),
-            "final_reflow_text": str(
-                parsed.get("final_reflow_text")
-                or parsed.get("draft_b_text")
-                or parsed.get("final_text")
-                or parsed.get("draft_a_text")
-                or ""
-            ),
-            "docx_translation_map": parsed.get("docx_translation_map") or parsed.get("docx_translation_blocks") or parsed.get("docx_table_cells") or [],
-            "xlsx_translation_map": parsed.get("xlsx_translation_map") or [],
-            "review_brief_points": [str(x) for x in (parsed.get("review_brief_points") or [])],
-            "change_log_points": [str(x) for x in (parsed.get("change_log_points") or [])],
-            "resolved": [str(x) for x in (parsed.get("resolved") or [])],
-            "unresolved": [str(x) for x in (parsed.get("unresolved") or [])],
-            "codex_pass": bool(parsed.get("codex_pass")),
-            "reasoning_summary": str(parsed.get("reasoning_summary") or ""),
-        },
-        "raw": parsed,
-        "call_meta": call_meta,
+        "data": aggregate_data,
+        "raw": {"batch_mode": True, "failed_batches": failed_batches},
+        "call_meta": first_call_meta,
     }
 
 
@@ -2596,11 +2955,17 @@ def _kimi_coding_direct_api_call(prompt: str) -> dict[str, Any]:
 
     model_key = str(KIMI_CODING_MODEL or "kimi-coding/k2p5").strip()
     model = model_key.rsplit("/", 1)[-1] if "/" in model_key else model_key
-    api_key = str(os.getenv("OPENCLAW_KIMI_CODING_API_KEY") or "").strip() or _read_openclaw_api_key("kimi-coding")
+    api_key = (
+        str(os.getenv("OPENCLAW_KIMI_CODING_API_KEY") or "").strip()
+        or str(os.getenv("ANTHROPIC_AUTH_TOKEN") or "").strip()
+        or _read_openclaw_api_key("kimi-coding")
+    )
     if not api_key:
         return {"ok": False, "error": "kimi_coding_api_key_not_set"}
 
     base_url = str(KIMI_CODING_API_BASE_URL or "").strip().rstrip("/")
+    if base_url.endswith("/coding"):
+        base_url = f"{base_url}/v1"
     url = f"{base_url}/chat/completions"
     body = json.dumps(
         {

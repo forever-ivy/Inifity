@@ -466,11 +466,13 @@ class OpenClawTranslationOrchestratorTest(unittest.TestCase):
             self.assertEqual(out["status"], "review_ready")
             self.assertTrue(out["double_pass"])
             qr = out.get("quality_report") or {}
-            meta2 = ((qr.get("preserve_coverage_by_round") or {}).get("2") or {}).get("meta") or {}
+            preserve_by_round = qr.get("preserve_coverage_by_round") or {}
+            last_round_key = str(max([int(k) for k in preserve_by_round.keys()] or [1]))
+            meta2 = (preserve_by_round.get(last_round_key) or {}).get("meta") or {}
             self.assertEqual(meta2.get("xlsx_expected"), 4)
             self.assertEqual(meta2.get("xlsx_got"), 4)
 
-            merged_selected = review / ".system" / "rounds" / "round_2" / "selected_output.json"
+            merged_selected = review / ".system" / "rounds" / f"round_{last_round_key}" / "selected_output.json"
             self.assertTrue(merged_selected.exists())
             merged = json.loads(merged_selected.read_text(encoding="utf-8"))
             self.assertEqual(len(merged.get("xlsx_translation_map") or []), 4)
@@ -837,6 +839,150 @@ class PromptCompactionHelpersTest(unittest.TestCase):
 
 
 class CodexGenerateFallbackTest(unittest.TestCase):
+    @patch("scripts.openclaw_translation_orchestrator._agent_call")
+    def test_codex_generate_spreadsheet_batches_and_merges(self, mocked_agent_call):
+        units = []
+        for idx in range(1, 9):
+            units.append({"file": "fd.xlsx", "sheet": "S1", "cell": f"A{idx}", "text": f"نص {idx}"})
+
+        batch1_map = [
+            {"file": "fd.xlsx", "sheet": "S1", "cell": f"A{idx}", "text": f"text {idx}"}
+            for idx in range(1, 7)
+        ]
+        batch2_map = [
+            {"file": "fd.xlsx", "sheet": "S1", "cell": f"A{idx}", "text": f"text {idx}"}
+            for idx in range(7, 9)
+        ]
+
+        mocked_agent_call.side_effect = [
+            _agent_ok(
+                {
+                    "final_text": "",
+                    "final_reflow_text": "",
+                    "docx_translation_map": [],
+                    "xlsx_translation_map": batch1_map,
+                    "review_brief_points": [],
+                    "change_log_points": [],
+                    "resolved": [],
+                    "unresolved": [],
+                    "codex_pass": True,
+                    "reasoning_summary": "batch1",
+                }
+            ),
+            _agent_ok(
+                {
+                    "final_text": "",
+                    "final_reflow_text": "",
+                    "docx_translation_map": [],
+                    "xlsx_translation_map": batch2_map,
+                    "review_brief_points": [],
+                    "change_log_points": [],
+                    "resolved": [],
+                    "unresolved": [],
+                    "codex_pass": True,
+                    "reasoning_summary": "batch2",
+                }
+            ),
+        ]
+
+        context = {
+            "task_intent": {"task_type": "SPREADSHEET_TRANSLATION"},
+            "subject": "Translate",
+            "message_text": "translate",
+            "candidate_files": [],
+            "format_preserve": {
+                "xlsx_sources": [
+                    {
+                        "file": "fd.xlsx",
+                        "cell_units": units,
+                    }
+                ]
+            },
+        }
+        with patch.dict(
+            os.environ,
+            {
+                "OPENCLAW_XLSX_BATCH_MAX_CELLS": "6",
+                "OPENCLAW_XLSX_BATCH_MAX_SOURCE_CHARS": "8000",
+                "OPENCLAW_XLSX_BATCH_RETRY": "1",
+                "OPENCLAW_GLM_DIRECT_FALLBACK_ENABLED": "0",
+                "OPENCLAW_KIMI_CODING_DIRECT_FALLBACK_ENABLED": "0",
+            },
+            clear=False,
+        ):
+            out = _codex_generate(context, None, [], 1)
+
+        self.assertTrue(out.get("ok"))
+        data = out.get("data") or {}
+        self.assertEqual(len(data.get("xlsx_translation_map") or []), 8)
+        self.assertEqual(mocked_agent_call.call_count, 2)
+
+    @patch("scripts.openclaw_translation_orchestrator._agent_call")
+    def test_codex_generate_spreadsheet_batch_retries_missing_cells(self, mocked_agent_call):
+        units = [{"file": "fd.xlsx", "sheet": "S1", "cell": f"A{idx}", "text": f"نص {idx}"} for idx in range(1, 5)]
+        missing_first = [
+            {"file": "fd.xlsx", "sheet": "S1", "cell": "A1", "text": "text 1"},
+            {"file": "fd.xlsx", "sheet": "S1", "cell": "A2", "text": "text 2"},
+            {"file": "fd.xlsx", "sheet": "S1", "cell": "A3", "text": "text 3"},
+        ]
+        full_retry = missing_first + [{"file": "fd.xlsx", "sheet": "S1", "cell": "A4", "text": "text 4"}]
+
+        mocked_agent_call.side_effect = [
+            _agent_ok(
+                {
+                    "final_text": "",
+                    "final_reflow_text": "",
+                    "docx_translation_map": [],
+                    "xlsx_translation_map": missing_first,
+                    "review_brief_points": [],
+                    "change_log_points": [],
+                    "resolved": [],
+                    "unresolved": [],
+                    "codex_pass": True,
+                    "reasoning_summary": "attempt1",
+                }
+            ),
+            _agent_ok(
+                {
+                    "final_text": "",
+                    "final_reflow_text": "",
+                    "docx_translation_map": [],
+                    "xlsx_translation_map": full_retry,
+                    "review_brief_points": [],
+                    "change_log_points": [],
+                    "resolved": [],
+                    "unresolved": [],
+                    "codex_pass": True,
+                    "reasoning_summary": "attempt2",
+                }
+            ),
+        ]
+
+        context = {
+            "task_intent": {"task_type": "SPREADSHEET_TRANSLATION"},
+            "subject": "Translate",
+            "message_text": "translate",
+            "candidate_files": [],
+            "format_preserve": {
+                "xlsx_sources": [{"file": "fd.xlsx", "cell_units": units}]
+            },
+        }
+        with patch.dict(
+            os.environ,
+            {
+                "OPENCLAW_XLSX_BATCH_MAX_CELLS": "6",
+                "OPENCLAW_XLSX_BATCH_RETRY": "1",
+                "OPENCLAW_GLM_DIRECT_FALLBACK_ENABLED": "0",
+                "OPENCLAW_KIMI_CODING_DIRECT_FALLBACK_ENABLED": "0",
+            },
+            clear=False,
+        ):
+            out = _codex_generate(context, None, [], 1)
+
+        self.assertTrue(out.get("ok"))
+        self.assertEqual(len((out.get("data") or {}).get("xlsx_translation_map") or []), 4)
+        self.assertEqual(mocked_agent_call.call_count, 2)
+
     @patch("scripts.openclaw_translation_orchestrator._kimi_coding_direct_api_call")
     @patch("scripts.openclaw_translation_orchestrator._agent_call")
     def test_codex_generate_uses_fallback_agent_on_request_too_large(self, mocked_agent_call, mocked_kimi_call):
