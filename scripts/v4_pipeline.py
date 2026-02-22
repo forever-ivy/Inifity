@@ -770,7 +770,10 @@ def run_job_pipeline(
         update_job_plan(
             conn,
             job_id=job_id,
-            status=plan.get("status", "planned"),
+            # Keep job status as running while the pipeline is executing.
+            # The plan-only classifier returns status="planned" on success, which
+            # would otherwise make `status` look stuck before round 1.
+            status="running",
             task_type=p.get("task_type", ""),
             confidence=float(p.get("confidence", 0.0)),
             estimated_minutes=int(p.get("estimated_minutes", 0)),
@@ -885,6 +888,18 @@ def run_job_pipeline(
         job_id=job_id,
         milestone="running",
         message=f"\U0001f680 Translating\n\U0001f4cb {_task_name}\n\u23f3 OpenClaw routing \u00b7 up to 3 rounds",
+        target=notify_target,
+        dry_run=dry_run_notify,
+    )
+    # Round 1 can take a while for spreadsheet jobs because generation runs in
+    # multiple batches before any round artifacts are written. Emit an explicit
+    # "round started" milestone so status does not look stuck.
+    notify_milestone(
+        paths=paths,
+        conn=conn,
+        job_id=job_id,
+        milestone="round_1_started",
+        message=f"\U0001f504 Round 1 started\n\U0001f4cb {_task_name}",
         target=notify_target,
         dry_run=dry_run_notify,
     )
