@@ -832,13 +832,14 @@ class PromptCompactionHelpersTest(unittest.TestCase):
                     "file": "a.xlsx",
                     "sheet": "S1",
                     "cell": "D19",
-                    "text": ("incomplete output " * 8) + "[SOURCE TRUNCATED]",
+                    "text": ("incomplete output " * 12) + "[SOURCE TRUNCATED]",
                 },
             ]
         }
         findings, meta = _validate_format_preserve_coverage(context, draft)
         self.assertEqual(findings, [])
-        self.assertIn(meta.get("xlsx_source_truncated_count"), (None, 0))
+        self.assertEqual(meta.get("xlsx_source_truncated_count"), 1)
+        self.assertEqual(meta.get("xlsx_source_truncated_marker_missing_count"), 0)
 
 
 class CodexGenerateFallbackTest(unittest.TestCase):

@@ -193,6 +193,8 @@ def build_status_card(
             detail_lines.append(f"\u23f1\ufe0f Heartbeat: {queue_hb_norm}")
         if queue_err_norm and queue_state_norm in {"failed", "canceled"}:
             detail_lines.append(f"\u26a0\ufe0f Queue error: {queue_err_norm}")
+        if queue_err_norm and queue_state_norm == "queued" and queue_err_norm.startswith("deferred:"):
+            detail_lines.append(f"\u23f8\ufe0f Deferred: {queue_err_norm}")
 
     last_ms = str(last_milestone or "").strip()
     last_at = str(last_milestone_at or "").strip()

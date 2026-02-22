@@ -283,6 +283,7 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             notify_target TEXT DEFAULT '',
             created_by_sender TEXT DEFAULT '',
             enqueued_at TEXT NOT NULL,
+            available_at TEXT DEFAULT '',
             started_at TEXT DEFAULT '',
             finished_at TEXT DEFAULT '',
             heartbeat_at TEXT DEFAULT '',
@@ -337,6 +338,7 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             pass
 
     for ddl in [
+        "ALTER TABLE job_run_queue ADD COLUMN available_at TEXT DEFAULT ''",
         "ALTER TABLE job_run_queue ADD COLUMN cancel_requested_at TEXT DEFAULT ''",
         "ALTER TABLE job_run_queue ADD COLUMN cancel_requested_by TEXT DEFAULT ''",
         "ALTER TABLE job_run_queue ADD COLUMN cancel_reason TEXT DEFAULT ''",
@@ -786,10 +788,10 @@ def enqueue_run_job(
             """
             INSERT INTO job_run_queue(
               job_id, state, attempt, notify_target, created_by_sender,
-              enqueued_at, heartbeat_at
-            ) VALUES(?,?,?,?,?,?,?)
+              enqueued_at, available_at, heartbeat_at
+            ) VALUES(?,?,?,?,?,?,?,?)
             """,
-            (job_id_norm, "queued", 0, notify_norm, sender_norm, now, now),
+            (job_id_norm, "queued", 0, notify_norm, sender_norm, now, now, now),
         )
         conn.commit()
     except sqlite3.IntegrityError:
@@ -975,9 +977,12 @@ def claim_next_queued(conn: sqlite3.Connection, *, worker_id: str) -> dict[str, 
             SELECT id, job_id
             FROM job_run_queue
             WHERE state='queued'
+              AND (available_at='' OR available_at<=?)
             ORDER BY enqueued_at ASC, id ASC
             LIMIT 1
             """
+        ,
+            (now,),
         ).fetchone()
         if not row:
             conn.execute("COMMIT")
@@ -1079,7 +1084,59 @@ def finish_queue_item(
                 tag = f"queue_{state_norm}:{token}"
                 if tag not in errors:
                     errors.append(tag)
-                update_job_status(conn, job_id=job_id, status=("canceled" if state_norm == "canceled" else "failed"), errors=errors)
+                    update_job_status(conn, job_id=job_id, status=("canceled" if state_norm == "canceled" else "failed"), errors=errors)
+
+
+def defer_queue_item(
+    conn: sqlite3.Connection,
+    *,
+    queue_id: int,
+    worker_id: str,
+    delay_seconds: int,
+    reason: str = "cooldown",
+) -> None:
+    """Return a running queue item back to queued with a future available_at."""
+    now_dt = datetime.now(UTC)
+    now_iso = now_dt.isoformat()
+    delay_s = max(30, int(delay_seconds))
+    available_at_iso = (now_dt.timestamp() + delay_s)
+    available_at = datetime.fromtimestamp(available_at_iso, UTC).isoformat()
+    err = f"deferred:{(reason or 'cooldown').strip()}:retry_in={delay_s}s"
+    conn.execute(
+        """
+        UPDATE job_run_queue
+        SET state='queued',
+            worker_id='',
+            started_at='',
+            heartbeat_at=?,
+            available_at=?,
+            last_error=?,
+            pipeline_pid=0,
+            pipeline_pgid=0
+        WHERE id=?
+          AND worker_id=?
+          AND state='running'
+        """,
+        (
+            now_iso,
+            available_at,
+            err,
+            int(queue_id),
+            (worker_id or "").strip() or "worker",
+        ),
+    )
+    conn.commit()
+
+    row = conn.execute("SELECT job_id FROM job_run_queue WHERE id=?", (int(queue_id),)).fetchone()
+    job_id = str(row["job_id"] or "").strip() if row else ""
+    if job_id:
+        job = get_job(conn, job_id)
+        if job and str(job.get("status") or "").strip().lower() in {"planned", "queued", "running", "failed"}:
+            errors = list(job.get("errors_json") or [])
+            token = f"queue_deferred:{reason}:retry_in={delay_s}s"
+            if token not in errors:
+                errors.append(token)
+            update_job_status(conn, job_id=job_id, status="queued", errors=errors)
 
 
 def _kill_pipeline_best_effort(*, pgid: int, pid: int) -> None:

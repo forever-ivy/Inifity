@@ -30,6 +30,7 @@ from scripts.v4_runtime import (
     DEFAULT_WORK_ROOT,
     claim_next_queued,
     db_connect,
+    defer_queue_item,
     ensure_runtime_paths,
     set_queue_pipeline_process,
     finish_queue_item,
@@ -227,6 +228,19 @@ def _run_job_cmd(*, job_id: str, work_root: Path, kb_root: Path, notify_target: 
     return cmd
 
 
+def _extract_cooldown_defer(errors: list[str]) -> tuple[int, str] | None:
+    for raw in errors or []:
+        token = str(raw or "").strip()
+        if not token.startswith("queue_defer_cooldown:"):
+            continue
+        try:
+            delay = int(token.split(":", 1)[1].strip())
+        except Exception:
+            delay = 0
+        return (max(30, delay), "provider_cooldown")
+    return None
+
+
 def _read_cancel_request(paths, *, queue_id: int) -> dict[str, str]:
     try:
         conn = db_connect(paths)
@@ -381,6 +395,7 @@ def main() -> int:
 
             state = "failed"
             last_error = ""
+            queue_handled = False
             try:
                 _reload_dotenv_env()
                 child_env = os.environ.copy()
@@ -454,7 +469,23 @@ def main() -> int:
                         except Exception:
                             job2 = {}
                         errs = list(job2.get("errors_json") or [])
-                        last_error = str(errs[0] or "").strip() if errs else f"exit_code:{rc}"
+                        defer = _extract_cooldown_defer(errs)
+                        if defer:
+                            delay_s, defer_reason = defer
+                            conn = db_connect(paths)
+                            defer_queue_item(
+                                conn,
+                                queue_id=queue_id,
+                                worker_id=worker_id,
+                                delay_seconds=delay_s,
+                                reason=defer_reason,
+                            )
+                            conn.close()
+                            queue_handled = True
+                            state = "deferred"
+                            last_error = f"deferred:{defer_reason}:retry_in={delay_s}s"
+                        else:
+                            last_error = str(errs[0] or "").strip() if errs else f"exit_code:{rc}"
             except Exception as exc:  # pragma: no cover
                 state = "failed"
                 last_error = f"worker_exception:{exc}"
@@ -464,9 +495,10 @@ def main() -> int:
                     hb.join(timeout=2)
                 except Exception:
                     pass
-                conn = db_connect(paths)
-                finish_queue_item(conn, queue_id=queue_id, worker_id=worker_id, state=state, last_error=last_error)
-                conn.close()
+                if not queue_handled:
+                    conn = db_connect(paths)
+                    finish_queue_item(conn, queue_id=queue_id, worker_id=worker_id, state=state, last_error=last_error)
+                    conn.close()
 
             log.info("Finished job_id=%s (queue_id=%s, state=%s, last_error=%s)", job_id, queue_id, state, last_error)
 

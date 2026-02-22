@@ -904,6 +904,24 @@ def run_job_pipeline(
         dry_run=dry_run_notify,
     )
     result = run_translation(meta, plan_only=False, on_round_complete=_on_round_complete)
+    cooldown_friendly = str(os.getenv("OPENCLAW_COOLDOWN_FRIENDLY_MODE", "1")).strip().lower() not in {"0", "false", "off", "no"}
+    if cooldown_friendly and bool(result.get("queue_retry_recommended")):
+        retry_after = max(30, int(result.get("queue_retry_after_seconds") or 300))
+        retry_reason = str(result.get("queue_retry_reason") or "all_providers_cooldown").strip() or "all_providers_cooldown"
+        errs = [str(x) for x in (result.get("errors") or []) if str(x).strip()]
+        defer_token = f"queue_defer_cooldown:{retry_after}"
+        if defer_token not in errs:
+            errs.insert(0, defer_token)
+        reason_token = f"cooldown_reason:{retry_reason}"
+        if reason_token not in errs:
+            errs.append(reason_token)
+        flags = [str(x) for x in (result.get("status_flags") or []) if str(x).strip()]
+        if "cooldown_deferred" not in flags:
+            flags.append("cooldown_deferred")
+        result["errors"] = errs
+        result["status_flags"] = flags
+        result["status"] = "queued"
+        result["ok"] = False
 
     # Run detail validation if enabled (after translation, before quality gate)
     detail_validation_enabled = str(
@@ -1001,7 +1019,32 @@ def run_job_pipeline(
         errors=list(result.get("errors", [])) + pdf_errors,
     )
 
-    if result.get("status") == "review_ready":
+    if result.get("status") == "queued":
+        retry_after = 300
+        for item in (result.get("errors") or []):
+            token = str(item or "").strip()
+            if token.startswith("queue_defer_cooldown:"):
+                try:
+                    retry_after = max(30, int(token.split(":", 1)[1].strip()))
+                except Exception:
+                    retry_after = 300
+                break
+        retry_min = max(1, int(round(retry_after / 60)))
+        notify_milestone(
+            paths=paths,
+            conn=conn,
+            job_id=job_id,
+            milestone="cooldown_wait",
+            message=(
+                f"⏸️ Provider cooldown\n"
+                f"📋 {_task_name}\n"
+                f"Will retry automatically in ~{retry_min} min\n"
+                f"Send: status"
+            ),
+            target=notify_target,
+            dry_run=dry_run_notify,
+        )
+    elif result.get("status") == "review_ready":
         rounds = (((result.get("quality_report") or {}).get("rounds")) or [])
         for rd in rounds:
             rd_no = rd.get("round")

@@ -220,6 +220,8 @@ OPENCLAW_DIRECT_API_MAX_BACKOFF_SECONDS = max(
     OPENCLAW_DIRECT_API_BACKOFF_SECONDS,
     float(os.getenv("OPENCLAW_DIRECT_API_MAX_BACKOFF_SECONDS", "20")),
 )
+OPENCLAW_COOLDOWN_FRIENDLY_MODE = _env_flag("OPENCLAW_COOLDOWN_FRIENDLY_MODE", "1")
+OPENCLAW_COOLDOWN_RETRY_SECONDS = max(30, int(os.getenv("OPENCLAW_COOLDOWN_RETRY_SECONDS", "300")))
 DOC_CONTEXT_CHARS = int(os.getenv("OPENCLAW_DOC_CONTEXT_CHARS", "45000"))
 VALID_THINKING_LEVELS = {"off", "minimal", "low", "medium", "high"}
 OPENCLAW_TRANSLATION_THINKING = os.getenv("OPENCLAW_TRANSLATION_THINKING", "high").strip().lower()
@@ -318,11 +320,11 @@ def _normalize_xlsx_translation_map_keys(entries: Any, *, xlsx_files: list[str])
     return keys
 
 
-def _has_terminal_punctuation(text: str) -> bool:
+def _has_terminal_punctuation(text: str, *, allow_source_marker: bool = True) -> bool:
     value = str(text or "").strip()
     if not value:
         return False
-    if value.endswith(SOURCE_TRUNCATED_MARKER):
+    if allow_source_marker and value.endswith(SOURCE_TRUNCATED_MARKER):
         return True
     return value[-1] in ".!?\"'):]}>"
 
@@ -415,8 +417,8 @@ def _validate_format_preserve_coverage(context: dict[str, Any], draft: dict[str,
             key = (file_name, sheet, str(cell).upper())
             src_text = expected_text_by_key.get(key, "")
             source_has_terminal = _has_terminal_punctuation(src_text)
-            translated_has_terminal = _has_terminal_punctuation(text)
             marker_present = bool(SOURCE_TRUNCATED_MARKER and text.endswith(SOURCE_TRUNCATED_MARKER))
+            translated_has_terminal = _has_terminal_punctuation(text, allow_source_marker=False) and not marker_present
             if text.endswith("...") or text.endswith("…"):
                 reason = "ellipsis"
             elif len(text) > 100 and not translated_has_terminal:
@@ -1934,6 +1936,22 @@ def _is_retryable_agent_failure(error: str, detail: str) -> bool:
         "try again",
     )
     return any(m in text for m in retry_markers)
+
+
+def _is_cooldown_provider_error(text: str) -> bool:
+    lowered = str(text or "").lower()
+    return any(
+        token in lowered
+        for token in (
+            "cooldown",
+            "rate_limit",
+            "rate limit",
+            "too many requests",
+            "429",
+            "all profiles unavailable",
+            "api rate limit reached",
+        )
+    )
 
 
 def _recover_stale_agent_lock(agent_id: str) -> None:
@@ -4198,6 +4216,9 @@ def run(
         markdown_sanity_by_round: dict[str, Any] = {}
         preserve_coverage_by_round: dict[str, Any] = {}
         vision_trials_by_round: dict[str, Any] = {}
+        queue_retry_recommended = False
+        queue_retry_after_seconds = 0
+        queue_retry_reason = ""
 
         def _write_raw_error_artifacts(round_dir: Path, name: str, result: dict[str, Any]) -> None:
             if result.get("ok"):
@@ -4262,6 +4283,12 @@ def run(
                 generation_errors["glm"] = str(glm_gen.get("error", "glm_generation_failed"))
             if not codex_data and not glm_data:
                 errors.append(f"no_generator_candidates:{generation_errors}")
+                if generation_errors and all(_is_cooldown_provider_error(str(v or "")) for v in generation_errors.values()):
+                    status_flags.append("all_providers_cooldown")
+                    if OPENCLAW_COOLDOWN_FRIENDLY_MODE:
+                        queue_retry_recommended = True
+                        queue_retry_after_seconds = OPENCLAW_COOLDOWN_RETRY_SECONDS
+                        queue_retry_reason = "all_providers_cooldown"
                 _write_json(round_dir / "generation_errors.json", {"errors": generation_errors})
                 break
 
@@ -4954,6 +4981,9 @@ def run(
             "router_mode": router_mode,
             "token_guard_applied": token_guard_applied,
             "errors": errors if errors else ([] if status == "review_ready" else ["double_pass_not_reached"]),
+            "queue_retry_recommended": bool(queue_retry_recommended),
+            "queue_retry_after_seconds": int(queue_retry_after_seconds) if queue_retry_recommended else 0,
+            "queue_retry_reason": str(queue_retry_reason or "") if queue_retry_recommended else "",
         }
         _write_result(review_dir, response)
         return response

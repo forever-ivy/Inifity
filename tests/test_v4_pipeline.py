@@ -166,5 +166,101 @@ class V4PipelinePlanStatusTest(unittest.TestCase):
             self.assertEqual(kwargs.get("status"), "running")
 
 
+class V4PipelineCooldownFriendlyTest(unittest.TestCase):
+    def test_run_job_pipeline_marks_cooldown_as_queued(self):
+        with tempfile.TemporaryDirectory() as td:
+            work_root = Path(td) / "Translation Task"
+            kb_root = Path(td) / "Knowledge Repository"
+            kb_root.mkdir(parents=True, exist_ok=True)
+            paths = ensure_runtime_paths(work_root)
+            conn = db_connect(paths)
+            job_id = "job_pipeline_cooldown_queued"
+            inbox_dir = paths.inbox_messaging / job_id
+            review_dir = paths.review_root / job_id
+            inbox_dir.mkdir(parents=True, exist_ok=True)
+            review_dir.mkdir(parents=True, exist_ok=True)
+
+            write_job(
+                conn,
+                job_id=job_id,
+                source="telegram",
+                sender="+1",
+                subject="Test",
+                message_text="translate arabic to english",
+                status="planned",
+                inbox_dir=inbox_dir,
+                review_dir=review_dir,
+            )
+            xlsx_path = inbox_dir / "FD.xlsx"
+            xlsx_path.write_text("stub", encoding="utf-8")
+            conn.execute(
+                "INSERT INTO job_files(job_id, path, name, mime_type, created_at) VALUES(?,?,?,?,?)",
+                (job_id, str(xlsx_path.resolve()), xlsx_path.name, "", "2026-02-22T00:00:00+00:00"),
+            )
+            conn.commit()
+            conn.close()
+
+            plan_result = {
+                "ok": True,
+                "status": "planned",
+                "intent": {
+                    "task_type": "SPREADSHEET_TRANSLATION",
+                    "task_label": "Translate Arabic Excel file to English",
+                    "source_language": "ar",
+                    "target_language": "en",
+                    "required_inputs": ["source_document"],
+                    "missing_inputs": [],
+                    "confidence": 0.9,
+                    "reasoning_summary": "stub",
+                },
+                "plan": {
+                    "task_type": "SPREADSHEET_TRANSLATION",
+                    "confidence": 0.9,
+                    "estimated_minutes": 15,
+                    "complexity_score": 2.0,
+                    "time_budget_minutes": 20,
+                },
+                "estimated_minutes": 15,
+            }
+            run_result = {
+                "ok": False,
+                "status": "failed",
+                "errors": ["no_generator_candidates:{'codex':'rate_limit'}"],
+                "status_flags": [],
+                "artifacts": {},
+                "quality_report": {"rounds": []},
+                "intent": plan_result["intent"],
+                "iteration_count": 0,
+                "double_pass": False,
+                "queue_retry_recommended": True,
+                "queue_retry_after_seconds": 300,
+                "queue_retry_reason": "all_providers_cooldown",
+            }
+
+            def _fake_run_translation(*_args, **kwargs):
+                if kwargs.get("plan_only"):
+                    return plan_result
+                return dict(run_result)
+
+            with (
+                patch("scripts.v4_pipeline.sync_kb_with_rag", return_value={"local_report": {"created": 0, "updated": 0}, "rag_report": {}}),
+                patch("scripts.v4_pipeline.retrieve_kb_with_fallback", return_value={"hits": [], "backend": "local", "status_flags": []}),
+                patch("scripts.v4_pipeline.notify_milestone", return_value=None) as mocked_notify,
+                patch("scripts.v4_pipeline.run_translation", side_effect=_fake_run_translation),
+                patch.dict(os.environ, {"OPENCLAW_COOLDOWN_FRIENDLY_MODE": "1"}, clear=False),
+            ):
+                result = run_job_pipeline(
+                    job_id=job_id,
+                    work_root=work_root,
+                    kb_root=kb_root,
+                    dry_run_notify=True,
+                )
+
+            self.assertEqual(str(result.get("status")), "queued")
+            self.assertIn("queue_defer_cooldown:300", [str(x) for x in (result.get("errors") or [])])
+            milestones = [str(c.kwargs.get("milestone") or "") for c in mocked_notify.call_args_list]
+            self.assertIn("cooldown_wait", milestones)
+
+
 if __name__ == "__main__":
     unittest.main()
