@@ -26,11 +26,13 @@ from scripts.v4_runtime import (
     db_connect,
     ensure_runtime_paths,
     enqueue_run_job,
+    compute_sha256,
     get_job,
     get_job_interaction,
     get_last_event,
     get_active_queue_item,
     get_sender_active_job,
+    get_last_kb_company_for_sender,
     list_actionable_jobs_for_sender,
     list_job_final_uploads,
     list_job_files,
@@ -53,6 +55,210 @@ ACTIVE_JOB_STATUSES = {"collecting", "received", "missing_inputs", "needs_revisi
 RUN_ALLOWED_STATUSES = {"collecting", "received", "missing_inputs", "needs_revision"}
 RERUN_ALLOWED_STATUSES = {"collecting", "received", "missing_inputs", "needs_revision", "review_ready", "needs_attention", "failed", "incomplete_input", "canceled", "discarded"}
 DISCARD_ALLOWED_STATUSES = {"collecting", "received", "missing_inputs", "needs_revision", "review_ready", "needs_attention", "failed", "incomplete_input", "canceled", "verified"}
+
+BATCH_PARENT_FLAG = "batch_parent"
+BATCH_PARENT_STATUS = "batch_dispatched"
+
+
+def _env_truthy(name: str, default: str = "0") -> bool:
+    raw = str(os.getenv(name, default)).strip().lower()
+    return raw not in {"0", "false", "off", "no", ""}
+
+
+def _is_spreadsheet_path(path: Path) -> bool:
+    return path.suffix.lower() in {".xlsx", ".csv"}
+
+
+def _safe_copy_dest(dest_dir: Path, src: Path, *, index: int) -> Path:
+    """Choose a non-colliding destination path under dest_dir for src."""
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    base = src.name
+    target = dest_dir / base
+    if not target.exists():
+        return target
+    stem = src.stem
+    suffix = src.suffix
+    ts = int(datetime.now(UTC).timestamp())
+    return dest_dir / f"{stem}_{index}_{ts}{suffix}"
+
+
+def _artifact_is_batch_parent(job: dict[str, Any]) -> bool:
+    status = str(job.get("status") or "").strip().lower()
+    if status == BATCH_PARENT_STATUS:
+        return True
+    flags = job.get("status_flags_json") if isinstance(job.get("status_flags_json"), list) else []
+    if any(str(x).strip() == BATCH_PARENT_FLAG for x in flags):
+        return True
+    artifacts = job.get("artifacts_json") if isinstance(job.get("artifacts_json"), dict) else {}
+    batch = artifacts.get("batch") if isinstance(artifacts.get("batch"), dict) else {}
+    return bool(batch.get("child_jobs"))
+
+
+def _batch_child_job_ids(job: dict[str, Any]) -> list[str]:
+    artifacts = job.get("artifacts_json") if isinstance(job.get("artifacts_json"), dict) else {}
+    batch = artifacts.get("batch") if isinstance(artifacts.get("batch"), dict) else {}
+    out: list[str] = []
+    for item in (batch.get("child_jobs") or []):
+        if not isinstance(item, dict):
+            continue
+        cid = str(item.get("child_job_id") or "").strip()
+        if cid:
+            out.append(cid)
+    return out
+
+
+def _split_multi_xlsx_job_and_enqueue(
+    conn,
+    *,
+    paths,
+    parent_job: dict[str, Any],
+    files: list[dict[str, Any]],
+    kb_company: str,
+    target: str,
+    sender: str,
+    dry_run_notify: bool,
+) -> dict[str, Any]:
+    parent_job_id = str(parent_job.get("job_id") or "").strip()
+    sender_norm = (sender or "").strip()
+    kb_company_norm = (kb_company or "").strip()
+
+    # Guard: do not split twice.
+    parent_artifacts = parent_job.get("artifacts_json") if isinstance(parent_job.get("artifacts_json"), dict) else {}
+    existing_batch = parent_artifacts.get("batch") if isinstance(parent_artifacts.get("batch"), dict) else {}
+    if existing_batch.get("child_jobs"):
+        return {"ok": True, "already_split": True, "parent_job_id": parent_job_id, "batch": existing_batch}
+
+    copy_mode = str(os.getenv("OPENCLAW_BATCH_SPLIT_COPY_MODE", "copy")).strip().lower() or "copy"
+    if copy_mode not in {"copy"}:
+        copy_mode = "copy"
+
+    child_entries: list[dict[str, Any]] = []
+    queued_children: list[dict[str, Any]] = []
+    failures: list[str] = []
+
+    # Keep parent as active job.
+    if sender_norm:
+        set_sender_active_job(conn, sender=sender_norm, job_id=parent_job_id)
+
+    for idx, item in enumerate(files, start=1):
+        src_path = Path(str(item.get("path") or "")).expanduser().resolve()
+        if not src_path.exists() or not src_path.is_file():
+            failures.append(f"missing:{src_path}")
+            continue
+
+        child_job_id = make_job_id("telegram")
+        child_inbox = paths.inbox_messaging / child_job_id
+        child_review = paths.review_root / child_job_id
+        child_inbox.mkdir(parents=True, exist_ok=True)
+        child_review.mkdir(parents=True, exist_ok=True)
+
+        # Copy input into the child's inbox (safer than move; parent inbox can be cleaned independently).
+        dst_path = _safe_copy_dest(child_inbox, src_path, index=idx)
+        try:
+            shutil.copy2(src_path, dst_path)
+        except Exception as exc:
+            failures.append(f"copy_failed:{src_path.name}:{exc}")
+            continue
+
+        write_job(
+            conn,
+            job_id=child_job_id,
+            source=str(parent_job.get("source") or "telegram"),
+            sender=str(parent_job.get("sender") or sender_norm),
+            subject=str(parent_job.get("subject") or "Telegram Task"),
+            message_text=str(parent_job.get("message_text") or ""),
+            status="received",
+            inbox_dir=child_inbox,
+            review_dir=child_review,
+        )
+        if kb_company_norm:
+            set_job_kb_company(conn, job_id=child_job_id, kb_company=kb_company_norm)
+
+        # Tag child label by filename stem for easier scanning.
+        try:
+            conn.execute(
+                "UPDATE jobs SET task_label=?, updated_at=? WHERE job_id=?",
+                (src_path.stem, utc_now_iso(), child_job_id),
+            )
+            conn.commit()
+        except Exception:
+            pass
+
+        # Tag child as a batch child so status can redirect to the batch parent when needed.
+        try:
+            child_artifacts = {"batch": {"parent_job_id": parent_job_id, "source_file": src_path.name}}
+            child_flags = ["batch_child"]
+            conn.execute(
+                "UPDATE jobs SET artifacts_json=?, status_flags_json=?, updated_at=? WHERE job_id=?",
+                (json.dumps(child_artifacts, ensure_ascii=False), json.dumps(child_flags, ensure_ascii=False), utc_now_iso(), child_job_id),
+            )
+            conn.commit()
+        except Exception:
+            pass
+
+        # Attach file record for child job.
+        attach_file_to_job(work_root=paths.work_root, job_id=child_job_id, path=dst_path)
+
+        # Mark child queued & enqueue.
+        update_job_status(conn, job_id=child_job_id, status="queued", errors=[])
+        q = enqueue_run_job(conn, job_id=child_job_id, notify_target=target, created_by_sender=sender_norm)
+        queued_children.append({"job_id": child_job_id, "queue": q})
+
+        child_entries.append(
+            {
+                "file_name": src_path.name,
+                "child_job_id": child_job_id,
+                "source_path": str(src_path),
+                "copied_path": str(dst_path.resolve()),
+                "sha256": compute_sha256(dst_path),
+            }
+        )
+
+    batch_manifest = {
+        "mode": "split_by_file",
+        "parent_job_id": parent_job_id,
+        "child_jobs": child_entries,
+        "created_at": utc_now_iso(),
+        "kb_company": kb_company_norm,
+    }
+
+    # Update parent job to batch container state.
+    parent_flags = parent_job.get("status_flags_json") if isinstance(parent_job.get("status_flags_json"), list) else []
+    if BATCH_PARENT_FLAG not in parent_flags:
+        parent_flags = list(parent_flags) + [BATCH_PARENT_FLAG]
+    parent_artifacts = parent_job.get("artifacts_json") if isinstance(parent_job.get("artifacts_json"), dict) else {}
+    parent_artifacts = dict(parent_artifacts)
+    parent_artifacts["batch"] = batch_manifest
+    conn.execute(
+        """
+        UPDATE jobs
+        SET status=?,
+            status_flags_json=?,
+            artifacts_json=?,
+            updated_at=?
+        WHERE job_id=?
+        """,
+        (
+            BATCH_PARENT_STATUS,
+            json.dumps(parent_flags, ensure_ascii=False),
+            json.dumps(parent_artifacts, ensure_ascii=False),
+            utc_now_iso(),
+            parent_job_id,
+        ),
+    )
+    conn.commit()
+
+    # Restore parent as active job for the sender (so 'status' shows the batch parent).
+    if sender_norm:
+        set_sender_active_job(conn, sender=sender_norm, job_id=parent_job_id)
+
+    return {
+        "ok": True,
+        "parent_job_id": parent_job_id,
+        "batch": batch_manifest,
+        "queued_children": queued_children,
+        "failures": failures,
+    }
 
 
 def _require_new_enabled() -> bool:
@@ -87,6 +293,10 @@ def _parse_command(text: str) -> tuple[str, str | None, str]:
         else:
             reason = " ".join(parts[1:]).strip()
         return "cancel", explicit_job, reason
+
+    if raw_action == "company":
+        # Allow forcing company re-selection for the active job.
+        return "company", None, ""
 
     action = raw_action
     if action not in {"run", "status", "ok", "no", "rerun", "new", "cancel", "discard", "help"}:
@@ -145,23 +355,46 @@ def _resolve_job(
         active_job_id = get_sender_active_job(conn, sender=sender_norm)
         if active_job_id:
             job = get_job(conn, active_job_id)
-            if job and job.get("status") in ACTIVE_JOB_STATUSES.union({"queued", "review_ready", "needs_attention", "failed", "incomplete_input", "running", "canceled"}):
+            if job and job.get("status") in ACTIVE_JOB_STATUSES.union(
+                {"queued", "review_ready", "needs_attention", "failed", "incomplete_input", "running", "canceled", BATCH_PARENT_STATUS}
+            ):
                 return job, {"source": "active_map", "multiple": 0}
 
         if allow_fallback:
             sender_jobs = list_actionable_jobs_for_sender(conn, sender=sender_norm, limit=20)
             if sender_jobs:
                 selected = sender_jobs[0]
-                return selected, {"source": "sender_latest", "multiple": max(0, len(sender_jobs) - 1)}
+                selected_id = str(selected.get("job_id") or "").strip()
+                hydrated = get_job(conn, selected_id) if selected_id else None
+                return (hydrated or selected), {"source": "sender_latest", "multiple": max(0, len(sender_jobs) - 1)}
 
     if allow_fallback:
         latest = latest_actionable_job(conn)
         if latest:
-            return latest, {"source": "global_latest", "multiple": 0}
+            latest_id = str(latest.get("job_id") or "").strip()
+            hydrated = get_job(conn, latest_id) if latest_id else None
+            return (hydrated or latest), {"source": "global_latest", "multiple": 0}
     return None, {"source": "none", "multiple": 0}
 
 
 def _status_text(conn, job: dict[str, Any], *, multiple_hint: int = 0, require_new: bool = True) -> str:
+    # Normalize legacy rows (some callers fetch raw sqlite rows without json decoding).
+    if isinstance(job.get("status_flags_json"), str):
+        try:
+            job["status_flags_json"] = json.loads(str(job.get("status_flags_json") or "[]"))
+        except Exception:
+            job["status_flags_json"] = []
+    if isinstance(job.get("artifacts_json"), str):
+        try:
+            job["artifacts_json"] = json.loads(str(job.get("artifacts_json") or "{}"))
+        except Exception:
+            job["artifacts_json"] = {}
+    if isinstance(job.get("errors_json"), str):
+        try:
+            job["errors_json"] = json.loads(str(job.get("errors_json") or "[]"))
+        except Exception:
+            job["errors_json"] = []
+
     files = list_job_files(conn, str(job["job_id"]))
     files_count = len(files)
     docx_count = sum(1 for item in files if Path(str(item.get("path", ""))).suffix.lower() == ".docx")
@@ -181,6 +414,45 @@ def _status_text(conn, job: dict[str, Any], *, multiple_hint: int = 0, require_n
     archived = bool(str(job.get("archived_at") or "").strip())
     last_event = get_last_event(conn, job_id=str(job["job_id"])) or {}
     queue_item = get_active_queue_item(conn, job_id=str(job["job_id"])) or {}
+
+    batch_summary_line = ""
+    batch_children_sample = ""
+    if _artifact_is_batch_parent(job):
+        artifacts = job.get("artifacts_json") if isinstance(job.get("artifacts_json"), dict) else {}
+        batch = artifacts.get("batch") if isinstance(artifacts.get("batch"), dict) else {}
+        children = batch.get("child_jobs") if isinstance(batch.get("child_jobs"), list) else []
+        child_ids = _batch_child_job_ids(job)
+        counts: dict[str, int] = {}
+        for cid in child_ids:
+            child = get_job(conn, cid) or {}
+            st = str(child.get("status") or "unknown").strip().lower() or "unknown"
+            counts[st] = counts.get(st, 0) + 1
+        total = len(child_ids)
+        order = ["queued", "running", "review_ready", "needs_attention", "failed", "verified", "canceled"]
+        parts = [f"total={total}"]
+        for key in order:
+            if counts.get(key):
+                parts.append(f"{key}={counts[key]}")
+        # Include other statuses (if any) at the end for completeness.
+        other_keys = sorted([k for k in counts.keys() if k not in set(order)])
+        for key in other_keys:
+            parts.append(f"{key}={counts[key]}")
+        batch_summary_line = "\U0001f9fe Batch: " + " | ".join(parts)
+
+        sample_pairs: list[str] = []
+        if isinstance(children, list):
+            for entry in children[:5]:
+                if not isinstance(entry, dict):
+                    continue
+                name = str(entry.get("file_name") or "").strip()
+                cid = str(entry.get("child_job_id") or "").strip()
+                if cid and name:
+                    sample_pairs.append(f"{name} -> {cid}")
+                elif cid:
+                    sample_pairs.append(cid)
+        if sample_pairs:
+            batch_children_sample = "\U0001f4ce Children (sample): " + ", ".join(sample_pairs)
+
     return build_status_card(
         job=job,
         files_count=files_count,
@@ -202,6 +474,8 @@ def _status_text(conn, job: dict[str, Any], *, multiple_hint: int = 0, require_n
         queue_cancel_requested_at=str(queue_item.get("cancel_requested_at") or "").strip(),
         queue_cancel_reason=str(queue_item.get("cancel_reason") or "").strip(),
         queue_cancel_mode=str(queue_item.get("cancel_mode") or "").strip(),
+        batch_summary_line=batch_summary_line,
+        batch_children_sample=batch_children_sample,
     )
 
 
@@ -236,6 +510,10 @@ def _create_new_job(conn, *, paths, sender: str, note: str) -> dict[str, Any]:
         inbox_dir=inbox_dir,
         review_dir=review_dir,
     )
+    if _env_truthy("OPENCLAW_PREFILL_COMPANY_FROM_LAST", "1"):
+        last_company = get_last_kb_company_for_sender(conn, sender=sender_norm)
+        if last_company:
+            set_job_kb_company(conn, job_id=job_id, kb_company=last_company)
     set_sender_active_job(conn, sender=sender_norm, job_id=job_id)
     record_event(
         conn,
@@ -717,6 +995,7 @@ def handle_command(
 
 🔹 Task Management
   new [note]      - Create new task
+  company         - Select/override company for this task
   status [job_id] - Check task status
   cancel [job_id] - Cancel running task
   discard [reason]- Delete task and files
@@ -739,6 +1018,49 @@ def handle_command(
         send_message(target=target, message=help_msg, dry_run=dry_run_notify)
         conn.close()
         return {"ok": True, "action": "help"}
+
+    if action == "company":
+        # Force company menu for the active job.
+        if not job:
+            send_result = send_message(
+                target=target,
+                message=no_active_job_hint(require_new=require_new),
+                dry_run=dry_run_notify,
+            )
+            conn.close()
+            return {"ok": False, "error": "job_not_found", "send_result": send_result}
+        job_id = str(job["job_id"])
+        companies = _discover_kb_companies(kb_root=kb_root)
+        menu, options = _company_menu(companies)
+        if not options:
+            _send_and_record(
+                conn,
+                job_id=job_id,
+                milestone="run_blocked",
+                target=target,
+                message="\u26a0\ufe0f No companies configured. Create: KB/{Section}/{Company}/ (e.g., 30_Reference/{Company}/)",
+                dry_run=dry_run_notify,
+            )
+            conn.close()
+            return {"ok": False, "job_id": job_id, "error": "no_companies_configured"}
+        set_job_pending_action(
+            conn,
+            job_id=job_id,
+            sender=str(job.get("sender") or sender).strip(),
+            pending_action="select_company_for_run",
+            options=options,
+            expires_at=_expires_at(20),
+        )
+        _send_and_record(
+            conn,
+            job_id=job_id,
+            milestone="awaiting_company_for_run",
+            target=target,
+            message=menu,
+            dry_run=dry_run_notify,
+        )
+        conn.close()
+        return {"ok": True, "job_id": job_id, "status": "awaiting_company_selection"}
     if not job:
         send_result = send_message(
             target=target,
@@ -755,22 +1077,66 @@ def handle_command(
         set_sender_active_job(conn, sender=sender.strip(), job_id=job_id)
 
     if action == "status":
-        msg = _status_text(conn, job, multiple_hint=resolve_meta.get("multiple", 0), require_new=require_new)
+        # If the active job is a batch child, redirect status to the batch parent for overview.
+        job_for_status = job
+        redirected_child_id = ""
+        if not explicit_job_id:
+            artifacts = job.get("artifacts_json") if isinstance(job.get("artifacts_json"), dict) else {}
+            batch = artifacts.get("batch") if isinstance(artifacts.get("batch"), dict) else {}
+            parent_job_id = str(batch.get("parent_job_id") or "").strip()
+            if parent_job_id:
+                parent = get_job(conn, parent_job_id)
+                if parent:
+                    redirected_child_id = str(job.get("job_id") or "").strip()
+                    job_for_status = parent
+
+        msg = _status_text(conn, job_for_status, multiple_hint=resolve_meta.get("multiple", 0), require_new=require_new)
+        if redirected_child_id:
+            msg = (
+                msg
+                + "\n\n\u21aa Active file job: "
+                + redirected_child_id
+                + f"\nSend: status {redirected_child_id} for details"
+            )
         _send_and_record(
             conn,
-            job_id=job_id,
+            job_id=str(job_for_status.get("job_id") or job_id),
             milestone="status",
             target=target,
             message=msg,
             dry_run=dry_run_notify,
         )
         conn.close()
-        return {"ok": True, "job_id": job_id, "status": str(job.get("status")), "resolve": resolve_meta}
+        return {"ok": True, "job_id": str(job_for_status.get("job_id") or job_id), "status": str(job_for_status.get("status")), "resolve": resolve_meta}
 
     current_status = str(job.get("status") or "")
     current_norm = current_status.strip().lower()
 
     if action == "cancel":
+        # Batch parent: cancel all children.
+        if _artifact_is_batch_parent(job):
+            child_ids = _batch_child_job_ids(job)
+            requested = 0
+            failed: list[str] = []
+            for cid in child_ids:
+                res = cancel_job_run(conn, job_id=cid, requested_by=sender, reason=reason, mode="force")
+                if res.get("ok"):
+                    requested += 1
+                else:
+                    failed.append(cid)
+            # Mark parent canceled (use existing status).
+            update_job_status(conn, job_id=job_id, status="canceled", errors=[])
+            msg = (
+                f"\u26d4\ufe0f Canceled batch: {requested} requested\n"
+                f"\U0001f4cb {_task_name}\n"
+                f"\U0001f194 {job_id}\n"
+                + (f"\u26a0\ufe0f Failed: {', '.join(failed[:3])}\n" if failed else "")
+                + "\u23ed\ufe0f Send: status | new"
+            )
+            _send_and_record(conn, job_id=job_id, milestone="batch_canceled", target=target, message=msg, dry_run=dry_run_notify)
+            conn.close()
+            return {"ok": True, "job_id": job_id, "status": "canceled", "batch_cancel": {"requested": requested, "failed": failed}}
+
         queue_item = get_active_queue_item(conn, job_id=job_id) or {}
         if not queue_item:
             msg = (
@@ -853,6 +1219,29 @@ def handle_command(
         )
         conn.close()
         return {"ok": True, "job_id": job_id, "status": current_status, "queue": q, "kill_sent": kill_sent}
+
+    if action in {"run", "rerun"} and _artifact_is_batch_parent(job):
+        artifacts = job.get("artifacts_json") if isinstance(job.get("artifacts_json"), dict) else {}
+        batch = artifacts.get("batch") if isinstance(artifacts.get("batch"), dict) else {}
+        children = (batch.get("child_jobs") or []) if isinstance(batch, dict) else []
+        total = len(children) if isinstance(children, list) else 0
+        sample = []
+        if isinstance(children, list):
+            for entry in children[:5]:
+                if isinstance(entry, dict):
+                    cid = str(entry.get("child_job_id") or "").strip()
+                    if cid:
+                        sample.append(cid)
+        msg = (
+            f"\u23f3 Already batch queued ({total} files)\n"
+            f"\U0001f4cb {_task_name}\n"
+            f"\U0001f194 {job_id}\n"
+            + (f"\U0001f4ce Children (sample): {', '.join(sample)}\n" if sample else "")
+            + "\u23ed\ufe0f Send: status | cancel | new"
+        )
+        _send_and_record(conn, job_id=job_id, milestone="batch_already_dispatched", target=target, message=msg, dry_run=dry_run_notify)
+        conn.close()
+        return {"ok": True, "job_id": job_id, "status": str(job.get("status") or ""), "batch": batch}
 
     if action in {"run", "rerun"} and current_norm in {"queued", "running"}:
         queue_item = get_active_queue_item(conn, job_id=job_id) or {}
@@ -1078,6 +1467,62 @@ def handle_command(
             )
             conn.close()
             return {"ok": True, "job_id": job_id, "status": "awaiting_company_selection"}
+
+        # Auto split multi-xlsx/csv jobs into child jobs before enqueueing the parent.
+        split_enabled = _env_truthy("OPENCLAW_RUN_SPLIT_MULTI_XLSX", "1")
+        if split_enabled:
+            files = list_job_files(conn, job_id=job_id)
+            file_paths = [Path(str(x.get("path") or "")).expanduser() for x in files]
+            spreadsheet_only = len(files) >= 2 and all(p and _is_spreadsheet_path(p) for p in file_paths)
+            if spreadsheet_only:
+                # If already split, don't do it again.
+                artifacts = job.get("artifacts_json") if isinstance(job.get("artifacts_json"), dict) else {}
+                batch = artifacts.get("batch") if isinstance(artifacts.get("batch"), dict) else {}
+                if batch.get("child_jobs"):
+                    msg = (
+                        f"\u23f3 Already batch queued\n"
+                        f"\U0001f4cb {_task_name}\n"
+                        f"\U0001f194 {job_id}\n"
+                        "\u23ed\ufe0f Send: status"
+                    )
+                    _send_and_record(conn, job_id=job_id, milestone="batch_already_dispatched", target=target, message=msg, dry_run=dry_run_notify)
+                    conn.close()
+                    return {"ok": True, "job_id": job_id, "status": str(job.get("status") or ""), "batch": batch}
+
+                split_res = _split_multi_xlsx_job_and_enqueue(
+                    conn,
+                    paths=paths,
+                    parent_job=job,
+                    files=files,
+                    kb_company=kb_company,
+                    target=target,
+                    sender=sender,
+                    dry_run_notify=dry_run_notify,
+                )
+                batch = split_res.get("batch") or {}
+                children = (batch.get("child_jobs") or []) if isinstance(batch, dict) else []
+                total = len(children)
+                sample = []
+                for entry in children[:5]:
+                    if isinstance(entry, dict):
+                        sample.append(f"{entry.get('file_name')} -> {entry.get('child_job_id')}")
+                more = max(0, total - len(sample))
+                failure_list = split_res.get("failures") if isinstance(split_res.get("failures"), list) else []
+                review_dir = str(job.get("review_dir") or "").strip()
+                folder_line = f"\U0001f4c1 {review_dir}\n" if review_dir else ""
+                msg = (
+                    f"\u23f3 Accepted \u00b7 batch queued ({total} files)\n"
+                    f"\U0001f4cb {_task_name}\n"
+                    f"\U0001f194 {job_id}\n"
+                    + folder_line
+                    + ("\n".join(sample) + ("\n" if sample else ""))
+                    + (f"+{more} more\n" if more else "")
+                    + (f"\u26a0\ufe0f Failures: {', '.join([str(x) for x in failure_list[:3]])}\n" if failure_list else "")
+                    + "\u23ed\ufe0f Send: status"
+                )
+                _send_and_record(conn, job_id=job_id, milestone="batch_dispatched", target=target, message=msg, dry_run=dry_run_notify)
+                conn.close()
+                return {"ok": True, "job_id": job_id, "status": BATCH_PARENT_STATUS, "batch": batch, "failures": failure_list}
 
         clear_job_pending_action(conn, job_id=job_id)
         update_job_status(conn, job_id=job_id, status="queued", errors=[])

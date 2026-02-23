@@ -15,6 +15,7 @@ from typing import Any
 
 from docx import Document
 
+from scripts.policy_structure import build_policy_sidecar
 from scripts.skill_clawrag_bridge import clawrag_delete, clawrag_search, clawrag_sync
 from scripts.v4_runtime import (
     KB_SUPPORTED_EXTENSIONS,
@@ -31,12 +32,15 @@ _KB_FTS_AVAILABLE: bool | None = None
 _RERANK_SOURCE_GROUP_WEIGHTS: dict[str, float] = {
     "glossary": 2.2,
     "previously_translated": 1.6,
+    "policy_reference": 1.2,
     "translated_output": 1.3,   # Generic translated output
     "translated_en": 1.3,       # Backward compatible
     "source_text": 1.0,         # Generic source text
     "arabic_source": 1.0,       # Backward compatible
     "general": 0.9,
 }
+
+_KB_CHUNK_META_AVAILABLE: bool | None = None
 
 
 def _rank_semantic(rank: int | None) -> float:
@@ -85,6 +89,7 @@ def _merge_and_rerank_hits(
     prefer_rag_ratio: float,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Merge (rag + local) candidates and re-rank with hard constraints and soft quotas."""
+    meta_fields = ("section_number", "section_title", "section_path", "doc_type")
     candidates_by_key: dict[tuple[str, int], dict[str, Any]] = {}
 
     for idx, hit in enumerate(rag_hits):
@@ -94,7 +99,7 @@ def _merge_and_rerank_hits(
         if not path:
             continue
         sg = str(hit.get("source_group") or "general").strip() or "general"
-        candidates_by_key[key] = {
+        row = {
             "path": path,
             "chunk_index": chunk,
             "snippet": str(hit.get("snippet") or ""),
@@ -103,6 +108,9 @@ def _merge_and_rerank_hits(
             "local_rank": None,
             "origin": "clawrag",
         }
+        for field in meta_fields:
+            row[field] = hit.get(field)
+        candidates_by_key[key] = row
 
     for idx, hit in enumerate(local_hits):
         path = str(hit.get("path") or "").strip()
@@ -118,9 +126,12 @@ def _merge_and_rerank_hits(
             existing["source_group"] = sg or existing.get("source_group") or "general"
             if not existing.get("snippet") and hit.get("snippet"):
                 existing["snippet"] = str(hit.get("snippet") or "")
+            for field in meta_fields:
+                if not existing.get(field) and hit.get(field):
+                    existing[field] = hit.get(field)
             existing["origin"] = "both"
         else:
-            candidates_by_key[key] = {
+            row = {
                 "path": path,
                 "chunk_index": chunk,
                 "snippet": str(hit.get("snippet") or ""),
@@ -129,6 +140,9 @@ def _merge_and_rerank_hits(
                 "local_rank": idx,
                 "origin": "local",
             }
+            for field in meta_fields:
+                row[field] = hit.get(field)
+            candidates_by_key[key] = row
 
     candidates: list[dict[str, Any]] = []
     for cand in candidates_by_key.values():
@@ -285,16 +299,22 @@ def _merge_and_rerank_hits(
     # Final payload for model context: keep minimal fields.
     hits_out: list[dict[str, Any]] = []
     for hit in selected[:final_k]:
-        hits_out.append(
-            {
-                "path": hit.get("path"),
-                "source_group": hit.get("source_group") or "general",
-                "chunk_index": int(hit.get("chunk_index") or 0),
-                "snippet": str(hit.get("snippet") or "")[:700],
-                "score": round(float(hit.get("final_score") or 0.0), 6),
-                "origin": hit.get("origin") or "unknown",
-            }
-        )
+        row = {
+            "path": hit.get("path"),
+            "source_group": hit.get("source_group") or "general",
+            "chunk_index": int(hit.get("chunk_index") or 0),
+            "snippet": str(hit.get("snippet") or "")[:700],
+            "score": round(float(hit.get("final_score") or 0.0), 6),
+            "origin": hit.get("origin") or "unknown",
+        }
+        for field in meta_fields:
+            value = hit.get(field)
+            if value is None:
+                continue
+            if isinstance(value, str) and not value.strip():
+                continue
+            row[field] = value
+        hits_out.append(row)
     return hits_out, report
 
 
@@ -429,6 +449,95 @@ def _ensure_kb_fts(conn: sqlite3.Connection) -> bool:
     except sqlite3.OperationalError:
         _KB_FTS_AVAILABLE = False
         return False
+
+
+def _ensure_kb_chunk_meta_schema(conn: sqlite3.Connection) -> None:
+    global _KB_CHUNK_META_AVAILABLE
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS kb_chunk_meta (
+            path TEXT NOT NULL,
+            chunk_index INTEGER NOT NULL,
+            section_id TEXT DEFAULT '',
+            section_number TEXT DEFAULT '',
+            section_title TEXT DEFAULT '',
+            section_path TEXT DEFAULT '',
+            section_level INTEGER NOT NULL DEFAULT 0,
+            doc_type TEXT DEFAULT '',
+            tags_json TEXT DEFAULT '[]',
+            PRIMARY KEY(path, chunk_index)
+        );
+        CREATE INDEX IF NOT EXISTS idx_kb_chunk_meta_path_chunk ON kb_chunk_meta(path, chunk_index);
+        CREATE INDEX IF NOT EXISTS idx_kb_chunk_meta_section ON kb_chunk_meta(section_number, doc_type);
+        """
+    )
+    _KB_CHUNK_META_AVAILABLE = True
+
+
+def _has_kb_chunk_meta(conn: sqlite3.Connection) -> bool:
+    global _KB_CHUNK_META_AVAILABLE
+    if _KB_CHUNK_META_AVAILABLE is not None:
+        return _KB_CHUNK_META_AVAILABLE
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='kb_chunk_meta'"
+    ).fetchone()
+    _KB_CHUNK_META_AVAILABLE = row is not None
+    return _KB_CHUNK_META_AVAILABLE
+
+
+def _detect_policy_sha_drift(*, conn: sqlite3.Connection, kb_root: Path) -> list[dict[str, Any]]:
+    kb_root_abs = str(kb_root.expanduser().resolve()).replace("\\", "/").lower()
+    like = f"{kb_root_abs}/20_domain_knowledge/%/policy/%.docx"
+    rows = conn.execute(
+        """
+        SELECT path, sha256
+        FROM kb_files
+        WHERE lower(replace(path, '\\', '/')) LIKE ?
+        """,
+        (like,),
+    ).fetchall()
+    grouped: dict[str, list[dict[str, str]]] = {}
+    for row in rows:
+        path = Path(str(row["path"] or ""))
+        sha = str(row["sha256"] or "").strip()
+        if not path.name or not sha:
+            continue
+        company = ""
+        parts = path.parts
+        for idx, part in enumerate(parts):
+            if part == "20_Domain_Knowledge" and idx + 1 < len(parts):
+                company = parts[idx + 1]
+                break
+        key = path.name.lower()
+        grouped.setdefault(key, []).append(
+            {
+                "path": str(path),
+                "company": company,
+                "sha256": sha,
+                "file_name": path.name,
+            }
+        )
+    out: list[dict[str, Any]] = []
+    for key, items in grouped.items():
+        distinct = sorted({str(item["sha256"]) for item in items})
+        if len(distinct) <= 1:
+            continue
+        out.append(
+            {
+                "file_name": items[0]["file_name"] if items else key,
+                "sha256_variants": len(distinct),
+                "companies": sorted(
+                    {
+                        str(item.get("company") or "").strip()
+                        for item in items
+                        if str(item.get("company") or "").strip()
+                    }
+                ),
+                "paths": sorted([str(item["path"]) for item in items]),
+            }
+        )
+    out.sort(key=lambda item: str(item.get("file_name") or "").lower())
+    return out
 
 try:  # Optional dependency
     from pypdf import PdfReader
@@ -617,6 +726,7 @@ def sync_kb(
     report_path: Path | None = None,
 ) -> dict[str, Any]:
     kb_root = kb_root.expanduser().resolve()
+    _ensure_kb_chunk_meta_schema(conn)
     files, unscoped = discover_kb_files(kb_root)
 
     existing_rows = conn.execute("SELECT * FROM kb_files").fetchall()
@@ -637,6 +747,9 @@ def sync_kb(
         "removed_paths": [],
         "skipped": 0,
         "errors": [],
+        "warnings": [],
+        "policy_sidecars": [],
+        "policy_drifts": [],
         "files": [],
         "indexed_at": utc_now_iso(),
     }
@@ -666,14 +779,83 @@ def sync_kb(
                 continue
 
             parser, text = extract_text(path)
-            chunks = _chunk_text(text)
             source_group = infer_source_group(path, kb_root)
+            chunks = _chunk_text(text)
+            chunk_meta_rows: list[dict[str, Any]] = []
+
+            if path.suffix.lower() == ".docx":
+                policy_payload: dict[str, Any] | None = None
+                policy_sidecar_path: Path | None = None
+                try:
+                    policy_payload, policy_sidecar_path = build_policy_sidecar(path)
+                    if policy_sidecar_path:
+                        report["policy_sidecars"].append(str(policy_sidecar_path))
+                except Exception as sidecar_exc:
+                    report["warnings"].append(f"policy_sidecar_failed:{ap}:{sidecar_exc}")
+                    policy_payload = None
+
+                if policy_payload and bool(policy_payload.get("is_policy_like")):
+                    payload_chunks = list(policy_payload.get("chunks") or [])
+                    if payload_chunks:
+                        chunks = []
+                        chunk_meta_rows = []
+                        for item in payload_chunks:
+                            text_item = str(item.get("text") or "").strip()
+                            if not text_item:
+                                continue
+                            chunks.append(text_item)
+                            chunk_meta_rows.append(
+                                {
+                                    "section_id": str(item.get("section_id") or ""),
+                                    "section_number": str(item.get("section_number") or ""),
+                                    "section_title": str(item.get("section_title") or ""),
+                                    "section_path": str(item.get("section_path") or ""),
+                                    "section_level": int(item.get("section_level") or 0),
+                                    "doc_type": "policy",
+                                    "tags_json": json_dumps(["policy", "structured"]),
+                                }
+                            )
+                        source_group = "policy_reference"
+
+            if not chunk_meta_rows:
+                chunk_meta_rows = [
+                    {
+                        "section_id": "",
+                        "section_number": "",
+                        "section_title": "",
+                        "section_path": "",
+                        "section_level": 0,
+                        "doc_type": "generic",
+                        "tags_json": json_dumps([]),
+                    }
+                    for _ in chunks
+                ]
 
             conn.execute("DELETE FROM kb_chunks WHERE path=?", (ap,))
+            conn.execute("DELETE FROM kb_chunk_meta WHERE path=?", (ap,))
             for idx, chunk in enumerate(chunks):
                 conn.execute(
                     "INSERT INTO kb_chunks(path, source_group, chunk_index, text) VALUES(?,?,?,?)",
                     (ap, source_group, idx, chunk),
+                )
+                meta = chunk_meta_rows[idx] if idx < len(chunk_meta_rows) else {}
+                conn.execute(
+                    """
+                    INSERT INTO kb_chunk_meta(
+                        path, chunk_index, section_id, section_number, section_title, section_path, section_level, doc_type, tags_json
+                    ) VALUES(?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        ap,
+                        idx,
+                        str(meta.get("section_id") or ""),
+                        str(meta.get("section_number") or ""),
+                        str(meta.get("section_title") or ""),
+                        str(meta.get("section_path") or ""),
+                        int(meta.get("section_level") or 0),
+                        str(meta.get("doc_type") or "generic"),
+                        str(meta.get("tags_json") or "[]"),
+                    ),
                 )
 
             conn.execute(
@@ -698,6 +880,7 @@ def sync_kb(
                     "parser": parser,
                     "source_group": source_group,
                     "chunk_count": len(chunks),
+                    "doc_type": "policy" if source_group == "policy_reference" else "generic",
                 }
             )
             if rec:
@@ -711,11 +894,19 @@ def sync_kb(
         if old_path in seen_paths:
             continue
         conn.execute("DELETE FROM kb_chunks WHERE path=?", (old_path,))
+        conn.execute("DELETE FROM kb_chunk_meta WHERE path=?", (old_path,))
         conn.execute("DELETE FROM kb_files WHERE path=?", (old_path,))
         report["removed"] += 1
         report["removed_paths"].append(str(old_path))
 
     conn.commit()
+    drifts = _detect_policy_sha_drift(conn=conn, kb_root=kb_root)
+    if drifts:
+        report["policy_drifts"] = drifts
+        for item in drifts:
+            report["warnings"].append(
+                f"policy_sha_drift:{item.get('file_name')}:{item.get('sha256_variants')}"
+            )
     report["ok"] = len(report["errors"]) == 0
 
     if report_path:
@@ -892,6 +1083,7 @@ def retrieve_kb(
     tokens = [t.lower() for t in re.findall(r"[A-Za-z0-9\u0600-\u06FF_]+", query) if len(t) >= 2]
     if not tokens:
         return []
+    meta_enabled = _has_kb_chunk_meta(conn)
 
     task = task_type.upper().strip()
     task_boosts = {
@@ -924,21 +1116,47 @@ def retrieve_kb(
                     where_sql = " AND (c.path NOT LIKE ? OR c.path LIKE ?)"
                     where_params.extend([ref_like, company_like])
 
-        rows = conn.execute(
-            f"""
-            SELECT
-              c.path AS path,
-              c.source_group AS source_group,
-              c.chunk_index AS chunk_index,
-              substr(c.text, 1, 700) AS snippet,
-              bm25(kb_chunks_fts) AS rank
-            FROM kb_chunks_fts
-            JOIN kb_chunks c ON c.id = kb_chunks_fts.rowid
-            WHERE kb_chunks_fts MATCH ?{where_sql}
-            LIMIT ?
-            """,
-            [match_query, *where_params, max(10, int(top_k) * 8)],
-        ).fetchall()
+        if meta_enabled:
+            rows = conn.execute(
+                f"""
+                SELECT
+                  c.path AS path,
+                  c.source_group AS source_group,
+                  c.chunk_index AS chunk_index,
+                  substr(c.text, 1, 700) AS snippet,
+                  bm25(kb_chunks_fts) AS rank,
+                  m.section_number AS section_number,
+                  m.section_title AS section_title,
+                  m.section_path AS section_path,
+                  m.doc_type AS doc_type
+                FROM kb_chunks_fts
+                JOIN kb_chunks c ON c.id = kb_chunks_fts.rowid
+                LEFT JOIN kb_chunk_meta m ON m.path = c.path AND m.chunk_index = c.chunk_index
+                WHERE kb_chunks_fts MATCH ?{where_sql}
+                LIMIT ?
+                """,
+                [match_query, *where_params, max(10, int(top_k) * 8)],
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                f"""
+                SELECT
+                  c.path AS path,
+                  c.source_group AS source_group,
+                  c.chunk_index AS chunk_index,
+                  substr(c.text, 1, 700) AS snippet,
+                  bm25(kb_chunks_fts) AS rank,
+                  '' AS section_number,
+                  '' AS section_title,
+                  '' AS section_path,
+                  '' AS doc_type
+                FROM kb_chunks_fts
+                JOIN kb_chunks c ON c.id = kb_chunks_fts.rowid
+                WHERE kb_chunks_fts MATCH ?{where_sql}
+                LIMIT ?
+                """,
+                [match_query, *where_params, max(10, int(top_k) * 8)],
+            ).fetchall()
 
         scored: list[dict[str, Any]] = []
         for row in rows:
@@ -948,36 +1166,80 @@ def retrieve_kb(
             raw_rank = float(row["rank"] or 0.0)
             inv = 1.0 / (1.0 + max(0.0, raw_rank))
             score = round(inv * float(base) * float(boost), 6)
-            scored.append(
-                {
-                    "path": row["path"],
-                    "source_group": source_group,
-                    "chunk_index": int(row["chunk_index"]),
-                    "snippet": str(row["snippet"] or ""),
-                    "score": score,
-                }
-            )
+            item = {
+                "path": row["path"],
+                "source_group": source_group,
+                "chunk_index": int(row["chunk_index"]),
+                "snippet": str(row["snippet"] or ""),
+                "score": score,
+            }
+            for key in ("section_number", "section_title", "section_path", "doc_type"):
+                value = row[key] if key in row.keys() else None
+                if value is None:
+                    continue
+                value_str = str(value).strip()
+                if value_str:
+                    item[key] = value_str
+            scored.append(item)
         scored.sort(key=lambda x: x["score"], reverse=True)
         return scored[: max(1, int(top_k))]
 
     where_sql = ""
+    where_sql_alias = ""
     where_params: list[Any] = []
     if kb_root and kb_company.strip():
         mode = (isolation_mode or "company_strict").strip().lower()
         if mode == "company_strict":
             likes = _company_like_filters(kb_root=kb_root, kb_company=kb_company.strip())
             where_sql = " WHERE (" + " OR ".join(["path LIKE ?"] * len(likes)) + ")"
+            where_sql_alias = " WHERE (" + " OR ".join(["c.path LIKE ?"] * len(likes)) + ")"
             where_params.extend(likes)
         else:
             ref_like, company_like = _reference_like_filters(kb_root=kb_root, kb_company=kb_company.strip())
             if mode == "all":
                 where_sql = " WHERE path LIKE ?"
+                where_sql_alias = " WHERE c.path LIKE ?"
                 where_params.append(company_like)
             else:
                 where_sql = " WHERE (path NOT LIKE ? OR path LIKE ?)"
+                where_sql_alias = " WHERE (c.path NOT LIKE ? OR c.path LIKE ?)"
                 where_params.extend([ref_like, company_like])
 
-    rows = conn.execute(f"SELECT path, source_group, chunk_index, text FROM kb_chunks{where_sql}", tuple(where_params)).fetchall()
+    if meta_enabled:
+        rows = conn.execute(
+            f"""
+            SELECT
+              c.path AS path,
+              c.source_group AS source_group,
+              c.chunk_index AS chunk_index,
+              c.text AS text,
+              m.section_number AS section_number,
+              m.section_title AS section_title,
+              m.section_path AS section_path,
+              m.doc_type AS doc_type
+            FROM kb_chunks c
+            LEFT JOIN kb_chunk_meta m ON m.path = c.path AND m.chunk_index = c.chunk_index
+            {where_sql_alias}
+            """,
+            tuple(where_params),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            f"""
+            SELECT
+              path,
+              source_group,
+              chunk_index,
+              text,
+              '' AS section_number,
+              '' AS section_title,
+              '' AS section_path,
+              '' AS doc_type
+            FROM kb_chunks
+            {where_sql}
+            """,
+            tuple(where_params),
+        ).fetchall()
     scored: list[dict[str, Any]] = []
     for row in rows:
         text = (row["text"] or "").lower()
@@ -992,15 +1254,21 @@ def retrieve_kb(
         base = SOURCE_GROUP_WEIGHTS.get(source_group, SOURCE_GROUP_WEIGHTS["general"])
         boost = task_boosts.get(source_group, 1.0)
         score = round(float(match_hits) * base * boost, 4)
-        scored.append(
-            {
-                "path": row["path"],
-                "source_group": source_group,
-                "chunk_index": int(row["chunk_index"]),
-                "snippet": row["text"][:700],
-                "score": score,
-            }
-        )
+        item = {
+            "path": row["path"],
+            "source_group": source_group,
+            "chunk_index": int(row["chunk_index"]),
+            "snippet": row["text"][:700],
+            "score": score,
+        }
+        for key in ("section_number", "section_title", "section_path", "doc_type"):
+            value = row[key] if key in row.keys() else None
+            if value is None:
+                continue
+            value_str = str(value).strip()
+            if value_str:
+                item[key] = value_str
+        scored.append(item)
 
     scored.sort(key=lambda x: x["score"], reverse=True)
     return scored[: max(1, int(top_k))]

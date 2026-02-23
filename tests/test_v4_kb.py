@@ -7,8 +7,39 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from docx import Document
+
 from scripts.v4_kb import _extract_pdf, _extract_xlsx, retrieve_kb, retrieve_kb_with_fallback, sync_kb, sync_kb_with_rag
 from scripts.v4_runtime import db_connect, ensure_runtime_paths
+
+
+def _make_policy_docx(path: Path, *, include_focus_section: bool = False, body_tail: str = "") -> None:
+    doc = Document()
+    lines = [
+        "1 Introduction",
+        "1.1. Purpose of the Policy",
+        "2 Treasury Governance and Oversight",
+        "2.1. Principles of Treasury Governance",
+        "3 The Treasury Function",
+        "3.1. Treasury Product Mandate Framework",
+        "4 Treasury Operations Control Framework",
+        "4.1. Trade Lifecycle",
+    ]
+    if include_focus_section:
+        lines.extend(
+            [
+                "10 Trade Reconciliation and Control",
+                "10.2. Control framework",
+                "10.2.3. Segregation of duties",
+                body_tail or "Segregation of duties prevents control conflicts.",
+            ]
+        )
+    else:
+        lines.append(body_tail or "Policy baseline content.")
+    for line in lines:
+        doc.add_paragraph(line)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    doc.save(path)
 
 
 class V4KnowledgeBaseTest(unittest.TestCase):
@@ -94,6 +125,113 @@ class V4KnowledgeBaseTest(unittest.TestCase):
                 self.assertEqual(rag["backend"], "local")
                 self.assertGreaterEqual(len(rag["hits"]), 1)
                 self.assertIn("rag_fallback_local", rag["status_flags"])
+            conn.close()
+
+    def test_policy_docx_sync_populates_chunk_meta_and_retrieve_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            work_root = base / "Translation Task"
+            kb_root = base / "Knowledge Repository"
+            policy_docx = kb_root / "20_Domain_Knowledge" / "Eventranz" / "Policy" / "Treasury_Operations_Policy.docx"
+            _make_policy_docx(policy_docx, include_focus_section=True)
+
+            paths = ensure_runtime_paths(work_root)
+            conn = db_connect(paths)
+            report = sync_kb(conn=conn, kb_root=kb_root, report_path=paths.kb_system_root / "kb_sync_latest.json")
+            self.assertTrue(report["ok"])
+
+            rows = conn.execute(
+                "SELECT source_group FROM kb_files WHERE path=?",
+                (str(policy_docx.resolve()),),
+            ).fetchall()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(str(rows[0]["source_group"]), "policy_reference")
+
+            chunk_count = int(
+                conn.execute(
+                    "SELECT COUNT(*) AS c FROM kb_chunks WHERE path=?",
+                    (str(policy_docx.resolve()),),
+                ).fetchone()["c"]
+                or 0
+            )
+            meta_count = int(
+                conn.execute(
+                    "SELECT COUNT(*) AS c FROM kb_chunk_meta WHERE path=?",
+                    (str(policy_docx.resolve()),),
+                ).fetchone()["c"]
+                or 0
+            )
+            self.assertGreater(chunk_count, 0)
+            self.assertEqual(chunk_count, meta_count)
+
+            hits = retrieve_kb(
+                conn=conn,
+                query="10.2.3 Segregation of duties",
+                task_type="REVISION_UPDATE",
+                top_k=8,
+                kb_root=kb_root,
+                kb_company="Eventranz",
+                isolation_mode="company_strict",
+            )
+            self.assertTrue(any(str(h.get("doc_type") or "") == "policy" for h in hits))
+            self.assertTrue(any(str(h.get("section_number") or "").startswith("10.2.3") for h in hits))
+
+            local_only = retrieve_kb_with_fallback(
+                conn=conn,
+                query="Segregation of duties",
+                task_type="REVISION_UPDATE",
+                rag_backend="local",
+                kb_root=kb_root,
+                kb_company="Eventranz",
+                isolation_mode="company_strict",
+            )
+            self.assertEqual(local_only.get("backend"), "local")
+            self.assertTrue(any(str(h.get("section_title") or "").lower().find("segregation") >= 0 for h in local_only.get("hits") or []))
+            conn.close()
+
+    def test_policy_reference_weight_between_general_and_reference(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            work_root = base / "Translation Task"
+            kb_root = base / "Knowledge Repository"
+            company = "Eventranz"
+
+            general_file = kb_root / "20_Domain_Knowledge" / company / "general.txt"
+            ref_file = kb_root / "30_Reference" / company / "Project" / "final" / "ref.txt"
+            policy_docx = kb_root / "20_Domain_Knowledge" / company / "Policy" / "Treasury_Operations_Policy.docx"
+
+            general_file.parent.mkdir(parents=True, exist_ok=True)
+            ref_file.parent.mkdir(parents=True, exist_ok=True)
+            general_file.write_text("policyterm sharedtoken", encoding="utf-8")
+            ref_file.write_text("policyterm sharedtoken", encoding="utf-8")
+            _make_policy_docx(policy_docx, include_focus_section=False, body_tail="policyterm sharedtoken")
+
+            paths = ensure_runtime_paths(work_root)
+            conn = db_connect(paths)
+            report = sync_kb(conn=conn, kb_root=kb_root)
+            self.assertTrue(report["ok"])
+
+            hits = retrieve_kb(
+                conn=conn,
+                query="policyterm",
+                task_type="REVISION_UPDATE",
+                top_k=20,
+                kb_root=kb_root,
+                kb_company=company,
+                isolation_mode="company_strict",
+            )
+            max_score: dict[str, float] = {}
+            for hit in hits:
+                group = str(hit.get("source_group") or "")
+                score = float(hit.get("score") or 0.0)
+                if group not in max_score or score > max_score[group]:
+                    max_score[group] = score
+
+            self.assertIn("general", max_score)
+            self.assertIn("policy_reference", max_score)
+            self.assertIn("previously_translated", max_score)
+            self.assertLess(max_score["general"], max_score["policy_reference"])
+            self.assertLess(max_score["policy_reference"], max_score["previously_translated"])
             conn.close()
 
     def test_sync_kb_with_rag_calls_delete_on_removed_paths(self):
