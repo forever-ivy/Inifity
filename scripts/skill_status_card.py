@@ -63,7 +63,6 @@ _STATUS_LABEL: dict[str, str] = {
     "queued": "⏳ Queued",
     "received": "📩 Received",
     "running": "🔄 Running...",
-    "batch_dispatched": "🧩 Batch queued",
     "canceled": "⏹️ Canceled",
     "review_ready": "✅ Review ready",
     "needs_attention": "⚠️ Needs attention",
@@ -86,7 +85,6 @@ _COMMANDS_BY_STATUS: dict[str, str] = {
     "queued": "status | cancel",
     "received": "run | status | discard",
     "running": "status | cancel",
-    "batch_dispatched": "status | cancel | new",
     "canceled": "rerun | discard | status",
     "review_ready": "ok | no {reason} | rerun | status",
     "needs_attention": "ok | no {reason} | rerun | discard | status",
@@ -126,8 +124,6 @@ def build_status_card(
     queue_cancel_requested_at: str = "",
     queue_cancel_reason: str = "",
     queue_cancel_mode: str = "",
-    batch_summary_line: str = "",
-    batch_children_sample: str = "",
 ) -> str:
     job_id = str(job.get("job_id") or "unknown")
     status = str(job.get("status") or "unknown")
@@ -171,29 +167,6 @@ def build_status_card(
     if why_lines:
         detail_lines.append("Why:")
         detail_lines.extend([f"- {x}" for x in why_lines[:3]])
-
-    # Batch parent summary (split-by-file mode)
-    status_norm = status.strip().lower()
-    is_batch_parent = status_norm == "batch_dispatched" or any(str(x).strip() == "batch_parent" for x in status_flags)
-    batch = artifacts.get("batch") if isinstance(artifacts.get("batch"), dict) else {}
-    child_jobs = batch.get("child_jobs") if isinstance(batch.get("child_jobs"), list) else []
-    if is_batch_parent and child_jobs:
-        if batch_summary_line.strip():
-            detail_lines.append(str(batch_summary_line).strip())
-        else:
-            detail_lines.append(f"\U0001f9fe Batch: total={len(child_jobs)}")
-        if batch_children_sample.strip():
-            detail_lines.append(str(batch_children_sample).strip())
-        else:
-            sample_ids: list[str] = []
-            for entry in child_jobs[:5]:
-                if not isinstance(entry, dict):
-                    continue
-                cid = str(entry.get("child_job_id") or "").strip()
-                if cid:
-                    sample_ids.append(cid)
-            if sample_ids:
-                detail_lines.append(f"\U0001f4ce Children (sample): {', '.join(sample_ids)}")
 
     queue_state_norm = str(queue_state or "").strip().lower()
     queue_worker_norm = str(queue_worker_id or "").strip()

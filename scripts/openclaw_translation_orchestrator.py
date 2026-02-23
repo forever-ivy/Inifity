@@ -1144,20 +1144,7 @@ def _compact_knowledge_context(hits: list[dict[str, Any]]) -> list[dict[str, Any
             out.append({"snippet": _truncate_text(hit, max_chars=OPENCLAW_KB_CONTEXT_MAX_CHARS)})
             continue
         row: dict[str, Any] = {}
-        for key in (
-            "id",
-            "source",
-            "path",
-            "title",
-            "score",
-            "company",
-            "doc_id",
-            "chunk_id",
-            "section_number",
-            "section_title",
-            "section_path",
-            "doc_type",
-        ):
+        for key in ("id", "source", "path", "title", "score", "company", "doc_id", "chunk_id"):
             if key in hit:
                 row[key] = hit.get(key)
         snippet = hit.get("snippet")
@@ -1170,37 +1157,6 @@ def _compact_knowledge_context(hits: list[dict[str, Any]]) -> list[dict[str, Any
         if not row:
             row["snippet"] = _truncate_text(json.dumps(hit, ensure_ascii=False), max_chars=OPENCLAW_KB_CONTEXT_MAX_CHARS)
         out.append(row)
-    return out
-
-
-def _build_policy_outline_context(hits: list[dict[str, Any]], *, limit: int = 12) -> list[str]:
-    if limit <= 0:
-        return []
-    out: list[str] = []
-    seen: set[str] = set()
-    for hit in list(hits or []):
-        if not isinstance(hit, dict):
-            continue
-        if str(hit.get("doc_type") or "").strip().lower() != "policy":
-            continue
-        number = str(hit.get("section_number") or "").strip()
-        title = str(hit.get("section_title") or "").strip()
-        path = str(hit.get("section_path") or "").strip()
-        if number and title:
-            line = f"{number} {title}".strip()
-        elif path:
-            line = path
-        elif title:
-            line = title
-        else:
-            continue
-        key = line.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(line)
-        if len(out) >= limit:
-            break
     return out
 
 
@@ -2553,8 +2509,6 @@ def _build_execution_context(
 ) -> dict[str, Any]:
     task_type = str(intent.get("task_type", "LOW_CONTEXT_TASK"))
     include_candidate_text = task_type != "SPREADSHEET_TRANSLATION"
-    compact_hits = _compact_knowledge_context(kb_hits)
-    policy_outline_context = _build_policy_outline_context(compact_hits, limit=12)
     context: dict[str, Any] = {
         "job_id": meta.get("job_id"),
         "subject": meta.get("subject", ""),
@@ -2562,7 +2516,7 @@ def _build_execution_context(
         "task_intent": intent,
         "selected_tool": task_type,
         "candidate_files": _candidate_payload(candidates, include_text=include_candidate_text),
-        "knowledge_context": compact_hits,
+        "knowledge_context": _compact_knowledge_context(kb_hits),
         "cross_job_memories": list(meta.get("cross_job_memories") or []),
         "rules": {
             "preserve_structure_first": True,
@@ -2571,8 +2525,6 @@ def _build_execution_context(
             "manual_delivery_only": True,
         },
     }
-    if policy_outline_context:
-        context["policy_outline_context"] = policy_outline_context
     # Add revision pack for REVISION_UPDATE tasks
     if revision_pack:
         context["revision_pack"] = revision_pack.to_dict()
@@ -2611,13 +2563,6 @@ PRESERVED_TEXT_MAP (copy these texts EXACTLY for the corresponding unit IDs):
 - Return JSON only with complete per-cell translations; no summarization.
 - If you detect a source cell itself is truncated/incomplete, append {SOURCE_TRUNCATED_MARKER} at the end of that cell's translation.
 - XLSX batch hint: {xlsx_batch_hint}
-"""
-        policy_rules = ""
-        policy_outline = context_payload.get("policy_outline_context")
-        if isinstance(policy_outline, list) and policy_outline:
-            policy_rules = """
-- If execution_context.policy_outline_context is present, follow that chapter order and numbering hierarchy first.
-- Policy outline is a soft constraint: you may add clarifying content, but do not reorder or break the reference section sequence.
 """
 
         return f"""
@@ -2659,7 +2604,6 @@ Rules:
   A translation that only covers the first half of the source is WRONG and will be rejected.
   If you cannot fit all cells completely, translate FEWER cells but translate each one FULLY.
 {batch_rules}
-{policy_rules}
 - If execution_context.glossary_enforcer.terms is present, you MUST apply those term mappings strictly (Arabic => English).
   For every unit/cell whose source text contains a glossary Arabic term, the corresponding translated text MUST contain the required English translation.
   Never append standalone glossary labels at the end (e.g., "... Artificial Intelligence (AI)").
@@ -3499,13 +3443,6 @@ CRITICAL REVISION CONTEXT:
 PRESERVED_TEXT_MAP (copy these texts EXACTLY for the corresponding unit IDs):
 {json.dumps(context.get("revision_pack", {}).get("preserved_text_map", {}), ensure_ascii=False)}
 """
-    policy_rules = ""
-    policy_outline = context.get("policy_outline_context")
-    if isinstance(policy_outline, list) and policy_outline:
-        policy_rules = """
-- If execution_context.policy_outline_context is present, follow that chapter order and numbering hierarchy first.
-- Policy outline is a soft constraint: you may add clarifying content, but do not reorder or break the reference section sequence.
-"""
 
     prompt = f"""
 You are a translation generator (GLM). Work on this translation job and return strict JSON only.
@@ -3545,7 +3482,6 @@ Rules:
   Compare your translation against the source: if the source has 5 sentences, your translation must have 5 sentences.
   A translation that only covers the first half of the source is WRONG and will be rejected.
   If you cannot fit all cells completely, translate FEWER cells but translate each one FULLY.
-{policy_rules}
 - If execution_context.glossary_enforcer.terms is present, you MUST apply those term mappings strictly (Arabic => English).
   For every unit/cell whose source text contains a glossary Arabic term, the corresponding translated text MUST contain the required English translation.
   Never append standalone glossary labels at the end (e.g., "... Artificial Intelligence (AI)").
@@ -3916,87 +3852,6 @@ def _run_vision_trials(
     return findings, warnings, results
 
 
-def _validate_policy_structure_coverage(
-    context: dict[str, Any],
-    draft: dict[str, Any],
-) -> tuple[list[str], list[str], dict[str, Any]]:
-    findings: list[str] = []
-    warnings: list[str] = []
-    meta: dict[str, Any] = {
-        "enabled": False,
-        "expected_main_sections": [],
-        "covered_main_sections": [],
-        "coverage": 0.0,
-        "skipped_reason": "",
-    }
-    outline = context.get("policy_outline_context")
-    if not isinstance(outline, list) or not outline:
-        meta["skipped_reason"] = "no_policy_outline_context"
-        return findings, warnings, meta
-
-    expected_main: list[str] = []
-    for item in outline:
-        line = str(item or "").strip()
-        if not line:
-            continue
-        match = re.match(r"^(\d+)(?:\.\d+)*", line)
-        if not match:
-            continue
-        main = str(match.group(1) or "").strip()
-        if main and main not in expected_main:
-            expected_main.append(main)
-    if not expected_main:
-        meta["enabled"] = True
-        meta["skipped_reason"] = "no_numbered_outline"
-        return findings, warnings, meta
-
-    parts: list[str] = []
-    for key in ("final_reflow_text", "final_text"):
-        value = draft.get(key)
-        if isinstance(value, str) and value.strip():
-            parts.append(value)
-    docx_map = draft.get("docx_translation_map")
-    if isinstance(docx_map, list):
-        for row in docx_map:
-            if not isinstance(row, dict):
-                continue
-            text = row.get("text")
-            if isinstance(text, str) and text.strip():
-                parts.append(text)
-    elif isinstance(docx_map, dict):
-        for text in docx_map.values():
-            if isinstance(text, str) and text.strip():
-                parts.append(text)
-
-    output_text = "\n".join(parts)
-    if not output_text.strip():
-        meta["enabled"] = True
-        meta["skipped_reason"] = "no_output_text"
-        return findings, warnings, meta
-
-    covered: list[str] = []
-    for sec in expected_main:
-        pattern = re.compile(rf"(^|\n)\s*{re.escape(sec)}(?:[.\s]|$)")
-        if pattern.search(output_text):
-            covered.append(sec)
-
-    coverage = float(len(covered)) / float(len(expected_main)) if expected_main else 0.0
-    meta.update(
-        {
-            "enabled": True,
-            "expected_main_sections": expected_main,
-            "covered_main_sections": covered,
-            "coverage": round(float(coverage), 6),
-            "skipped_reason": "",
-        }
-    )
-    if coverage < 0.6:
-        findings.append(f"policy_structure_coverage_failed:main={round(coverage, 4)}")
-    elif coverage < 0.8:
-        warnings.append(f"policy_structure_coverage_warning:main={round(coverage, 4)}")
-    return findings, warnings, meta
-
-
 def _compute_hard_gates(
     *,
     review_dir: str,
@@ -4020,15 +3875,12 @@ def _compute_hard_gates(
     # flood findings due to missing translation map entries.
     if not preserve_findings:
         glossary_findings, glossary_meta = _validate_glossary_enforcer(context, draft)
-    policy_findings, policy_warnings, policy_meta = _validate_policy_structure_coverage(context, draft)
 
     findings: list[str] = []
     findings.extend(markdown_findings)
     findings.extend(preserve_findings)
     findings.extend(glossary_findings)
-    findings.extend(policy_findings)
     warnings: list[str] = []
-    warnings.extend(policy_warnings)
     source_truncated_count = int(preserve_meta.get("xlsx_source_truncated_count", 0) or 0)
     if source_truncated_count > 0:
         warnings.append(f"xlsx_source_truncated:cells={source_truncated_count}")
@@ -4054,7 +3906,6 @@ def _compute_hard_gates(
         "markdown_sanity": markdown_sanity,
         "preserve_coverage": {"findings": preserve_findings, "meta": preserve_meta},
         "glossary_enforcer": {"findings": glossary_findings, "meta": glossary_meta},
-        "policy_structure": {"findings": policy_findings, "warnings": policy_warnings, "meta": policy_meta},
         "vision_trial": vision_results,
     }
     return findings, warnings, meta
