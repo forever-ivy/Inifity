@@ -73,6 +73,18 @@ Knowledge Repository/
 - `OPENCLAW_RAG_COLLECTION_MODE`：`auto`（默认）/ `shared` / `per_company`。
   - `auto`：当 `OPENCLAW_KB_ISOLATION_MODE=company_strict` 且 job 有 `kb_company` 时，自动启用 `per_company`。
 
+### 3.3 政策文档结构学习（DOCX policy）
+入口：`scripts/policy_structure.py` + `scripts/v4_kb.py:sync_kb()`。
+
+关键机制：
+- 对 `.docx` 自动进行 policy 结构识别（编号章节 + 目录噪声清洗），并输出 sidecar：`<doc>.policy_struct.v1.json`。
+- 当满足 `is_policy_like=true`（`section_heading_count >= 8` 且 `max_level >= 2`）时：
+  - chunk 采用 section-aware 切分（不跨章节）；
+  - `source_group` 提升为 `policy_reference`（中权重）；
+  - chunk 元数据写入 `kb_chunk_meta`（`section_number/section_title/section_path/doc_type`）。
+- `kb_chunk_meta` 为增量兼容表：旧流程不依赖它，新流程可按 section 召回。
+- 对 `20_Domain_Knowledge/{Company}/Policy/*.docx` 会做跨公司同名文档 `sha256` 漂移检测，仅告警不自动覆盖。
+
 ## 4. KB 如何被“检索并注入到 run”
 
 ### 4.1 run 前置：sync + retrieve
@@ -86,6 +98,7 @@ Knowledge Repository/
    - 合并去重后做统一重排（merge + rerank），而不是“远端命中直接覆盖本地”
    - 当 clawrag 不可用时自动回退为本地-only（`rag_fallback_local` flag）
 3) `knowledge_context`（hits 列表）写入 `meta`，作为 `openclaw_translation_orchestrator.run()` 的输入上下文。
+   - 若命中 policy chunk，会附带 `section_number/section_title/section_path/doc_type`，供生成侧按结构约束使用。
 
 相关环境变量（rerank）：
 - `OPENCLAW_KB_RERANK_FINAL_K`（默认 `12`）

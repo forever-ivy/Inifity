@@ -14,6 +14,7 @@ from openpyxl import Workbook
 from scripts.openclaw_translation_orchestrator import (
     _agent_call,
     _available_slots,
+    _build_execution_context,
     _strip_redundant_glossary_suffixes,
     _compact_knowledge_context,
     _compact_xlsx_prompt_payload,
@@ -26,6 +27,7 @@ from scripts.openclaw_translation_orchestrator import (
     _llm_intent,
     _trim_xlsx_prompt_text,
     _validate_format_preserve_coverage,
+    _validate_policy_structure_coverage,
     run,
 )
 
@@ -735,6 +737,51 @@ class PromptCompactionHelpersTest(unittest.TestCase):
         self.assertLessEqual(len(compact), 6)
         snippet = str((compact[0] or {}).get("snippet") or "")
         self.assertTrue(len(snippet) <= 1201)
+
+    def test_build_execution_context_adds_policy_outline_context(self):
+        meta = {"job_id": "job_policy", "subject": "", "message_text": "", "cross_job_memories": []}
+        candidates: list[dict] = []
+        intent = {"task_type": "NEW_TRANSLATION"}
+        kb_hits = [
+            {"doc_type": "policy", "section_number": "10.2.3", "section_title": "Segregation of duties", "snippet": "s1"},
+            {"doc_type": "policy", "section_number": "10.2.4", "section_title": "Record keeping", "snippet": "s2"},
+            {"doc_type": "general", "snippet": "ignore"},
+        ]
+        context = _build_execution_context(meta, candidates, intent, kb_hits)
+        outline = context.get("policy_outline_context")
+        self.assertIsInstance(outline, list)
+        self.assertTrue(any("10.2.3" in str(item) for item in outline or []))
+
+    def test_build_execution_context_skips_policy_outline_for_non_policy_hits(self):
+        meta = {"job_id": "job_no_policy", "subject": "", "message_text": "", "cross_job_memories": []}
+        candidates: list[dict] = []
+        intent = {"task_type": "NEW_TRANSLATION"}
+        kb_hits = [{"doc_type": "general", "snippet": "plain context"}]
+        context = _build_execution_context(meta, candidates, intent, kb_hits)
+        self.assertNotIn("policy_outline_context", context)
+
+    def test_validate_policy_structure_coverage_thresholds(self):
+        context = {
+            "policy_outline_context": [
+                "1 Introduction",
+                "2 Governance",
+                "3 Treasury",
+                "4 Controls",
+                "5 Reporting",
+            ]
+        }
+        warning_draft = {"final_text": "1 Introduction\n2 Governance\n3 Treasury"}
+        fail_draft = {"final_text": "1 Introduction\n2 Governance"}
+
+        f1, w1, m1 = _validate_policy_structure_coverage(context, warning_draft)
+        self.assertEqual(len(f1), 0)
+        self.assertTrue(any(str(x).startswith("policy_structure_coverage_warning:") for x in w1))
+        self.assertGreaterEqual(float(m1.get("coverage") or 0.0), 0.6)
+
+        f2, w2, m2 = _validate_policy_structure_coverage(context, fail_draft)
+        self.assertTrue(any(str(x).startswith("policy_structure_coverage_failed:") for x in f2))
+        self.assertEqual(len(w2), 0)
+        self.assertLess(float(m2.get("coverage") or 1.0), 0.6)
 
     def test_trim_xlsx_prompt_text(self):
         context = {

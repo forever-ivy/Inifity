@@ -30,6 +30,7 @@ TASK_DOC_EXTENSIONS = {".docx"}
 SOURCE_GROUP_WEIGHTS = {
     "glossary": 1.7,
     "previously_translated": 1.4,
+    "policy_reference": 1.15,
     "translated_output": 1.2,   # Generic translated output
     "translated_en": 1.2,       # Backward compatible
     "source_text": 1.0,         # Generic source text
@@ -247,6 +248,20 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_kb_chunks_path ON kb_chunks(path);
         CREATE INDEX IF NOT EXISTS idx_kb_chunks_source ON kb_chunks(source_group);
+        CREATE TABLE IF NOT EXISTS kb_chunk_meta (
+            path TEXT NOT NULL,
+            chunk_index INTEGER NOT NULL,
+            section_id TEXT DEFAULT '',
+            section_number TEXT DEFAULT '',
+            section_title TEXT DEFAULT '',
+            section_path TEXT DEFAULT '',
+            section_level INTEGER NOT NULL DEFAULT 0,
+            doc_type TEXT DEFAULT '',
+            tags_json TEXT DEFAULT '[]',
+            PRIMARY KEY(path, chunk_index)
+        );
+        CREATE INDEX IF NOT EXISTS idx_kb_chunk_meta_path_chunk ON kb_chunk_meta(path, chunk_index);
+        CREATE INDEX IF NOT EXISTS idx_kb_chunk_meta_section ON kb_chunk_meta(section_number, doc_type);
 
         CREATE TABLE IF NOT EXISTS events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1428,6 +1443,27 @@ def get_sender_active_job(conn: sqlite3.Connection, *, sender: str) -> str | Non
     if not row:
         return None
     return str(row["active_job_id"])
+
+
+def get_last_kb_company_for_sender(conn: sqlite3.Connection, *, sender: str) -> str:
+    """Return the most recent non-empty kb_company for a sender (or empty string)."""
+    sender_norm = (sender or "").strip()
+    if not sender_norm:
+        return ""
+    row = conn.execute(
+        """
+        SELECT kb_company
+        FROM jobs
+        WHERE sender=?
+          AND TRIM(kb_company) != ''
+        ORDER BY updated_at DESC
+        LIMIT 1
+        """,
+        (sender_norm,),
+    ).fetchone()
+    if not row:
+        return ""
+    return str(row["kb_company"] or "").strip()
 
 
 def list_actionable_jobs_for_sender(conn: sqlite3.Connection, *, sender: str, limit: int = 20) -> list[dict[str, Any]]:
