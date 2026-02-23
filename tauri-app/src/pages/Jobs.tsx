@@ -48,29 +48,10 @@ export function Jobs() {
   const fetchJobMilestones = useAppStore((s) => s.fetchJobMilestones);
   const isLoading = useAppStore((s) => s.isLoading);
   const [statusFilter, setStatusFilter] = useState<string | null>(null);
-  const selectedJob = selectedJobId ? jobs.find((j) => j.jobId === selectedJobId) : null;
 
   useEffect(() => {
     fetchJobs(statusFilter ?? undefined);
   }, [fetchJobs, statusFilter]);
-
-  // Poll milestones in real-time for the selected running job.
-  useEffect(() => {
-    if (!selectedJobId) return;
-    if (selectedJob?.status !== "running") return;
-
-    const milestonesTimer = window.setInterval(() => {
-      fetchJobMilestones(selectedJobId, { silent: true });
-    }, 2000);
-    const jobsTimer = window.setInterval(() => {
-      fetchJobs(statusFilter ?? undefined, { silent: true });
-    }, 8000);
-
-    return () => {
-      window.clearInterval(milestonesTimer);
-      window.clearInterval(jobsTimer);
-    };
-  }, [fetchJobMilestones, fetchJobs, selectedJob?.status, selectedJobId, statusFilter]);
 
   const handleJobClick = async (jobId: string) => {
     useAppStore.getState().setSelectedJobId(jobId);

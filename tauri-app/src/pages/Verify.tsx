@@ -2,7 +2,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { useAppStore } from "@/stores/appStore";
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { MotionCard, CountUp, staggerContainer, staggerItem } from "@/components/ui/motion";
 import * as tauri from "@/lib/tauri";
@@ -18,18 +18,14 @@ import {
 
 export function Verify() {
   const jobs = useAppStore((s) => s.jobs);
-  const selectedJobArtifacts = useAppStore((s) => s.selectedJobArtifacts);
-  const selectedJobQuality = useAppStore((s) => s.selectedJobQuality);
-  const fetchJobs = useAppStore((s) => s.fetchJobs);
+  const jobArtifactsById = useAppStore((s) => s.jobArtifactsById);
+  const jobQualityById = useAppStore((s) => s.jobQualityById);
+  const jobArtifactsLoadingById = useAppStore((s) => s.jobArtifactsLoadingById);
+  const refreshVerifyData = useAppStore((s) => s.refreshVerifyData);
   const fetchJobArtifacts = useAppStore((s) => s.fetchJobArtifacts);
   const isLoading = useAppStore((s) => s.isLoading);
   const addToast = useAppStore((s) => s.addToast);
   const [expandedJob, setExpandedJob] = useState<string | null>(null);
-  const [artifactsLoadingJobId, setArtifactsLoadingJobId] = useState<string | null>(null);
-
-  useEffect(() => {
-    fetchJobs("review_ready");
-  }, [fetchJobs]);
 
   const handleJobExpand = async (jobId: string) => {
     if (expandedJob === jobId) {
@@ -37,12 +33,7 @@ export function Verify() {
     } else {
       setExpandedJob(jobId);
       useAppStore.getState().setSelectedJobId(jobId);
-      setArtifactsLoadingJobId(jobId);
-      try {
-        await fetchJobArtifacts(jobId);
-      } finally {
-        setArtifactsLoadingJobId((cur) => (cur === jobId ? null : cur));
-      }
+      await fetchJobArtifacts(jobId);
     }
   };
 
@@ -87,7 +78,7 @@ export function Verify() {
           <p className="text-muted-foreground">Review and approve translated artifacts</p>
         </div>
         <motion.div whileHover={{ scale: 1.02 }} whileTap={{ scale: 0.98 }}>
-          <Button variant="outline" size="sm" onClick={() => fetchJobs("review_ready")} disabled={isLoading}>
+          <Button variant="outline" size="sm" onClick={() => refreshVerifyData()} disabled={isLoading}>
             <RefreshCw className={`h-4 w-4 mr-2 ${isLoading ? "animate-spin" : ""}`} />
             Refresh
           </Button>
@@ -122,7 +113,11 @@ export function Verify() {
               </Card>
             </motion.div>
           ) : (
-            reviewReadyJobs.map((job) => (
+            reviewReadyJobs.map((job) => {
+              const jobArtifacts = jobArtifactsById[job.jobId] || [];
+              const jobQuality = jobQualityById[job.jobId] ?? null;
+              const isArtifactsLoading = !!jobArtifactsLoadingById[job.jobId];
+              return (
               <motion.div
                 key={job.jobId}
                 variants={staggerItem}
@@ -133,11 +128,15 @@ export function Verify() {
                   <Card variant="glass" className={expandedJob === job.jobId ? "ring-2 ring-primary" : ""}>
                     <CardHeader className="flex flex-row items-center justify-between">
                       <div className="flex items-center gap-3">
-                        <CardTitle
-                          className="text-base cursor-pointer hover:text-primary transition-colors"
-                          onClick={() => handleJobExpand(job.jobId)}
-                        >
-                          {job.jobId}
+                        <CardTitle className="text-base">
+                          <button
+                            type="button"
+                            className="cursor-pointer hover:text-primary transition-colors text-left"
+                            onClick={() => handleJobExpand(job.jobId)}
+                            aria-label={`Toggle details for ${job.jobId}`}
+                          >
+                            {job.jobId}
+                          </button>
                         </CardTitle>
                         <motion.div
                           initial={{ scale: 0.8, opacity: 0 }}
@@ -174,18 +173,18 @@ export function Verify() {
                             {/* Artifacts */}
                             <div>
                               <h4 className="text-sm font-medium mb-2">Artifacts</h4>
-                              {artifactsLoadingJobId === job.jobId ? (
+                              {isArtifactsLoading ? (
                                 <p className="text-sm text-muted-foreground">Loading artifacts...</p>
-                              ) : selectedJobArtifacts.length === 0 ? (
+                              ) : jobArtifacts.length === 0 ? (
                                 <p className="text-sm text-muted-foreground">No artifacts found.</p>
                               ) : (
                                 <motion.div
-                                  className="grid grid-cols-2 gap-2"
+                                  className="grid grid-cols-1 md:grid-cols-2 gap-2"
                                   variants={staggerContainer}
                                   initial="hidden"
                                   animate="show"
                                 >
-                                  {selectedJobArtifacts.map((artifact) => (
+                                  {jobArtifacts.map((artifact) => (
                                     <motion.div
                                       key={artifact.name}
                                       variants={staggerItem}
@@ -212,6 +211,7 @@ export function Verify() {
                                             size="icon"
                                             className="h-8 w-8"
                                             onClick={() => handleOpenArtifact(artifact.path)}
+                                            aria-label={`Open ${artifact.name}`}
                                           >
                                             <ExternalLink className="h-4 w-4" />
                                           </Button>
@@ -225,14 +225,14 @@ export function Verify() {
 
                             {/* Quality Report */}
                             <AnimatePresence>
-                              {selectedJobQuality ? (
+                              {jobQuality ? (
                                 <motion.div
                                   initial={{ opacity: 0, y: 10 }}
                                   animate={{ opacity: 1, y: 0 }}
                                   exit={{ opacity: 0, y: 10 }}
                                 >
                                   <h4 className="text-sm font-medium mb-2">Quality Report</h4>
-                                  <div className="grid grid-cols-3 gap-4 p-4 rounded-lg bg-card/50 backdrop-blur-sm border border-border/50">
+                                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 p-4 rounded-lg bg-card/50 backdrop-blur-sm border border-border/50">
                                     <motion.div
                                       className="text-center"
                                       initial={{ scale: 0.8, opacity: 0 }}
@@ -241,14 +241,14 @@ export function Verify() {
                                     >
                                       <p
                                         className={`text-2xl font-bold ${
-                                          selectedJobQuality.terminologyHit >= 80
+                                          jobQuality.terminologyHit >= 80
                                             ? "text-green-600"
-                                            : selectedJobQuality.terminologyHit >= 60
+                                            : jobQuality.terminologyHit >= 60
                                               ? "text-yellow-600"
                                               : "text-red-600"
                                         }`}
                                       >
-                                        <CountUp value={selectedJobQuality.terminologyHit} suffix="%" />
+                                        <CountUp value={jobQuality.terminologyHit} suffix="%" />
                                       </p>
                                       <p className="text-xs text-muted-foreground">Terminology Hit</p>
                                     </motion.div>
@@ -260,14 +260,14 @@ export function Verify() {
                                     >
                                       <p
                                         className={`text-2xl font-bold ${
-                                          selectedJobQuality.structureFidelity >= 90
+                                          jobQuality.structureFidelity >= 90
                                             ? "text-green-600"
-                                            : selectedJobQuality.structureFidelity >= 70
+                                            : jobQuality.structureFidelity >= 70
                                               ? "text-yellow-600"
                                               : "text-red-600"
                                         }`}
                                       >
-                                        <CountUp value={selectedJobQuality.structureFidelity} suffix="%" />
+                                        <CountUp value={jobQuality.structureFidelity} suffix="%" />
                                       </p>
                                       <p className="text-xs text-muted-foreground">Structure Fidelity</p>
                                     </motion.div>
@@ -279,20 +279,20 @@ export function Verify() {
                                     >
                                       <p
                                         className={`text-2xl font-bold ${
-                                          selectedJobQuality.purityScore >= 95
+                                          jobQuality.purityScore >= 95
                                             ? "text-green-600"
-                                            : selectedJobQuality.purityScore >= 90
+                                            : jobQuality.purityScore >= 90
                                               ? "text-yellow-600"
                                               : "text-red-600"
                                         }`}
                                       >
-                                        <CountUp value={selectedJobQuality.purityScore} suffix="%" />
+                                        <CountUp value={jobQuality.purityScore} suffix="%" />
                                       </p>
                                       <p className="text-xs text-muted-foreground">Purity Score</p>
                                     </motion.div>
                                   </div>
                                 </motion.div>
-                              ) : artifactsLoadingJobId === job.jobId ? (
+                              ) : isArtifactsLoading ? (
                                 <motion.div
                                   initial={{ opacity: 0, y: 10 }}
                                   animate={{ opacity: 1, y: 0 }}
@@ -318,13 +318,13 @@ export function Verify() {
                             {/* Actions */}
                             <div className="flex gap-2 pt-2">
                               <motion.div whileHover={{ scale: 1.02 }} whileTap={{ scale: 0.98 }}>
-                                <Button variant="outline" disabled>
+                                <Button variant="outline" disabled title="Coming soon">
                                   <CheckCircle2 className="h-4 w-4 mr-2" />
                                   Mark as Reviewed
                                 </Button>
                               </motion.div>
                               <motion.div whileHover={{ scale: 1.02 }} whileTap={{ scale: 0.98 }}>
-                                <Button variant="ghost" disabled>
+                                <Button variant="ghost" disabled title="Coming soon">
                                   <FileCheck className="h-4 w-4 mr-2" />
                                   View Report Details
                                 </Button>
@@ -337,7 +337,8 @@ export function Verify() {
                   </Card>
                 </MotionCard>
               </motion.div>
-            ))
+              );
+            })
           )}
         </AnimatePresence>
       </motion.div>

@@ -1,4 +1,3 @@
-import { useEffect } from "react";
 import { cn } from "@/lib/utils";
 import { useAppStore } from "@/stores/appStore";
 import {
@@ -44,14 +43,6 @@ export function Sidebar() {
   const sidebarCollapsed = useAppStore((s) => s.sidebarCollapsed);
   const setSidebarCollapsed = useAppStore((s) => s.setSidebarCollapsed);
   const services = useAppStore((s) => s.services);
-  const fetchServices = useAppStore((s) => s.fetchServices);
-
-  // Poll service status every 15s
-  useEffect(() => {
-    fetchServices();
-    const interval = setInterval(fetchServices, 15000);
-    return () => clearInterval(interval);
-  }, [fetchServices]);
 
   const currentThemeOption = themeOptions.find((o) => o.value === theme) || themeOptions[2];
   const ThemeIcon = currentThemeOption.icon;
@@ -96,6 +87,8 @@ export function Sidebar() {
         </AnimatePresence>
         <motion.button
           onClick={() => setSidebarCollapsed(!sidebarCollapsed)}
+          aria-label={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+          type="button"
           whileHover={{ scale: 1.1 }}
           whileTap={{ scale: 0.9 }}
           className={cn(
@@ -118,6 +111,9 @@ export function Sidebar() {
           <motion.button
             key={item.id}
             onClick={() => setActiveTab(item.id)}
+            aria-current={activeTab === item.id ? "page" : undefined}
+            aria-label={item.label}
+            type="button"
             whileHover={{ scale: 1.02, x: sidebarCollapsed ? 0 : 2 }}
             whileTap={{ scale: 0.98 }}
             className={cn(
@@ -151,6 +147,8 @@ export function Sidebar() {
       <div className="p-3 border-t border-border/50">
         <motion.button
           onClick={cycleTheme}
+          aria-label={`Switch theme (current: ${currentThemeOption.label})`}
+          type="button"
           whileHover={{ scale: 1.05 }}
           whileTap={{ scale: 0.95 }}
           className={cn(

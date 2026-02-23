@@ -131,8 +131,9 @@ interface AppState {
   selectedJobId: string | null;
   setSelectedJobId: (id: string | null) => void;
   selectedJobMilestones: Milestone[];
-  selectedJobArtifacts: Artifact[];
-  selectedJobQuality: QualityReport | null;
+  jobArtifactsById: Record<string, Artifact[]>;
+  jobQualityById: Record<string, QualityReport | null>;
+  jobArtifactsLoadingById: Record<string, boolean>;
 
   // Preflight
   preflightChecks: PreflightCheck[];
@@ -209,11 +210,22 @@ interface AppState {
   // Model Availability
   modelAvailabilityReport: ModelAvailabilityReport | null;
   fetchModelAvailabilityReport: () => Promise<void>;
+
+  // Consolidated polling actions
+  refreshDashboardData: (opts?: { silent?: boolean; includeJobs?: boolean }) => Promise<void>;
+  refreshJobsData: (opts?: { silent?: boolean }) => Promise<void>;
+  refreshSelectedJobMilestones: (opts?: { silent?: boolean }) => Promise<void>;
+  refreshLogsData: (opts?: { silent?: boolean; lines?: number }) => Promise<void>;
+  refreshVerifyData: (opts?: { silent?: boolean }) => Promise<void>;
+  refreshApiConfigUsage: () => Promise<void>;
+  refreshApiConfigAvailability: () => Promise<void>;
+  refreshApiConfigData: () => Promise<void>;
 }
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 let servicesFetchInFlight = false;
 const logsFetchInFlight: Record<string, boolean> = {};
+const artifactRequestSeqByJob: Record<string, number> = {};
 
 export const useAppStore = create<AppState>((set, get) => ({
   // Services
@@ -286,10 +298,11 @@ export const useAppStore = create<AppState>((set, get) => ({
   jobs: [],
   setJobs: (jobs) => set({ jobs }),
   selectedJobId: null,
-  setSelectedJobId: (id) => set({ selectedJobId: id, selectedJobArtifacts: [], selectedJobQuality: null }),
+  setSelectedJobId: (id) => set({ selectedJobId: id }),
   selectedJobMilestones: [],
-  selectedJobArtifacts: [],
-  selectedJobQuality: null,
+  jobArtifactsById: {},
+  jobQualityById: {},
+  jobArtifactsLoadingById: {},
 
   // Preflight
   preflightChecks: [],
@@ -326,14 +339,9 @@ export const useAppStore = create<AppState>((set, get) => ({
 
     const { activeTab } = get();
 
-    // Fetch all relevant data based on current tab
     try {
       if (activeTab === "dashboard") {
-        await Promise.all([
-          get().fetchServices(),
-          get().fetchJobs(),
-          get().fetchDockerStatus(),
-        ]);
+        await get().refreshDashboardData({ includeJobs: true });
       } else if (activeTab === "services") {
         await Promise.all([
           get().fetchServices(),
@@ -341,13 +349,13 @@ export const useAppStore = create<AppState>((set, get) => ({
           get().fetchDockerStatus(),
         ]);
       } else if (activeTab === "jobs") {
-        await get().fetchJobs();
+        await Promise.all([get().refreshJobsData(), get().refreshSelectedJobMilestones()]);
+      } else if (activeTab === "verify") {
+        await get().refreshVerifyData();
+      } else if (activeTab === "logs") {
+        await get().refreshLogsData();
       } else if (activeTab === "api-config") {
-        await Promise.all([
-          get().fetchApiProviders(),
-          get().fetchModelAvailabilityReport(),
-        ]);
-        await get().fetchAllApiUsage();
+        await get().refreshApiConfigData();
       } else if (activeTab === "kb-health") {
         await Promise.all([
           get().fetchKbSyncReport(),
@@ -520,28 +528,57 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   fetchJobArtifacts: async (jobId: string) => {
+    const requestSeq = (artifactRequestSeqByJob[jobId] || 0) + 1;
+    artifactRequestSeqByJob[jobId] = requestSeq;
+    set((state) => ({
+      jobArtifactsLoadingById: {
+        ...state.jobArtifactsLoadingById,
+        [jobId]: true,
+      },
+    }));
+
     try {
       const [artifacts, quality] = await Promise.all([
         tauri.listVerifyArtifacts(jobId),
         tauri.getQualityReport(jobId).catch(() => null),
       ]);
+
+      if (artifactRequestSeqByJob[jobId] !== requestSeq) {
+        return;
+      }
+
       set({
-        selectedJobArtifacts: artifacts.map((a) => ({
-          name: a.name,
-          path: a.path,
-          size: a.size,
-          artifactType: a.artifact_type,
-        })),
-        selectedJobQuality: quality
-          ? {
-              terminologyHit: quality.terminology_hit,
-              structureFidelity: quality.structure_fidelity,
-              purityScore: quality.purity_score,
-            }
-          : null,
+        jobArtifactsById: {
+          ...get().jobArtifactsById,
+          [jobId]: artifacts.map((a) => ({
+            name: a.name,
+            path: a.path,
+            size: a.size,
+            artifactType: a.artifact_type,
+          })),
+        },
+        jobQualityById: {
+          ...get().jobQualityById,
+          [jobId]: quality
+            ? {
+                terminologyHit: quality.terminology_hit,
+                structureFidelity: quality.structure_fidelity,
+                purityScore: quality.purity_score,
+              }
+            : null,
+        },
       });
     } catch (err) {
       get().addToast("error", `Failed to fetch artifacts: ${err}`);
+    } finally {
+      if (artifactRequestSeqByJob[jobId] === requestSeq) {
+        set((state) => ({
+          jobArtifactsLoadingById: {
+            ...state.jobArtifactsLoadingById,
+            [jobId]: false,
+          },
+        }));
+      }
     }
   },
 
@@ -889,6 +926,45 @@ export const useAppStore = create<AppState>((set, get) => ({
     } catch (err) {
       get().addToast("error", `Failed to remove API key: ${err}`);
     }
+  },
+
+  // Consolidated polling actions
+  refreshDashboardData: async (opts?: { silent?: boolean; includeJobs?: boolean }) => {
+    await Promise.all([
+      get().fetchServices(),
+      get().fetchDockerStatus(),
+      opts?.includeJobs ? get().fetchJobs(undefined, { silent: opts?.silent }) : Promise.resolve(),
+    ]);
+  },
+  refreshJobsData: async (opts?: { silent?: boolean }) => {
+    await get().fetchJobs(undefined, { silent: opts?.silent });
+  },
+  refreshSelectedJobMilestones: async (opts?: { silent?: boolean }) => {
+    const selectedJobId = get().selectedJobId;
+    if (!selectedJobId) return;
+    const selectedJob = get().jobs.find((j) => j.jobId === selectedJobId);
+    if (!selectedJob || selectedJob.status !== "running") return;
+    await get().fetchJobMilestones(selectedJobId, { silent: opts?.silent });
+  },
+  refreshLogsData: async (opts?: { silent?: boolean; lines?: number }) => {
+    const service = get().selectedLogService;
+    await get().fetchLogs(service, opts?.lines ?? 200);
+  },
+  refreshVerifyData: async (opts?: { silent?: boolean }) => {
+    await get().fetchJobs("review_ready", { silent: opts?.silent });
+  },
+  refreshApiConfigUsage: async () => {
+    await get().fetchAllApiUsage();
+  },
+  refreshApiConfigAvailability: async () => {
+    await get().fetchModelAvailabilityReport();
+  },
+  refreshApiConfigData: async () => {
+    await get().fetchApiProviders();
+    await Promise.all([
+      get().fetchModelAvailabilityReport(),
+      get().fetchAllApiUsage(),
+    ]);
   },
 
   // Model Availability

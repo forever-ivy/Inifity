@@ -3,7 +3,6 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { useAppStore, type ServiceStatusType } from "@/stores/appStore";
 import * as tauri from "@/lib/tauri";
-import { useEffect } from "react";
 import { motion } from "framer-motion";
 import { StatusPulse, CountUp, staggerContainer, staggerItem } from "@/components/ui/motion";
 import {
@@ -39,8 +38,6 @@ export function Dashboard() {
   const isLoading = useAppStore((s) => s.isLoading);
   const isRefreshing = useAppStore((s) => s.isRefreshing);
   const refreshCurrentPage = useAppStore((s) => s.refreshCurrentPage);
-  const fetchServices = useAppStore((s) => s.fetchServices);
-  const fetchJobs = useAppStore((s) => s.fetchJobs);
   const startServices = useAppStore((s) => s.startServices);
   const stopServices = useAppStore((s) => s.stopServices);
   const restartServices = useAppStore((s) => s.restartServices);
@@ -48,17 +45,6 @@ export function Dashboard() {
   const startDocker = useAppStore((s) => s.startDocker);
   const stopDocker = useAppStore((s) => s.stopDocker);
   const fetchDockerStatus = useAppStore((s) => s.fetchDockerStatus);
-
-  useEffect(() => {
-    fetchServices();
-    fetchJobs();
-    fetchDockerStatus();
-    const interval = setInterval(() => {
-      fetchServices();
-      fetchDockerStatus();
-    }, 10000);
-    return () => clearInterval(interval);
-  }, [fetchServices, fetchJobs, fetchDockerStatus]);
 
   const allRunning = services.every((s) => s.status === "running");
   const anyRunning = services.some((s) => s.status === "running");
@@ -111,7 +97,7 @@ export function Dashboard() {
 
       {/* Service Status Cards */}
       <motion.div
-        className="grid grid-cols-2 gap-4"
+        className="grid grid-cols-1 md:grid-cols-2 gap-4"
         variants={staggerContainer}
         initial="hidden"
         animate="show"
@@ -214,7 +200,7 @@ export function Dashboard() {
             {dockerContainers.length === 0 ? (
               <p className="text-sm text-muted-foreground">Docker not available or containers not found</p>
             ) : (
-              <div className="grid grid-cols-2 gap-2">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
                 {dockerContainers.map((c) => (
                   <motion.div
                     key={c.name}

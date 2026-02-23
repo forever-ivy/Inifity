@@ -47,36 +47,80 @@ function ConfirmModal({
   onConfirm: () => void;
   onCancel: () => void;
 }) {
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const cancelButtonRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    const previousFocus = document.activeElement as HTMLElement | null;
+    cancelButtonRef.current?.focus();
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        onCancel();
+        return;
+      }
+      if (event.key !== "Tab" || !dialogRef.current) return;
+      const focusable = dialogRef.current.querySelectorAll<HTMLElement>(
+        'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
+      );
+      if (focusable.length === 0) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("keydown", handleKeyDown);
+      previousFocus?.focus();
+    };
+  }, [onCancel]);
+
   return (
     <motion.div
       className="fixed inset-0 z-[99999] flex items-center justify-center"
       initial={{ opacity: 0 }}
       animate={{ opacity: 1 }}
       exit={{ opacity: 0 }}
+      onClick={onCancel}
     >
-      <div className="absolute inset-0 bg-black/40 backdrop-blur-sm" onMouseDown={onCancel} />
+      <div className="absolute inset-0 bg-black/40 backdrop-blur-sm" />
       <motion.div
+        ref={dialogRef}
         initial={{ scale: 0.9, opacity: 0 }}
         animate={{ scale: 1, opacity: 1 }}
         exit={{ scale: 0.9, opacity: 0 }}
         transition={{ type: "spring", stiffness: 400, damping: 25 }}
         className="relative z-10 w-80 rounded-2xl border border-border/60 bg-card/95 backdrop-blur-xl p-5 shadow-2xl"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="toast-dismiss-title"
+        aria-describedby="toast-dismiss-desc"
+        onClick={(event) => event.stopPropagation()}
       >
-        <h3 className="text-sm font-semibold mb-1">Dismiss Alert</h3>
-        <p className="text-xs text-muted-foreground mb-4">
+        <h3 id="toast-dismiss-title" className="text-sm font-semibold mb-1">Dismiss Alert</h3>
+        <p id="toast-dismiss-desc" className="text-xs text-muted-foreground mb-4">
           Are you sure you want to dismiss this notification?
         </p>
         <div className="flex justify-end gap-2">
           <button
+            ref={cancelButtonRef}
             type="button"
-            onMouseDown={(e) => { e.stopPropagation(); onCancel(); }}
+            onClick={onCancel}
             className="px-4 py-1.5 text-xs rounded-xl border border-border bg-background hover:bg-muted transition-colors cursor-pointer"
           >
             Cancel
           </button>
           <button
             type="button"
-            onMouseDown={(e) => { e.stopPropagation(); onConfirm(); }}
+            onClick={onConfirm}
             className="px-4 py-1.5 text-xs rounded-xl bg-red-600 hover:bg-red-500 text-white font-medium transition-colors cursor-pointer"
           >
             Dismiss
@@ -145,6 +189,7 @@ function ToastMessage({
           styleMap[toast.type],
           glowMap[toast.type]
         )}
+        role={toast.type === "error" || toast.type === "warning" ? "alert" : "status"}
       >
         <Icon className="h-5 w-5 shrink-0 mt-0.5" />
         <p className="text-sm flex-1 leading-relaxed">{toast.message}</p>
@@ -171,7 +216,7 @@ export function ToastContainer({
   onDismiss: (id: string) => void;
 }) {
   return (
-    <div className="fixed bottom-6 right-6 z-[9999] flex flex-col-reverse gap-2">
+    <div className="fixed bottom-6 right-6 z-[9999] flex flex-col-reverse gap-2" aria-live="polite" aria-atomic="false">
       <AnimatePresence mode="popLayout">
         {toasts.map((toast) => (
           <div key={toast.id}>

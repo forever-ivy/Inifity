@@ -3,6 +3,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import { Sidebar } from "@/components/layout/Sidebar";
 import { useAppStore } from "@/stores/appStore";
 import { ToastContainer } from "@/components/ui/toast";
+import { usePollingOrchestrator } from "@/hooks/usePollingOrchestrator";
 
 const Dashboard = lazy(() => import("@/pages/Dashboard").then(m => ({ default: m.Dashboard })));
 const Services = lazy(() => import("@/pages/Services").then(m => ({ default: m.Services })));
@@ -31,6 +32,8 @@ function App() {
   const theme = useAppStore((s) => s.theme);
   const toasts = useAppStore((s) => s.toasts);
   const dismissToast = useAppStore((s) => s.dismissToast);
+
+  usePollingOrchestrator();
 
   useEffect(() => {
     // Apply theme class to document

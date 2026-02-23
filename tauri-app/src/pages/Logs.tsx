@@ -12,6 +12,7 @@ const levelColors: Record<string, string> = {
   ERROR: "text-red-500",
   DEBUG: "text-gray-400",
 };
+const MAX_VISIBLE_LOG_ROWS = 300;
 
 export function Logs() {
   const logs = useAppStore((s) => s.logs);
@@ -43,19 +44,12 @@ export function Logs() {
     prevLogsLengthRef.current = logs.length;
   }, [logs]);
 
-  // Auto-refresh logs every 5 seconds
-  useEffect(() => {
-    const interval = setInterval(() => {
-      fetchLogs(selectedLogService, 200);
-    }, 5000);
-    return () => clearInterval(interval);
-  }, [fetchLogs, selectedLogService]);
-
   const filteredLogs = logs.filter((log) => {
     if (levelFilter && log.level !== levelFilter) return false;
     if (filter && !log.message.toLowerCase().includes(filter.toLowerCase())) return false;
     return true;
   });
+  const visibleLogs = filteredLogs.slice(-MAX_VISIBLE_LOG_ROWS);
 
   const errorCount = logs.filter((l) => l.level === "ERROR").length;
   const warnCount = logs.filter((l) => l.level === "WARN").length;
@@ -104,7 +98,7 @@ export function Logs() {
 
       {/* Error Summary */}
       <motion.div
-        className="grid grid-cols-2 gap-4"
+        className="grid grid-cols-1 md:grid-cols-2 gap-4"
         initial={{ opacity: 0, y: 20 }}
         animate={{ opacity: 1, y: 0 }}
         transition={{ duration: 0.3 }}
@@ -191,6 +185,7 @@ export function Logs() {
                 size="icon"
                 onClick={handleRefresh}
                 disabled={isLoading}
+                aria-label="Refresh logs"
               >
                 <RefreshCw className={`h-4 w-4 ${isLoading ? "animate-spin" : ""}`} />
               </Button>
@@ -221,7 +216,7 @@ export function Logs() {
               <FileText className="h-4 w-4" />
               Log Stream
               <span className="text-xs text-muted-foreground font-normal">
-                {filteredLogs.length} entries
+                {visibleLogs.length}/{filteredLogs.length} entries
               </span>
               <AnimatePresence>
                 {newLogCount > 0 && (
@@ -251,26 +246,24 @@ export function Logs() {
                 ref={logContainerRef}
                 className="font-mono text-xs space-y-1 max-h-96 overflow-auto bg-card/50 backdrop-blur-sm rounded-lg p-4 border border-border/50"
               >
-                <AnimatePresence initial={false}>
-                  {filteredLogs.map((log, i) => (
-                    <motion.div
-                      key={`${log.time}-${i}`}
-                      initial={{ opacity: 0, x: -10 }}
-                      animate={{ opacity: 1, x: 0 }}
-                      transition={{ delay: Math.min(i * 0.01, 0.5) }}
-                      className={`flex gap-2 py-0.5 hover:bg-muted/50 rounded px-1 ${
-                        log.level === "ERROR" ? "bg-red-500/5" : log.level === "WARN" ? "bg-yellow-500/5" : ""
-                      }`}
-                    >
-                      <span className="text-muted-foreground whitespace-nowrap">{log.time}</span>
-                      <span className={`font-medium whitespace-nowrap ${levelColors[log.level] || "text-gray-400"}`}>
-                        [{log.level}]
-                      </span>
-                      <span className="text-blue-500 whitespace-nowrap">[{log.service}]</span>
-                      <span className="text-foreground">{log.message}</span>
-                    </motion.div>
-                  ))}
-                </AnimatePresence>
+                {visibleLogs.map((log, i) => (
+                  <motion.div
+                    key={`${log.time}-${i}`}
+                    initial={{ opacity: 0, x: -6 }}
+                    animate={{ opacity: 1, x: 0 }}
+                    transition={{ duration: 0.12 }}
+                    className={`flex gap-2 py-0.5 hover:bg-muted/50 rounded px-1 ${
+                      log.level === "ERROR" ? "bg-red-500/5" : log.level === "WARN" ? "bg-yellow-500/5" : ""
+                    }`}
+                  >
+                    <span className="text-muted-foreground whitespace-nowrap">{log.time}</span>
+                    <span className={`font-medium whitespace-nowrap ${levelColors[log.level] || "text-gray-400"}`}>
+                      [{log.level}]
+                    </span>
+                    <span className="text-blue-500 whitespace-nowrap">[{log.service}]</span>
+                    <span className="text-foreground">{log.message}</span>
+                  </motion.div>
+                ))}
               </div>
             )}
           </CardContent>

@@ -1,4 +1,4 @@
-import { motion, type HTMLMotionProps } from "framer-motion";
+import { motion, type HTMLMotionProps, useReducedMotion } from "framer-motion";
 import type { ReactNode } from "react";
 import { cn } from "@/lib/utils";
 
@@ -7,11 +7,12 @@ export function MotionCard({
   children,
   ...props
 }: { children: ReactNode } & HTMLMotionProps<"div">) {
+  const reduceMotion = useReducedMotion();
   return (
     <motion.div
-      whileHover={{ scale: 1.01, boxShadow: "0 8px 30px rgba(0,0,0,0.25)" }}
-      whileTap={{ scale: 0.99 }}
-      transition={{ duration: 0.2 }}
+      whileHover={reduceMotion ? undefined : { scale: 1.01, boxShadow: "0 8px 30px rgba(0,0,0,0.25)" }}
+      whileTap={reduceMotion ? undefined : { scale: 0.99 }}
+      transition={reduceMotion ? { duration: 0 } : { duration: 0.2 }}
       {...props}
     >
       {children}
@@ -26,13 +27,14 @@ export function GlassMotionCard({
   className,
   ...props
 }: { children: ReactNode; glowColor?: "teal" | "green" | "yellow" | "red" } & HTMLMotionProps<"div">) {
+  const reduceMotion = useReducedMotion();
   const glowClass = glowColor ? `glow-${glowColor}` : "";
 
   return (
     <motion.div
-      whileHover={{ scale: 1.01, boxShadow: "0 8px 40px rgba(0,0,0,0.3)" }}
-      whileTap={{ scale: 0.99 }}
-      transition={{ duration: 0.2 }}
+      whileHover={reduceMotion ? undefined : { scale: 1.01, boxShadow: "0 8px 40px rgba(0,0,0,0.3)" }}
+      whileTap={reduceMotion ? undefined : { scale: 0.99 }}
+      transition={reduceMotion ? { duration: 0 } : { duration: 0.2 }}
       className={cn(glowClass, className)}
       {...props}
     >
@@ -66,10 +68,12 @@ export function CountUp({
   suffix?: string;
   className?: string
 }) {
+  const reduceMotion = useReducedMotion();
   return (
     <motion.span
-      initial={{ opacity: 0, scale: 0.8 }}
+      initial={reduceMotion ? false : { opacity: 0, scale: 0.8 }}
       animate={{ opacity: 1, scale: 1 }}
+      transition={reduceMotion ? { duration: 0 } : { duration: 0.2 }}
       key={String(value)}
       className={className}
     >
@@ -88,6 +92,7 @@ export function StatusPulse({
   glow?: boolean;
   className?: string
 }) {
+  const reduceMotion = useReducedMotion();
   const colorClasses = {
     green: "bg-green-500",
     yellow: "bg-yellow-500",
@@ -110,8 +115,8 @@ export function StatusPulse({
         glow && glowClasses[color],
         className
       )}
-      animate={glow ? { scale: [1, 1.3, 1], opacity: [1, 0.6, 1] } : {}}
-      transition={glow ? { duration: 2, repeat: Infinity, ease: "easeInOut" } : {}}
+      animate={glow && !reduceMotion ? { scale: [1, 1.3, 1], opacity: [1, 0.6, 1] } : undefined}
+      transition={glow && !reduceMotion ? { duration: 2, repeat: Infinity, ease: "easeInOut" } : { duration: 0 }}
     />
   );
 }
@@ -121,11 +126,12 @@ export function MotionButton({
   children,
   ...props
 }: { children: ReactNode } & HTMLMotionProps<"button">) {
+  const reduceMotion = useReducedMotion();
   return (
     <motion.button
-      whileHover={{ scale: 1.02 }}
-      whileTap={{ scale: 0.96 }}
-      transition={{ duration: 0.15 }}
+      whileHover={reduceMotion ? undefined : { scale: 1.02 }}
+      whileTap={reduceMotion ? undefined : { scale: 0.96 }}
+      transition={reduceMotion ? { duration: 0 } : { duration: 0.15 }}
       {...props}
     >
       {children}
@@ -143,11 +149,12 @@ export function FadeIn({
   delay?: number;
   className?: string
 }) {
+  const reduceMotion = useReducedMotion();
   return (
     <motion.div
-      initial={{ opacity: 0, y: 10 }}
+      initial={reduceMotion ? false : { opacity: 0, y: 10 }}
       animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.3, delay }}
+      transition={reduceMotion ? { duration: 0 } : { duration: 0.3, delay }}
       className={className}
     >
       {children}
@@ -165,11 +172,12 @@ export function SlideIn({
   delay?: number;
   className?: string
 }) {
+  const reduceMotion = useReducedMotion();
   return (
     <motion.div
-      initial={{ opacity: 0, y: 20 }}
+      initial={reduceMotion ? false : { opacity: 0, y: 20 }}
       animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.35, delay, ease: "easeOut" }}
+      transition={reduceMotion ? { duration: 0 } : { duration: 0.35, delay, ease: "easeOut" }}
       className={className}
     >
       {children}
@@ -183,10 +191,11 @@ export function SpinLoader({
 }: {
   className?: string
 }) {
+  const reduceMotion = useReducedMotion();
   return (
     <motion.div
-      animate={{ rotate: 360 }}
-      transition={{ duration: 1, repeat: Infinity, ease: "linear" }}
+      animate={reduceMotion ? undefined : { rotate: 360 }}
+      transition={reduceMotion ? { duration: 0 } : { duration: 1, repeat: Infinity, ease: "linear" }}
       className={className}
     />
   );
@@ -200,12 +209,13 @@ export function AnimatedProgress({
   value: number;
   className?: string
 }) {
+  const reduceMotion = useReducedMotion();
   return (
     <motion.div
       className={cn("h-2 bg-primary rounded-full", className)}
-      initial={{ width: 0 }}
+      initial={reduceMotion ? false : { width: 0 }}
       animate={{ width: `${Math.min(100, Math.max(0, value))}%` }}
-      transition={{ duration: 0.5, ease: "easeOut" }}
+      transition={reduceMotion ? { duration: 0 } : { duration: 0.5, ease: "easeOut" }}
     />
   );
 }

@@ -2,7 +2,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { useAppStore, ApiProvider, ApiUsage, ModelAvailabilityReport } from "@/stores/appStore";
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   Key,
@@ -15,9 +15,6 @@ import {
   Clock,
   Zap,
 } from "lucide-react";
-
-const USAGE_REFRESH_INTERVAL = 60000; // 1 minute
-const AVAILABILITY_REFRESH_INTERVAL = 30000; // 30 seconds
 
 function useRelativeTime(epochMs: number | undefined) {
   const [, setTick] = useState(0);
@@ -279,6 +276,7 @@ function ApiKeyInput({
             size="sm"
             onClick={onDelete}
             className="text-red-500 hover:text-red-600"
+            aria-label={`Delete ${provider.name} API key`}
           >
             <Trash2 className="h-4 w-4" />
           </Button>
@@ -304,6 +302,7 @@ function ApiKeyInput({
             type="button"
             onClick={() => setShowKey(!showKey)}
             className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+            aria-label={showKey ? "Hide API key" : "Show API key"}
           >
             {showKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
           </button>
@@ -369,51 +368,17 @@ export function ApiConfig() {
   const apiProviders = useAppStore((s) => s.apiProviders);
   const apiUsage = useAppStore((s) => s.apiUsage);
   const modelAvailabilityReport = useAppStore((s) => s.modelAvailabilityReport);
-  const fetchApiProviders = useAppStore((s) => s.fetchApiProviders);
+  const refreshApiConfigData = useAppStore((s) => s.refreshApiConfigData);
   const fetchApiUsage = useAppStore((s) => s.fetchApiUsage);
-  const fetchAllApiUsage = useAppStore((s) => s.fetchAllApiUsage);
-  const fetchModelAvailabilityReport = useAppStore((s) => s.fetchModelAvailabilityReport);
   const setApiKey = useAppStore((s) => s.setApiKey);
   const deleteApiKey = useAppStore((s) => s.deleteApiKey);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const relativeTime = useRelativeTime(modelAvailabilityReport?.fetched_at);
 
-  // Initial fetch
-  useEffect(() => {
-    fetchApiProviders().then(() => fetchAllApiUsage());
-    fetchModelAvailabilityReport();
-  }, [fetchApiProviders, fetchAllApiUsage, fetchModelAvailabilityReport]);
-
-  // Auto-refresh usage every minute when page is visible
-  const refreshUsage = useCallback(() => {
-    if (document.visibilityState === "visible") {
-      fetchAllApiUsage();
-    }
-  }, [fetchAllApiUsage]);
-
-  useEffect(() => {
-    const interval = setInterval(refreshUsage, USAGE_REFRESH_INTERVAL);
-    return () => clearInterval(interval);
-  }, [refreshUsage]);
-
-  // Auto-refresh availability every 30s when page is visible
-  const refreshAvailability = useCallback(() => {
-    if (document.visibilityState === "visible") {
-      fetchModelAvailabilityReport();
-    }
-  }, [fetchModelAvailabilityReport]);
-
-  useEffect(() => {
-    const interval = setInterval(refreshAvailability, AVAILABILITY_REFRESH_INTERVAL);
-    return () => clearInterval(interval);
-  }, [refreshAvailability]);
-
   const handleRefresh = async () => {
     if (isRefreshing) return;
     setIsRefreshing(true);
-    await fetchApiProviders();
-    await fetchModelAvailabilityReport();
-    await fetchAllApiUsage();
+    await refreshApiConfigData();
     setIsRefreshing(false);
   };
 
@@ -476,7 +441,7 @@ export function ApiConfig() {
               <CardContent className="pt-5 pb-4 px-4 space-y-4">
                 <div className="text-sm font-semibold">Vision / GLM</div>
                 {/* 2x2 credential grid */}
-                <div className="grid grid-cols-2 gap-2">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                   {([
                     ["Google", modelAvailabilityReport?.vision?.has_google_api_key],
                     ["Gemini", modelAvailabilityReport?.vision?.has_gemini_api_key],
@@ -588,10 +553,12 @@ export function ApiConfig() {
                       <div className="flex items-center justify-between mb-2">
                         <span className="text-sm font-medium">Usage</span>
                         <motion.button
+                          type="button"
                           whileHover={{ scale: 1.1 }}
                           whileTap={{ scale: 0.9 }}
                           onClick={() => handleRefreshProvider(provider.id)}
                           className="text-muted-foreground hover:text-foreground"
+                          aria-label={`Refresh ${provider.name} usage`}
                         >
                           <RefreshCw className="h-3.5 w-3.5" />
                         </motion.button>
