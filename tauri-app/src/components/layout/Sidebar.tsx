@@ -10,6 +10,7 @@ import {
   Database,
   BookText,
   Key,
+  Siren,
   ChevronLeft,
   Sun,
   Moon,
@@ -19,6 +20,7 @@ import { motion, AnimatePresence } from "framer-motion";
 
 const navItems = [
   { id: "dashboard", label: "Overview", icon: LayoutDashboard },
+  { id: "alerts", label: "Alert Center", icon: Siren },
   { id: "services", label: "Service Control", icon: Server },
   { id: "jobs", label: "Task Center", icon: Briefcase },
   { id: "verify", label: "Review Desk", icon: FileCheck },

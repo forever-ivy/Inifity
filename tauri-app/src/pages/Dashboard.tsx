@@ -293,9 +293,14 @@ export function Dashboard() {
                 <AlertTriangle className="h-4 w-4" />
                 Alert Center
               </CardTitle>
-              <Badge variant={openAlerts.length > 0 ? "warning" : "success"}>
-                {openAlerts.length > 0 ? `${openAlerts.length} Open` : "Healthy"}
-              </Badge>
+              <div className="flex items-center gap-2">
+                <Button variant="ghost" size="sm" onClick={() => setActiveTab("alerts")}>
+                  Open Full Center
+                </Button>
+                <Badge variant={openAlerts.length > 0 ? "warning" : "success"}>
+                  {openAlerts.length > 0 ? `${openAlerts.length} Open` : "Healthy"}
+                </Badge>
+              </div>
             </div>
             <div className="flex flex-wrap gap-2">
               {alertFilters.map((filter) => (

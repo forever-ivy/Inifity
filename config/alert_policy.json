@@ -1,0 +1,102 @@
+{
+  "warning_to_critical_minutes": 30,
+  "runbooks": [
+    {
+      "source": "service",
+      "headline": "Service health issue",
+      "steps": [
+        "Open Service Control and confirm which process is stopped or degraded.",
+        "Restart the affected service, then verify status returns to running.",
+        "Open Technical Logs and confirm new ERROR lines stop increasing.",
+        "Return to Overview and confirm open alerts and backlog begin to drop."
+      ],
+      "actions": [
+        { "label": "Open Service Control", "tab": "services" },
+        { "label": "Open Technical Logs", "tab": "logs" },
+        { "label": "Open Overview", "tab": "dashboard" }
+      ]
+    },
+    {
+      "source": "jobs",
+      "headline": "Job failure cluster",
+      "steps": [
+        "Open Task Center and inspect the most recent failed jobs first.",
+        "Check whether failures share the same source file, sender, or task type.",
+        "If failures repeat, verify services and logs before rerunning jobs.",
+        "Monitor recovery in Overview success rate and open alerts."
+      ],
+      "actions": [
+        { "label": "Open Task Center", "tab": "jobs" },
+        { "label": "Open Technical Logs", "tab": "logs" },
+        { "label": "Open Overview", "tab": "dashboard" }
+      ]
+    },
+    {
+      "source": "verify",
+      "headline": "Review queue accumulation",
+      "steps": [
+        "Open Review Desk and prioritize the oldest review_ready jobs first.",
+        "Process urgent customer-facing files before batch jobs.",
+        "Confirm reviewed jobs leave the queue and no new blockers appear."
+      ],
+      "actions": [
+        { "label": "Open Review Desk", "tab": "verify" },
+        { "label": "Open Task Center", "tab": "jobs" }
+      ]
+    },
+    {
+      "source": "queue",
+      "headline": "Pending queue pressure",
+      "steps": [
+        "Open Overview Queue Board and identify where jobs accumulate.",
+        "If pending is high, verify worker health and processing throughput.",
+        "If running is high for too long, inspect logs for retries or API errors."
+      ],
+      "actions": [
+        { "label": "Open Overview", "tab": "dashboard" },
+        { "label": "Open Service Control", "tab": "services" },
+        { "label": "Open Technical Logs", "tab": "logs" }
+      ]
+    },
+    {
+      "source": "logs",
+      "headline": "Error log surge",
+      "steps": [
+        "Open Technical Logs and identify the most frequent repeating error.",
+        "Decide whether it is transient (rate-limited) or persistent (input/config).",
+        "Apply fix or restart service, then verify error frequency declines."
+      ],
+      "actions": [
+        { "label": "Open Technical Logs", "tab": "logs" },
+        { "label": "Open Service Control", "tab": "services" }
+      ]
+    },
+    {
+      "severity": "critical",
+      "headline": "Critical system signal",
+      "steps": [
+        "Stabilize service availability first, then reduce queue pressure.",
+        "Inspect logs for persistent failures and verify recovery after mitigation.",
+        "Acknowledge the alert only after impact is contained."
+      ],
+      "actions": [
+        { "label": "Open Service Control", "tab": "services" },
+        { "label": "Open Technical Logs", "tab": "logs" },
+        { "label": "Open Overview", "tab": "dashboard" }
+      ]
+    },
+    {
+      "headline": "Operational signal",
+      "steps": [
+        "Open Overview and verify trend direction for related metrics.",
+        "Use Task Center or Logs to isolate root cause and impact scope.",
+        "Acknowledge or ignore only after decision and follow-up action are clear."
+      ],
+      "actions": [
+        { "label": "Open Overview", "tab": "dashboard" },
+        { "label": "Open Task Center", "tab": "jobs" },
+        { "label": "Open Technical Logs", "tab": "logs" }
+      ]
+    }
+  ]
+}

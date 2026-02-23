@@ -136,6 +136,17 @@ export interface AppConfig {
   rag_backend: string;
 }
 
+export interface EnvVarItem {
+  key: string;
+  value: string;
+  is_secret: boolean;
+}
+
+export interface EnvVarUpdate {
+  key: string;
+  value: string;
+}
+
 export interface Artifact {
   name: string;
   path: string;
@@ -202,6 +213,12 @@ export const getConfig = (): Promise<AppConfig> =>
 
 export const saveConfig = (config: AppConfig): Promise<void> =>
   tInvoke<void>("save_config", { config });
+
+export const getEnvSettings = (): Promise<EnvVarItem[]> =>
+  tInvoke<EnvVarItem[]>("get_env_settings");
+
+export const saveEnvSettings = (updates: EnvVarUpdate[]): Promise<void> =>
+  tInvoke<void>("save_env_settings", { updates });
 
 // ============================================================================
 // Job Commands
@@ -360,7 +377,7 @@ export interface TrendPoint {
 }
 
 export type AlertSeverity = "critical" | "warning" | "info";
-export type AlertStatus = "open" | "acknowledged";
+export type AlertStatus = "open" | "acknowledged" | "ignored";
 
 export interface AlertItem {
   id: string;
@@ -389,6 +406,17 @@ export interface RunSummary {
   generated_at: number;
 }
 
+export interface AlertRunbookAction {
+  label: string;
+  tab: string;
+}
+
+export interface AlertRunbook {
+  headline: string;
+  steps: string[];
+  actions: AlertRunbookAction[];
+}
+
 // ============================================================================
 // Overview / Operations Commands
 // ============================================================================
@@ -407,6 +435,21 @@ export const listAlerts = (status?: AlertStatus, severity?: AlertSeverity): Prom
 
 export const ackAlert = (alertId: string): Promise<boolean> =>
   tInvoke<boolean>("ack_alert", { alertId });
+
+export const ackAlerts = (alertIds: string[]): Promise<number> =>
+  tInvoke<number>("ack_alerts", { alertIds });
+
+export const ignoreAlert = (alertId: string): Promise<boolean> =>
+  tInvoke<boolean>("ignore_alert", { alertId });
+
+export const ignoreAlerts = (alertIds: string[]): Promise<number> =>
+  tInvoke<number>("ignore_alerts", { alertIds });
+
+export const reopenAlert = (alertId: string): Promise<boolean> =>
+  tInvoke<boolean>("reopen_alert", { alertId });
+
+export const getAlertRunbook = (source: string, severity: AlertSeverity): Promise<AlertRunbook> =>
+  tInvoke<AlertRunbook>("get_alert_runbook", { source, severity });
 
 export const exportRunSummary = (date?: string): Promise<RunSummary> =>
   tInvoke<RunSummary>("export_run_summary", { date });
@@ -433,6 +476,14 @@ export interface ApiUsage {
   unit: string;
   reset_at?: number;
   fetched_at: number;
+  // Extended fields for dual-track (real vs estimated)
+  source: "real_api" | "estimated_activity" | "unsupported";
+  confidence: "high" | "medium" | "low";
+  reason?: string;
+  activity_calls_24h?: number;
+  activity_errors_24h?: number;
+  activity_success_rate?: number;
+  activity_last_seen_at?: number; // epoch ms
 }
 
 // ============================================================================

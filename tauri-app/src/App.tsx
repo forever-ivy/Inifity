@@ -6,6 +6,7 @@ import { ToastContainer } from "@/components/ui/toast";
 import { usePollingOrchestrator } from "@/hooks/usePollingOrchestrator";
 
 const Dashboard = lazy(() => import("@/pages/Dashboard").then(m => ({ default: m.Dashboard })));
+const AlertCenter = lazy(() => import("@/pages/AlertCenter").then(m => ({ default: m.AlertCenter })));
 const Services = lazy(() => import("@/pages/Services").then(m => ({ default: m.Services })));
 const Jobs = lazy(() => import("@/pages/Jobs").then(m => ({ default: m.Jobs })));
 const Verify = lazy(() => import("@/pages/Verify").then(m => ({ default: m.Verify })));
@@ -59,6 +60,7 @@ function App() {
   const renderPage = () => {
     switch (activeTab) {
       case "dashboard": return <Dashboard />;
+      case "alerts": return <AlertCenter />;
       case "services": return <Services />;
       case "jobs": return <Jobs />;
       case "verify": return <Verify />;

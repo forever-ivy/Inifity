@@ -58,6 +58,19 @@ pub struct AppConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnvVarItem {
+    pub key: String,
+    pub value: String,
+    pub is_secret: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnvVarUpdate {
+    pub key: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Artifact {
     pub name: String,
     pub path: String,
@@ -207,6 +220,14 @@ pub struct ApiUsage {
     pub unit: String,
     pub reset_at: Option<i64>,
     pub fetched_at: i64,
+    // Extended fields for dual-track (real vs estimated)
+    pub source: String, // "real_api" | "estimated_activity" | "unsupported"
+    pub confidence: String, // "high" | "medium" | "low"
+    pub reason: Option<String>,
+    pub activity_calls_24h: Option<u64>,
+    pub activity_errors_24h: Option<u64>,
+    pub activity_success_rate: Option<f64>,
+    pub activity_last_seen_at: Option<i64>, // epoch ms
 }
 
 // ============================================================================
@@ -243,7 +264,7 @@ pub struct AlertItem {
     pub title: String,
     pub message: String,
     pub severity: String, // "critical" | "warning" | "info"
-    pub status: String,   // "open" | "acknowledged"
+    pub status: String,   // "open" | "acknowledged" | "ignored"
     pub source: String,
     pub metric_value: Option<i64>,
     pub created_at: i64,
@@ -265,6 +286,19 @@ pub struct RunSummary {
     pub date: String,
     pub text: String,
     pub generated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlertRunbookAction {
+    pub label: String,
+    pub tab: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlertRunbook {
+    pub headline: String,
+    pub steps: Vec<String>,
+    pub actions: Vec<AlertRunbookAction>,
 }
 
 // ============================================================================
@@ -329,10 +363,42 @@ pub struct GlmAvailability {
 // Application State
 // ============================================================================
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct AlertStateSnapshot {
+    #[serde(default)]
+    acknowledged_ids: HashSet<String>,
+    #[serde(default)]
+    ignored_ids: HashSet<String>,
+    #[serde(default)]
+    first_seen_ms: HashMap<String, i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct AlertRunbookRuleConfig {
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    severity: Option<String>,
+    headline: String,
+    #[serde(default)]
+    steps: Vec<String>,
+    #[serde(default)]
+    actions: Vec<AlertRunbookAction>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AlertPolicyConfig {
+    #[serde(default = "default_warning_to_critical_minutes")]
+    warning_to_critical_minutes: u32,
+    #[serde(default)]
+    runbooks: Vec<AlertRunbookRuleConfig>,
+}
+
 pub struct AppState {
     pub services: Mutex<HashMap<String, ServiceStatus>>,
-    pub acknowledged_alert_ids: Mutex<HashSet<String>>,
-    pub ack_alerts_path: String,
+    pub alert_state: Mutex<AlertStateSnapshot>,
+    pub alert_state_path: String,
+    pub alert_policy_path: String,
     pub config_path: String,
     pub scripts_path: String,
     pub pids_dir: String,
@@ -371,13 +437,15 @@ impl Default for AppState {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/ivy".to_string());
         let runtime_dir = format!("{}/.openclaw/runtime/translation", home);
         let project_root = detect_project_root();
-        let ack_alerts_path = format!("{}/ack_alerts.json", runtime_dir);
-        let acknowledged_alert_ids = load_ack_alert_ids(&ack_alerts_path);
+        let alert_state_path = format!("{}/alert_state.json", runtime_dir);
+        let alert_state = load_alert_state_snapshot(&alert_state_path);
+        let alert_policy_path = format!("{}/config/alert_policy.json", project_root);
 
         Self {
             services: Mutex::new(HashMap::new()),
-            acknowledged_alert_ids: Mutex::new(acknowledged_alert_ids),
-            ack_alerts_path,
+            alert_state: Mutex::new(alert_state),
+            alert_state_path,
+            alert_policy_path,
             config_path: project_root.clone(),
             scripts_path: format!("{}/scripts", project_root),
             pids_dir: format!("{}/pids", runtime_dir),
@@ -484,6 +552,58 @@ fn env_quote_double(value: &str) -> String {
     // Safe for bash `source` in .env-style files.
     let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
     format!("\"{}\"", escaped)
+}
+
+fn env_quote_single(value: &str) -> String {
+    let escaped = value.replace('\'', "'\"'\"'");
+    format!("'{}'", escaped)
+}
+
+fn format_env_value_for_file(value: &str) -> String {
+    if value.is_empty() {
+        return "\"\"".to_string();
+    }
+
+    let safe_unquoted = value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | ':' | ',' | '@' | '+'));
+    if safe_unquoted {
+        return value.to_string();
+    }
+
+    env_quote_single(value)
+}
+
+fn update_or_add_env_line(lines: &mut Vec<String>, key: &str, rendered_value: &str) {
+    let key_prefix = format!("{}=", key);
+    if let Some(line) = lines.iter_mut().find(|l| {
+        let s = l.trim_start();
+        if s.starts_with(&key_prefix) {
+            return true;
+        }
+        if let Some(rest) = s.strip_prefix("export ") {
+            return rest.trim_start().starts_with(&key_prefix);
+        }
+        false
+    }) {
+        let s = line.trim_start();
+        if s.starts_with("export ") {
+            *line = format!("export {}={}", key, rendered_value);
+        } else {
+            *line = format!("{}={}", key, rendered_value);
+        }
+    } else {
+        lines.push(format!("{}={}", key, rendered_value));
+    }
+}
+
+fn is_secret_env_key(key: &str) -> bool {
+    let up = key.trim().to_uppercase();
+    up.contains("KEY")
+        || up.contains("TOKEN")
+        || up.contains("PASSWORD")
+        || up.contains("SECRET")
+        || up.contains("AUTH")
 }
 
 fn read_env_map(env_path: &PathBuf) -> HashMap<String, String> {
@@ -1719,41 +1839,56 @@ fn save_config(config: AppConfig, state: State<'_, AppState>) -> Result<(), Stri
     let existing = fs::read_to_string(&env_path).unwrap_or_default();
     let mut lines: Vec<String> = existing.lines().map(|s| s.to_string()).collect();
 
-    // Helper to update or add a line
-    fn update_or_add(lines: &mut Vec<String>, key: &str, value: &str) {
-        let key_prefix = format!("{}=", key);
-        if let Some(line) = lines.iter_mut().find(|l| {
-            let s = l.trim_start();
-            if s.starts_with(&key_prefix) {
-                return true;
-            }
-            if let Some(rest) = s.strip_prefix("export ") {
-                return rest.trim_start().starts_with(&key_prefix);
-            }
-            false
-        }) {
-            let s = line.trim_start();
-            if s.starts_with("export ") {
-                *line = format!("export {}={}", key, value);
-            } else {
-                *line = format!("{}={}", key, value);
-            }
-        } else {
-            lines.push(format!("{}={}", key, value));
-        }
-    }
-
     let work_root = env_quote_double(&config.work_root);
     let kb_root = env_quote_double(&config.kb_root);
-    update_or_add(&mut lines, "V4_WORK_ROOT", &work_root);
-    update_or_add(&mut lines, "V4_KB_ROOT", &kb_root);
-    update_or_add(&mut lines, "OPENCLAW_STRICT_ROUTER", if config.strict_router { "1" } else { "0" });
-    update_or_add(&mut lines, "OPENCLAW_REQUIRE_NEW", if config.require_new { "1" } else { "0" });
-    update_or_add(&mut lines, "OPENCLAW_RAG_BACKEND", &config.rag_backend);
+    update_or_add_env_line(&mut lines, "V4_WORK_ROOT", &work_root);
+    update_or_add_env_line(&mut lines, "V4_KB_ROOT", &kb_root);
+    update_or_add_env_line(&mut lines, "OPENCLAW_STRICT_ROUTER", if config.strict_router { "1" } else { "0" });
+    update_or_add_env_line(&mut lines, "OPENCLAW_REQUIRE_NEW", if config.require_new { "1" } else { "0" });
+    update_or_add_env_line(&mut lines, "OPENCLAW_RAG_BACKEND", &config.rag_backend);
 
     let content = lines.join("\n");
     fs::write(&env_path, content).map_err(|e| format!("Failed to write config: {}", e))?;
 
+    Ok(())
+}
+
+#[tauri::command]
+fn get_env_settings(state: State<'_, AppState>) -> Result<Vec<EnvVarItem>, String> {
+    let env_path = PathBuf::from(&state.config_path).join(".env.v4.local");
+    let content = fs::read_to_string(&env_path).unwrap_or_default();
+
+    let mut items: Vec<EnvVarItem> = Vec::new();
+    for line in content.lines() {
+        if let Some((key, value)) = parse_env_assignment(line) {
+            items.push(EnvVarItem {
+                is_secret: is_secret_env_key(&key),
+                key,
+                value,
+            });
+        }
+    }
+    items.sort_by(|a, b| a.key.cmp(&b.key));
+    Ok(items)
+}
+
+#[tauri::command]
+fn save_env_settings(updates: Vec<EnvVarUpdate>, state: State<'_, AppState>) -> Result<(), String> {
+    let env_path = PathBuf::from(&state.config_path).join(".env.v4.local");
+    let existing = fs::read_to_string(&env_path).unwrap_or_default();
+    let mut lines: Vec<String> = existing.lines().map(|s| s.to_string()).collect();
+
+    for update in updates {
+        let key = update.key.trim();
+        if key.is_empty() {
+            continue;
+        }
+        let rendered_value = format_env_value_for_file(update.value.trim());
+        update_or_add_env_line(&mut lines, key, &rendered_value);
+    }
+
+    let content = lines.join("\n");
+    fs::write(&env_path, content).map_err(|e| format!("Failed to write env settings: {}", e))?;
     Ok(())
 }
 
@@ -1844,32 +1979,228 @@ fn get_job_milestones(job_id: String, state: State<'_, AppState>) -> Result<Vec<
     Ok(milestones)
 }
 
-fn load_ack_alert_ids(path: &str) -> HashSet<String> {
+fn load_alert_state_snapshot(path: &str) -> AlertStateSnapshot {
     let content = match fs::read_to_string(path) {
         Ok(content) => content,
-        Err(_) => return HashSet::new(),
+        Err(_) => return AlertStateSnapshot::default(),
     };
 
-    let ids: Vec<String> = match serde_json::from_str(&content) {
-        Ok(ids) => ids,
-        Err(_) => return HashSet::new(),
-    };
+    if let Ok(snapshot) = serde_json::from_str::<AlertStateSnapshot>(&content) {
+        return snapshot;
+    }
 
-    ids.into_iter().collect()
+    if let Ok(legacy_ack_ids) = serde_json::from_str::<Vec<String>>(&content) {
+        return AlertStateSnapshot {
+            acknowledged_ids: legacy_ack_ids.into_iter().collect(),
+            ..AlertStateSnapshot::default()
+        };
+    }
+
+    AlertStateSnapshot::default()
 }
 
-fn persist_ack_alert_ids(path: &str, ids: &HashSet<String>) -> Result<(), String> {
+fn persist_alert_state_snapshot(path: &str, snapshot: &AlertStateSnapshot) -> Result<(), String> {
     let path_buf = PathBuf::from(path);
     if let Some(parent) = path_buf.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("Failed to prepare alert state dir: {}", e))?;
     }
 
-    let mut sorted_ids: Vec<String> = ids.iter().cloned().collect();
-    sorted_ids.sort();
-    let payload = serde_json::to_string_pretty(&sorted_ids)
+    let payload = serde_json::to_string_pretty(snapshot)
         .map_err(|e| format!("Failed to serialize alert state: {}", e))?;
     fs::write(path, payload).map_err(|e| format!("Failed to persist alert state: {}", e))?;
     Ok(())
+}
+
+fn default_warning_to_critical_minutes() -> u32 {
+    30
+}
+
+fn default_alert_policy_config() -> AlertPolicyConfig {
+    AlertPolicyConfig {
+        warning_to_critical_minutes: default_warning_to_critical_minutes(),
+        runbooks: vec![
+            AlertRunbookRuleConfig {
+                source: Some("service".to_string()),
+                severity: None,
+                headline: "Service health issue".to_string(),
+                steps: vec![
+                    "Open Service Control and confirm which process is stopped or degraded.".to_string(),
+                    "Restart the affected service, then verify status returns to running.".to_string(),
+                    "Open Technical Logs and confirm new ERROR lines stop increasing.".to_string(),
+                    "Return to Overview and confirm open alerts and backlog begin to drop.".to_string(),
+                ],
+                actions: vec![
+                    AlertRunbookAction { label: "Open Service Control".to_string(), tab: "services".to_string() },
+                    AlertRunbookAction { label: "Open Technical Logs".to_string(), tab: "logs".to_string() },
+                    AlertRunbookAction { label: "Open Overview".to_string(), tab: "dashboard".to_string() },
+                ],
+            },
+            AlertRunbookRuleConfig {
+                source: Some("jobs".to_string()),
+                severity: None,
+                headline: "Job failure cluster".to_string(),
+                steps: vec![
+                    "Open Task Center and inspect the most recent failed jobs first.".to_string(),
+                    "Check whether failures share the same source file, sender, or task type.".to_string(),
+                    "If failures repeat, verify services and logs before rerunning jobs.".to_string(),
+                    "Monitor recovery in Overview success rate and open alerts.".to_string(),
+                ],
+                actions: vec![
+                    AlertRunbookAction { label: "Open Task Center".to_string(), tab: "jobs".to_string() },
+                    AlertRunbookAction { label: "Open Technical Logs".to_string(), tab: "logs".to_string() },
+                    AlertRunbookAction { label: "Open Overview".to_string(), tab: "dashboard".to_string() },
+                ],
+            },
+            AlertRunbookRuleConfig {
+                source: Some("verify".to_string()),
+                severity: None,
+                headline: "Review queue accumulation".to_string(),
+                steps: vec![
+                    "Open Review Desk and prioritize the oldest review_ready jobs first.".to_string(),
+                    "Process urgent customer-facing files before batch jobs.".to_string(),
+                    "Confirm reviewed jobs leave the queue and no new blockers appear.".to_string(),
+                ],
+                actions: vec![
+                    AlertRunbookAction { label: "Open Review Desk".to_string(), tab: "verify".to_string() },
+                    AlertRunbookAction { label: "Open Task Center".to_string(), tab: "jobs".to_string() },
+                ],
+            },
+            AlertRunbookRuleConfig {
+                source: Some("queue".to_string()),
+                severity: None,
+                headline: "Pending queue pressure".to_string(),
+                steps: vec![
+                    "Open Overview Queue Board and identify where jobs accumulate.".to_string(),
+                    "If pending is high, verify worker health and processing throughput.".to_string(),
+                    "If running is high for too long, inspect logs for retries or API errors.".to_string(),
+                ],
+                actions: vec![
+                    AlertRunbookAction { label: "Open Overview".to_string(), tab: "dashboard".to_string() },
+                    AlertRunbookAction { label: "Open Service Control".to_string(), tab: "services".to_string() },
+                    AlertRunbookAction { label: "Open Technical Logs".to_string(), tab: "logs".to_string() },
+                ],
+            },
+            AlertRunbookRuleConfig {
+                source: Some("logs".to_string()),
+                severity: None,
+                headline: "Error log surge".to_string(),
+                steps: vec![
+                    "Open Technical Logs and identify the most frequent repeating error.".to_string(),
+                    "Decide whether it is transient (rate-limited) or persistent (input/config).".to_string(),
+                    "Apply fix or restart service, then verify error frequency declines.".to_string(),
+                ],
+                actions: vec![
+                    AlertRunbookAction { label: "Open Technical Logs".to_string(), tab: "logs".to_string() },
+                    AlertRunbookAction { label: "Open Service Control".to_string(), tab: "services".to_string() },
+                ],
+            },
+            AlertRunbookRuleConfig {
+                source: None,
+                severity: Some("critical".to_string()),
+                headline: "Critical system signal".to_string(),
+                steps: vec![
+                    "Stabilize service availability first, then reduce queue pressure.".to_string(),
+                    "Inspect logs for persistent failures and verify recovery after mitigation.".to_string(),
+                    "Acknowledge the alert only after impact is contained.".to_string(),
+                ],
+                actions: vec![
+                    AlertRunbookAction { label: "Open Service Control".to_string(), tab: "services".to_string() },
+                    AlertRunbookAction { label: "Open Technical Logs".to_string(), tab: "logs".to_string() },
+                    AlertRunbookAction { label: "Open Overview".to_string(), tab: "dashboard".to_string() },
+                ],
+            },
+            AlertRunbookRuleConfig {
+                source: None,
+                severity: None,
+                headline: "Operational signal".to_string(),
+                steps: vec![
+                    "Open Overview and verify trend direction for related metrics.".to_string(),
+                    "Use Task Center or Logs to isolate root cause and impact scope.".to_string(),
+                    "Acknowledge or ignore only after decision and follow-up action are clear.".to_string(),
+                ],
+                actions: vec![
+                    AlertRunbookAction { label: "Open Overview".to_string(), tab: "dashboard".to_string() },
+                    AlertRunbookAction { label: "Open Task Center".to_string(), tab: "jobs".to_string() },
+                    AlertRunbookAction { label: "Open Technical Logs".to_string(), tab: "logs".to_string() },
+                ],
+            },
+        ],
+    }
+}
+
+fn load_alert_policy_config(state: &AppState) -> AlertPolicyConfig {
+    let mut config = default_alert_policy_config();
+    let path = PathBuf::from(&state.alert_policy_path);
+
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(_) => return config,
+    };
+
+    if let Ok(parsed) = serde_json::from_str::<AlertPolicyConfig>(&content) {
+        if parsed.warning_to_critical_minutes > 0 {
+            config.warning_to_critical_minutes = parsed.warning_to_critical_minutes;
+        }
+        if !parsed.runbooks.is_empty() {
+            config.runbooks = parsed.runbooks;
+        }
+    }
+
+    config
+}
+
+fn resolve_alert_runbook(config: &AlertPolicyConfig, source: &str, severity: &str) -> AlertRunbook {
+    let source_norm = source.to_lowercase();
+    let severity_norm = severity.to_lowercase();
+    let mut best_score = i32::MIN;
+    let mut best_rule: Option<&AlertRunbookRuleConfig> = None;
+
+    for rule in &config.runbooks {
+        if let Some(rule_source) = &rule.source {
+            if !rule_source.eq_ignore_ascii_case(&source_norm) {
+                continue;
+            }
+        }
+        if let Some(rule_severity) = &rule.severity {
+            if !rule_severity.eq_ignore_ascii_case(&severity_norm) {
+                continue;
+            }
+        }
+
+        let mut score = 0;
+        if rule.source.is_some() {
+            score += 2;
+        }
+        if rule.severity.is_some() {
+            score += 1;
+        }
+        if score > best_score {
+            best_score = score;
+            best_rule = Some(rule);
+        }
+    }
+
+    if let Some(rule) = best_rule {
+        return AlertRunbook {
+            headline: rule.headline.clone(),
+            steps: rule.steps.clone(),
+            actions: rule.actions.clone(),
+        };
+    }
+
+    AlertRunbook {
+        headline: "Operational signal".to_string(),
+        steps: vec![
+            "Open Overview and verify trend direction for related metrics.".to_string(),
+            "Use Task Center or Logs to isolate root cause and impact scope.".to_string(),
+            "Acknowledge or ignore only after decision and follow-up action are clear.".to_string(),
+        ],
+        actions: vec![
+            AlertRunbookAction { label: "Open Overview".to_string(), tab: "dashboard".to_string() },
+            AlertRunbookAction { label: "Open Task Center".to_string(), tab: "jobs".to_string() },
+            AlertRunbookAction { label: "Open Technical Logs".to_string(), tab: "logs".to_string() },
+        ],
+    }
 }
 
 fn now_epoch_ms() -> i64 {
@@ -1986,8 +2317,9 @@ fn build_queue_snapshot(jobs: &[JobInfo]) -> QueueSnapshot {
 
 fn push_alert_item(
     alerts: &mut Vec<AlertItem>,
-    acked: &HashSet<String>,
+    alert_state: &mut AlertStateSnapshot,
     now_ms: i64,
+    warning_to_critical_minutes: u32,
     id: String,
     title: String,
     message: String,
@@ -1996,16 +2328,38 @@ fn push_alert_item(
     metric: Option<i64>,
     action: Option<String>,
 ) {
-    let status = if acked.contains(&id) { "acknowledged" } else { "open" };
+    let first_seen = *alert_state.first_seen_ms.entry(id.clone()).or_insert(now_ms);
+    let mut resolved_severity = severity.to_string();
+    let mut resolved_message = message;
+    let status = if alert_state.ignored_ids.contains(&id) {
+        "ignored"
+    } else if alert_state.acknowledged_ids.contains(&id) {
+        "acknowledged"
+    } else {
+        "open"
+    };
+
+    if status == "open" && severity.eq_ignore_ascii_case("warning") {
+        let escalation_ms = (warning_to_critical_minutes as i64) * 60_000;
+        if escalation_ms > 0 && now_ms.saturating_sub(first_seen) >= escalation_ms {
+            resolved_severity = "critical".to_string();
+            resolved_message = format!(
+                "{} Escalated to critical after {} minutes unresolved.",
+                resolved_message,
+                warning_to_critical_minutes
+            );
+        }
+    }
+
     alerts.push(AlertItem {
         id,
         title,
-        message,
-        severity: severity.to_string(),
+        message: resolved_message,
+        severity: resolved_severity,
         status: status.to_string(),
         source: source.to_string(),
         metric_value: metric,
-        created_at: now_ms,
+        created_at: first_seen,
         action_label: action,
     });
 }
@@ -2013,19 +2367,25 @@ fn push_alert_item(
 fn build_alerts(state: &AppState, jobs: &[JobInfo], services: &[ServiceStatus], queue: &QueueSnapshot) -> Vec<AlertItem> {
     let mut alerts: Vec<AlertItem> = Vec::new();
     let now_ms = now_epoch_ms();
-    let acked = state
-        .acknowledged_alert_ids
+    let policy = load_alert_policy_config(state);
+    let warning_to_critical_minutes = policy.warning_to_critical_minutes.max(1);
+    let mut alert_state = state
+        .alert_state
         .lock()
-        .map(|set| set.clone())
+        .map(|s| s.clone())
         .unwrap_or_default();
+    let mut active_ids: HashSet<String> = HashSet::new();
 
     for service in services {
         if service.status != "running" {
+            let alert_id = format!("service_{}_not_running", service.name.to_lowercase().replace(' ', "_"));
+            active_ids.insert(alert_id.clone());
             push_alert_item(
                 &mut alerts,
-                &acked,
+                &mut alert_state,
                 now_ms,
-                format!("service_{}_not_running", service.name.to_lowercase().replace(' ', "_")),
+                warning_to_critical_minutes,
+                alert_id,
                 format!("{} is not running", service.name),
                 "Service health is degraded. Start or restart this service.".to_string(),
                 "critical",
@@ -2039,10 +2399,12 @@ fn build_alerts(state: &AppState, jobs: &[JobInfo], services: &[ServiceStatus], 
     let failed_jobs = jobs.iter().filter(|j| j.status.eq_ignore_ascii_case("failed")).count() as i64;
     if failed_jobs > 0 {
         let sev = if failed_jobs >= 5 { "critical" } else { "warning" };
+        active_ids.insert("jobs_failed_recent".to_string());
         push_alert_item(
             &mut alerts,
-            &acked,
+            &mut alert_state,
             now_ms,
+            warning_to_critical_minutes,
             "jobs_failed_recent".to_string(),
             "Failed jobs detected".to_string(),
             format!("{} jobs failed in the selected period.", failed_jobs),
@@ -2054,10 +2416,12 @@ fn build_alerts(state: &AppState, jobs: &[JobInfo], services: &[ServiceStatus], 
     }
 
     if queue.review_ready >= 3 {
+        active_ids.insert("review_backlog".to_string());
         push_alert_item(
             &mut alerts,
-            &acked,
+            &mut alert_state,
             now_ms,
+            warning_to_critical_minutes,
             "review_backlog".to_string(),
             "Review backlog growing".to_string(),
             format!("{} jobs are waiting for review.", queue.review_ready),
@@ -2069,10 +2433,12 @@ fn build_alerts(state: &AppState, jobs: &[JobInfo], services: &[ServiceStatus], 
     }
 
     if queue.pending >= 10 {
+        active_ids.insert("queue_pending_high".to_string());
         push_alert_item(
             &mut alerts,
-            &acked,
+            &mut alert_state,
             now_ms,
+            warning_to_critical_minutes,
             "queue_pending_high".to_string(),
             "Pending queue is high".to_string(),
             format!("{} jobs are still waiting in the queue.", queue.pending),
@@ -2093,10 +2459,12 @@ fn build_alerts(state: &AppState, jobs: &[JobInfo], services: &[ServiceStatus], 
             .count() as i64;
 
         if err_count > 0 {
+            active_ids.insert("worker_error_logs".to_string());
             push_alert_item(
                 &mut alerts,
-                &acked,
+                &mut alert_state,
                 now_ms,
+                warning_to_critical_minutes,
                 "worker_error_logs".to_string(),
                 "Worker error logs found".to_string(),
                 format!("{} error-level log lines found recently.", err_count),
@@ -2109,10 +2477,12 @@ fn build_alerts(state: &AppState, jobs: &[JobInfo], services: &[ServiceStatus], 
     }
 
     if alerts.is_empty() {
+        active_ids.insert("system_nominal".to_string());
         push_alert_item(
             &mut alerts,
-            &acked,
+            &mut alert_state,
             now_ms,
+            warning_to_critical_minutes,
             "system_nominal".to_string(),
             "No active issues".to_string(),
             "System is healthy. Continue routine monitoring.".to_string(),
@@ -2129,12 +2499,28 @@ fn build_alerts(state: &AppState, jobs: &[JobInfo], services: &[ServiceStatus], 
             "warning" => 1,
             _ => 2,
         };
-        let sa = if a.status == "open" { 0 } else { 1 };
-        let sb = if b.status == "open" { 0 } else { 1 };
+        let status_weight = |status: &str| match status {
+            "open" => 0,
+            "acknowledged" => 1,
+            _ => 2,
+        };
+        let sa = status_weight(&a.status);
+        let sb = status_weight(&b.status);
         sa.cmp(&sb)
             .then(weight(&a.severity).cmp(&weight(&b.severity)))
-            .then(b.created_at.cmp(&a.created_at))
+            .then(a.created_at.cmp(&b.created_at))
     });
+
+    alert_state.first_seen_ms.retain(|alert_id, _| active_ids.contains(alert_id));
+    alert_state.acknowledged_ids.retain(|alert_id| active_ids.contains(alert_id));
+    alert_state.ignored_ids.retain(|alert_id| active_ids.contains(alert_id));
+
+    if let Ok(mut guard) = state.alert_state.lock() {
+        if *guard != alert_state {
+            *guard = alert_state.clone();
+            let _ = persist_alert_state_snapshot(&state.alert_state_path, &alert_state);
+        }
+    }
 
     alerts
 }
@@ -2279,15 +2665,100 @@ fn list_alerts(status: Option<String>, severity: Option<String>, state: State<'_
 #[tauri::command]
 fn ack_alert(alert_id: String, state: State<'_, AppState>) -> Result<bool, String> {
     let mut guard = state
-        .acknowledged_alert_ids
+        .alert_state
         .lock()
         .map_err(|_| "Failed to lock alert state".to_string())?;
-    let inserted = guard.insert(alert_id);
+    let inserted = guard.acknowledged_ids.insert(alert_id.clone());
+    guard.ignored_ids.remove(&alert_id);
     let snapshot = guard.clone();
     drop(guard);
 
-    persist_ack_alert_ids(&state.ack_alerts_path, &snapshot)?;
+    persist_alert_state_snapshot(&state.alert_state_path, &snapshot)?;
     Ok(inserted)
+}
+
+#[tauri::command]
+fn ack_alerts(alert_ids: Vec<String>, state: State<'_, AppState>) -> Result<u64, String> {
+    let mut guard = state
+        .alert_state
+        .lock()
+        .map_err(|_| "Failed to lock alert state".to_string())?;
+
+    let mut changed = 0u64;
+    for alert_id in alert_ids {
+        let inserted = guard.acknowledged_ids.insert(alert_id.clone());
+        let removed_ignore = guard.ignored_ids.remove(&alert_id);
+        if inserted || removed_ignore {
+            changed += 1;
+        }
+    }
+
+    let snapshot = guard.clone();
+    drop(guard);
+    persist_alert_state_snapshot(&state.alert_state_path, &snapshot)?;
+    Ok(changed)
+}
+
+#[tauri::command]
+fn ignore_alert(alert_id: String, state: State<'_, AppState>) -> Result<bool, String> {
+    let mut guard = state
+        .alert_state
+        .lock()
+        .map_err(|_| "Failed to lock alert state".to_string())?;
+    let inserted = guard.ignored_ids.insert(alert_id.clone());
+    guard.acknowledged_ids.remove(&alert_id);
+    let snapshot = guard.clone();
+    drop(guard);
+
+    persist_alert_state_snapshot(&state.alert_state_path, &snapshot)?;
+    Ok(inserted)
+}
+
+#[tauri::command]
+fn ignore_alerts(alert_ids: Vec<String>, state: State<'_, AppState>) -> Result<u64, String> {
+    let mut guard = state
+        .alert_state
+        .lock()
+        .map_err(|_| "Failed to lock alert state".to_string())?;
+
+    let mut changed = 0u64;
+    for alert_id in alert_ids {
+        let inserted = guard.ignored_ids.insert(alert_id.clone());
+        let removed_ack = guard.acknowledged_ids.remove(&alert_id);
+        if inserted || removed_ack {
+            changed += 1;
+        }
+    }
+
+    let snapshot = guard.clone();
+    drop(guard);
+    persist_alert_state_snapshot(&state.alert_state_path, &snapshot)?;
+    Ok(changed)
+}
+
+#[tauri::command]
+fn reopen_alert(alert_id: String, state: State<'_, AppState>) -> Result<bool, String> {
+    let mut guard = state
+        .alert_state
+        .lock()
+        .map_err(|_| "Failed to lock alert state".to_string())?;
+
+    let removed_ack = guard.acknowledged_ids.remove(&alert_id);
+    let removed_ignore = guard.ignored_ids.remove(&alert_id);
+    if removed_ack || removed_ignore {
+        guard.first_seen_ms.remove(&alert_id);
+    }
+    let snapshot = guard.clone();
+    drop(guard);
+
+    persist_alert_state_snapshot(&state.alert_state_path, &snapshot)?;
+    Ok(removed_ack || removed_ignore)
+}
+
+#[tauri::command]
+fn get_alert_runbook(source: String, severity: String, state: State<'_, AppState>) -> Result<AlertRunbook, String> {
+    let policy = load_alert_policy_config(&state);
+    Ok(resolve_alert_runbook(&policy, &source, &severity))
 }
 
 #[tauri::command]
@@ -3136,12 +3607,120 @@ fn get_api_providers() -> Result<Vec<ApiProvider>, String> {
     Ok(providers)
 }
 
-#[tauri::command]
-async fn get_api_usage(provider: String) -> Result<Option<ApiUsage>, String> {
+/// Provider activity estimation from local logs
+struct ProviderActivity {
+    calls: u64,
+    errors: u64,
+    last_seen_at: Option<i64>,
+}
+
+/// Estimate provider activity by parsing worker.log and telegram.log
+fn estimate_provider_activity(state: &AppState, provider: &str, range_hours: u64) -> ProviderActivity {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs() as i64;
+        .as_millis() as i64;
+    let cutoff = now - (range_hours as i64 * 3600 * 1000);
+
+    // Provider keywords to match in log lines
+    let (provider_keywords, error_keywords) = match provider {
+        "moonshot" => (
+            vec!["moonshot", "Moonshot", "MOONSHOT"],
+            vec!["error", "Error", "failed", "timeout", "rate limit"],
+        ),
+        "zai" => (
+            vec!["zai", "Zai", "ZAI", "zhipu"],
+            vec!["error", "Error", "failed", "timeout", "rate limit"],
+        ),
+        "openai-codex" => (
+            vec!["openai", "OpenAI", "gpt-", "codex"],
+            vec!["error", "Error", "failed", "timeout", "rate limit"],
+        ),
+        "google-antigravity" | "google" | "gemini" => (
+            vec!["google", "Gemini", "gemini", "antigravity"],
+            vec!["error", "Error", "failed", "timeout", "rate limit"],
+        ),
+        _ => return ProviderActivity { calls: 0, errors: 0, last_seen_at: None },
+    };
+
+    let mut calls: u64 = 0;
+    let mut errors: u64 = 0;
+    let mut last_seen_at: Option<i64> = None;
+
+    // Parse timestamp from log line (format: "2026-02-18 23:45:07 ...")
+    fn parse_log_timestamp(line: &str) -> Option<i64> {
+        let re = regex::Regex::new(r"^(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2}):(\d{2})").ok()?;
+        let caps = re.captures(line)?;
+        let year: i32 = caps.get(1)?.as_str().parse().ok()?;
+        let month: u32 = caps.get(2)?.as_str().parse().ok()?;
+        let day: u32 = caps.get(3)?.as_str().parse().ok()?;
+        let hour: u32 = caps.get(4)?.as_str().parse().ok()?;
+        let min: u32 = caps.get(5)?.as_str().parse().ok()?;
+        let sec: u32 = caps.get(6)?.as_str().parse().ok()?;
+
+        let date = chrono::NaiveDate::from_ymd_opt(year, month, day)?;
+        let time = chrono::NaiveTime::from_hms_opt(hour, min, sec)?;
+        let dt = chrono::NaiveDateTime::new(date, time);
+        Some(dt.and_utc().timestamp_millis())
+    }
+
+    // Check if line matches provider and error patterns
+    fn line_matches(line: &str, provider_keywords: &[&str], error_keywords: &[&str]) -> (bool, bool) {
+        let line_lower = line.to_lowercase();
+        let has_provider = provider_keywords.iter().any(|k| line.contains(k) || line_lower.contains(&k.to_lowercase()));
+        let has_error = error_keywords.iter().any(|k| line.contains(k) || line_lower.contains(&k.to_lowercase()));
+        (has_provider, has_error)
+    }
+
+    // Process a single log file
+    fn process_log_file(
+        path: &str,
+        provider_keywords: &[&str],
+        error_keywords: &[&str],
+        cutoff: i64,
+        calls: &mut u64,
+        errors: &mut u64,
+        last_seen_at: &mut Option<i64>,
+    ) {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            for line in content.lines() {
+                let ts = parse_log_timestamp(line);
+                if let Some(ts) = ts {
+                    if ts < cutoff {
+                        continue;
+                    }
+                }
+
+                let (has_provider, has_error) = line_matches(line, provider_keywords, error_keywords);
+                if has_provider {
+                    *calls += 1;
+                    if has_error {
+                        *errors += 1;
+                    }
+                    if let Some(ts) = ts {
+                        *last_seen_at = Some(last_seen_at.unwrap_or(0).max(ts));
+                    }
+                }
+            }
+        }
+    }
+
+    // Check worker.log (primary) and telegram.log (secondary)
+    let worker_log = format!("{}/worker.log", state.logs_dir);
+    let telegram_log = format!("{}/telegram.log", state.logs_dir);
+
+    process_log_file(&worker_log, &provider_keywords, &error_keywords, cutoff, &mut calls, &mut errors, &mut last_seen_at);
+    process_log_file(&telegram_log, &provider_keywords, &error_keywords, cutoff, &mut calls, &mut errors, &mut last_seen_at);
+
+    ProviderActivity { calls, errors, last_seen_at }
+}
+
+#[tauri::command]
+async fn get_api_usage(provider: String, state: State<'_, AppState>) -> Result<Option<ApiUsage>, String> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
 
     let profiles = read_auth_profiles()?;
 
@@ -3179,34 +3758,104 @@ async fn get_api_usage(provider: String) -> Result<Option<ApiUsage>, String> {
                         unit: "credits".to_string(),
                         reset_at: None,
                         fetched_at: now,
+                        source: "real_api".to_string(),
+                        confidence: "high".to_string(),
+                        reason: None,
+                        activity_calls_24h: None,
+                        activity_errors_24h: None,
+                        activity_success_rate: None,
+                        activity_last_seen_at: None,
                     }));
                 }
             }
-            Ok(None)
-        }
-        "zai" => {
-            // Zai API usage - check if we have the key
-            let profile_key = "zai:default";
-            let has_key = profiles
-                .get("profiles")
-                .and_then(|p| p.get(profile_key))
-                .is_some();
-
-            if has_key {
-                // Return placeholder - actual API would need to be implemented
+            // Fallback to estimated activity if API call failed
+            let activity = estimate_provider_activity(&state, &provider, 24);
+            if activity.calls > 0 {
+                let success_rate = if activity.calls > 0 {
+                    Some(((activity.calls - activity.errors) as f64) / (activity.calls as f64))
+                } else {
+                    None
+                };
                 Ok(Some(ApiUsage {
                     provider: provider.clone(),
                     used: 0,
                     limit: 0,
                     remaining: 0,
-                    unit: "tokens".to_string(),
+                    unit: "credits".to_string(),
                     reset_at: None,
                     fetched_at: now,
+                    source: "estimated_activity".to_string(),
+                    confidence: "low".to_string(),
+                    reason: Some("API query failed, using log-based estimation".to_string()),
+                    activity_calls_24h: Some(activity.calls),
+                    activity_errors_24h: Some(activity.errors),
+                    activity_success_rate: success_rate,
+                    activity_last_seen_at: activity.last_seen_at,
                 }))
             } else {
                 Ok(None)
             }
         }
+        // All estimatable providers (moonshot, zai, openai-codex, google-antigravity, etc.)
+        pid @ ("moonshot" | "zai" | "openai-codex" | "google-antigravity" | "google" | "gemini") => {
+            let profile_key = format!("{}:default", pid);
+            let has_key = profiles
+                .get("profiles")
+                .and_then(|p| p.get(&profile_key))
+                .is_some();
+
+            // Try to estimate from logs
+            let activity = estimate_provider_activity(&state, pid, 24);
+
+            if activity.calls > 0 {
+                // We have activity data from logs
+                let success_rate = if activity.calls > 0 {
+                    Some(((activity.calls - activity.errors) as f64) / (activity.calls as f64))
+                } else {
+                    None
+                };
+                let confidence = if activity.calls >= 10 { "medium" } else { "low" };
+
+                Ok(Some(ApiUsage {
+                    provider: provider.clone(),
+                    used: 0,
+                    limit: 0,
+                    remaining: 0,
+                    unit: "requests".to_string(),
+                    reset_at: None,
+                    fetched_at: now,
+                    source: "estimated_activity".to_string(),
+                    confidence: confidence.to_string(),
+                    reason: Some(format!("Provider has no public usage API; estimated from {} log entries in 24h", activity.calls)),
+                    activity_calls_24h: Some(activity.calls),
+                    activity_errors_24h: Some(activity.errors),
+                    activity_success_rate: success_rate,
+                    activity_last_seen_at: activity.last_seen_at,
+                }))
+            } else if has_key {
+                // Has key but no recent activity
+                Ok(Some(ApiUsage {
+                    provider: provider.clone(),
+                    used: 0,
+                    limit: 0,
+                    remaining: 0,
+                    unit: "requests".to_string(),
+                    reset_at: None,
+                    fetched_at: now,
+                    source: "unsupported".to_string(),
+                    confidence: "low".to_string(),
+                    reason: Some("Provider has no public usage API and no recent local activity found".to_string()),
+                    activity_calls_24h: Some(0),
+                    activity_errors_24h: Some(0),
+                    activity_success_rate: None,
+                    activity_last_seen_at: None,
+                }))
+            } else {
+                // No key configured
+                Ok(None)
+            }
+        }
+        // Unknown providers
         _ => Ok(None),
     }
 }
@@ -3264,6 +3913,8 @@ pub fn run() {
             start_openclaw,
             get_config,
             save_config,
+            get_env_settings,
+            save_env_settings,
             get_jobs,
             get_job_milestones,
             get_overview_metrics,
@@ -3271,6 +3922,11 @@ pub fn run() {
             get_queue_snapshot,
             list_alerts,
             ack_alert,
+            ack_alerts,
+            ignore_alert,
+            ignore_alerts,
+            reopen_alert,
+            get_alert_runbook,
             export_run_summary,
             list_verify_artifacts,
             get_quality_report,

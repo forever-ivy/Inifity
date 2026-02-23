@@ -3,6 +3,7 @@ import { useAppStore } from "@/stores/appStore";
 
 const DASHBOARD_STATUS_INTERVAL_MS = 10_000;
 const DASHBOARD_JOBS_INTERVAL_MS = 30_000;
+const ALERT_CENTER_INTERVAL_MS = 10_000;
 const JOBS_INTERVAL_MS = 8_000;
 const JOB_MILESTONES_INTERVAL_MS = 2_000;
 const LOGS_INTERVAL_MS = 5_000;
@@ -17,6 +18,7 @@ function isVisible() {
 export function usePollingOrchestrator() {
   const activeTab = useAppStore((s) => s.activeTab);
   const refreshDashboardData = useAppStore((s) => s.refreshDashboardData);
+  const refreshAlertCenterData = useAppStore((s) => s.refreshAlertCenterData);
   const refreshJobsData = useAppStore((s) => s.refreshJobsData);
   const refreshSelectedJobMilestones = useAppStore((s) => s.refreshSelectedJobMilestones);
   const refreshLogsData = useAppStore((s) => s.refreshLogsData);
@@ -41,6 +43,16 @@ export function usePollingOrchestrator() {
       window.clearInterval(jobsId);
     };
   }, [activeTab, refreshDashboardData]);
+
+  useEffect(() => {
+    if (activeTab !== "alerts") return;
+    void refreshAlertCenterData();
+    const id = window.setInterval(() => {
+      if (!isVisible()) return;
+      void refreshAlertCenterData();
+    }, ALERT_CENTER_INTERVAL_MS);
+    return () => window.clearInterval(id);
+  }, [activeTab, refreshAlertCenterData]);
 
   useEffect(() => {
     if (activeTab !== "jobs") return;
@@ -107,6 +119,8 @@ export function usePollingOrchestrator() {
       if (!isVisible()) return;
       if (activeTab === "dashboard") {
         void refreshDashboardData({ silent: true, includeJobs: true });
+      } else if (activeTab === "alerts") {
+        void refreshAlertCenterData();
       } else if (activeTab === "jobs") {
         void refreshJobsData({ silent: true });
         void refreshSelectedJobMilestones({ silent: true });
@@ -122,6 +136,7 @@ export function usePollingOrchestrator() {
     return () => document.removeEventListener("visibilitychange", handleVisible);
   }, [
     activeTab,
+    refreshAlertCenterData,
     refreshApiConfigData,
     refreshDashboardData,
     refreshJobsData,

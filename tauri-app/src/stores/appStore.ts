@@ -109,6 +109,21 @@ export interface ApiUsage {
   unit: string;
   resetAt?: number;
   fetchedAt: number;
+  // Extended fields for dual-track (real vs estimated)
+  source: "real_api" | "estimated_activity" | "unsupported";
+  confidence: "high" | "medium" | "low";
+  reason?: string;
+  activityCalls24h?: number;
+  activityErrors24h?: number;
+  activitySuccessRate?: number;
+  activityLastSeenAt?: number; // epoch ms
+}
+
+export interface UsageSample {
+  ts: number;
+  used: number;
+  remaining: number;
+  limit: number;
 }
 
 export interface OverviewMetrics {
@@ -140,7 +155,7 @@ export interface AlertItem {
   title: string;
   message: string;
   severity: "critical" | "warning" | "info";
-  status: "open" | "acknowledged";
+  status: "open" | "acknowledged" | "ignored";
   source: string;
   metricValue?: number;
   createdAt: number;
@@ -161,6 +176,8 @@ export interface RunSummary {
   text: string;
   generatedAt: number;
 }
+
+export type AlertRunbook = tauri.AlertRunbook;
 
 export type ModelAvailabilityReport = tauri.ModelAvailabilityReport;
 
@@ -252,6 +269,7 @@ interface AppState {
   // API Providers
   apiProviders: ApiProvider[];
   apiUsage: Record<string, ApiUsage>;
+  apiUsageHistory: Record<string, UsageSample[]>;
   fetchApiProviders: () => Promise<void>;
   fetchApiUsage: (provider: string) => Promise<void>;
   fetchAllApiUsage: () => Promise<void>;
@@ -272,11 +290,17 @@ interface AppState {
   runSummary: RunSummary | null;
   fetchOverviewMetrics: (rangeHours?: number) => Promise<void>;
   fetchOverviewTrends: (metric?: OverviewTrendMetric, rangeHours?: number) => Promise<void>;
-  fetchOverviewAlerts: (status?: "open" | "acknowledged", severity?: "critical" | "warning" | "info") => Promise<void>;
+  fetchOverviewAlerts: (status?: "open" | "acknowledged" | "ignored", severity?: "critical" | "warning" | "info") => Promise<void>;
   ackOverviewAlert: (alertId: string) => Promise<void>;
+  ackOverviewAlerts: (alertIds: string[]) => Promise<void>;
+  ignoreOverviewAlert: (alertId: string) => Promise<void>;
+  ignoreOverviewAlerts: (alertIds: string[]) => Promise<void>;
+  reopenOverviewAlert: (alertId: string) => Promise<void>;
+  fetchAlertRunbook: (source: string, severity: "critical" | "warning" | "info") => Promise<AlertRunbook>;
   fetchQueueSnapshot: () => Promise<void>;
   fetchRunSummary: (date?: string) => Promise<void>;
   refreshOverviewData: (opts?: { includeTrends?: boolean }) => Promise<void>;
+  refreshAlertCenterData: () => Promise<void>;
 
   // Consolidated polling actions
   refreshDashboardData: (opts?: { silent?: boolean; includeJobs?: boolean }) => Promise<void>;
@@ -293,6 +317,65 @@ const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 let servicesFetchInFlight = false;
 const logsFetchInFlight: Record<string, boolean> = {};
 const artifactRequestSeqByJob: Record<string, number> = {};
+const API_USAGE_HISTORY_STORAGE_KEY = "apiUsageHistory";
+const API_USAGE_HISTORY_WINDOW_MS = 24 * 60 * 60 * 1000;
+const API_USAGE_HISTORY_MAX_POINTS = 576;
+
+function normalizeEpochMs(ts: number | undefined): number {
+  if (!ts || !Number.isFinite(ts) || ts <= 0) return Date.now();
+  return ts < 1_000_000_000_000 ? ts * 1000 : ts;
+}
+
+function loadApiUsageHistoryFromStorage(): Record<string, UsageSample[]> {
+  if (typeof window === "undefined") return {};
+  try {
+    const raw = localStorage.getItem(API_USAGE_HISTORY_STORAGE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as Record<string, UsageSample[]>;
+    const now = Date.now();
+    const out: Record<string, UsageSample[]> = {};
+
+    for (const [provider, samples] of Object.entries(parsed)) {
+      if (!Array.isArray(samples)) continue;
+      out[provider] = samples
+        .filter((s) =>
+          s &&
+          Number.isFinite(s.ts) &&
+          Number.isFinite(s.used) &&
+          Number.isFinite(s.remaining) &&
+          Number.isFinite(s.limit) &&
+          s.ts >= now - API_USAGE_HISTORY_WINDOW_MS
+        )
+        .slice(-API_USAGE_HISTORY_MAX_POINTS);
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function persistApiUsageHistoryToStorage(history: Record<string, UsageSample[]>) {
+  if (typeof window === "undefined") return;
+  try {
+    localStorage.setItem(API_USAGE_HISTORY_STORAGE_KEY, JSON.stringify(history));
+  } catch {
+    // Ignore storage errors.
+  }
+}
+
+function appendUsageSample(
+  history: Record<string, UsageSample[]>,
+  provider: string,
+  sample: UsageSample
+): Record<string, UsageSample[]> {
+  const now = Date.now();
+  const prev = history[provider] || [];
+  const merged = [...prev, sample]
+    .filter((s) => s.ts >= now - API_USAGE_HISTORY_WINDOW_MS)
+    .sort((a, b) => a.ts - b.ts)
+    .slice(-API_USAGE_HISTORY_MAX_POINTS);
+  return { ...history, [provider]: merged };
+}
 
 export const useAppStore = create<AppState>((set, get) => ({
   // Services
@@ -418,6 +501,8 @@ export const useAppStore = create<AppState>((set, get) => ({
     try {
       if (activeTab === "dashboard") {
         await get().refreshDashboardData({ includeJobs: true });
+      } else if (activeTab === "alerts") {
+        await get().refreshAlertCenterData();
       } else if (activeTab === "services") {
         await Promise.all([
           get().fetchServices(),
@@ -929,6 +1014,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   // API Providers
   apiProviders: [],
   apiUsage: {},
+  apiUsageHistory: loadApiUsageHistoryFromStorage(),
   fetchApiProviders: async () => {
     try {
       const providers = await tauri.getApiProviders();
@@ -951,7 +1037,22 @@ export const useAppStore = create<AppState>((set, get) => ({
     try {
       const usage = await tauri.getApiUsage(provider);
       if (usage) {
+        const fetchedAtMs = normalizeEpochMs(usage.fetched_at);
         set((state) => ({
+          apiUsageHistory: (() => {
+            // Only record history for real_api source
+            if (usage.source === "real_api") {
+              const nextHistory = appendUsageSample(state.apiUsageHistory, provider, {
+                ts: fetchedAtMs,
+                used: usage.used,
+                remaining: usage.remaining,
+                limit: usage.limit,
+              });
+              persistApiUsageHistoryToStorage(nextHistory);
+              return nextHistory;
+            }
+            return state.apiUsageHistory;
+          })(),
           apiUsage: {
             ...state.apiUsage,
             [provider]: {
@@ -961,7 +1062,14 @@ export const useAppStore = create<AppState>((set, get) => ({
               remaining: usage.remaining,
               unit: usage.unit,
               resetAt: usage.reset_at,
-              fetchedAt: usage.fetched_at,
+              fetchedAt: fetchedAtMs,
+              source: usage.source as ApiUsage["source"],
+              confidence: usage.confidence as ApiUsage["confidence"],
+              reason: usage.reason,
+              activityCalls24h: usage.activity_calls_24h,
+              activityErrors24h: usage.activity_errors_24h,
+              activitySuccessRate: usage.activity_success_rate,
+              activityLastSeenAt: usage.activity_last_seen_at,
             },
           },
         }));
@@ -973,16 +1081,17 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
   fetchAllApiUsage: async () => {
     const { apiProviders } = get();
-    for (const provider of apiProviders) {
-      if (provider.authType === "api_key" && provider.hasKey) {
-        await get().fetchApiUsage(provider.id);
-      }
-    }
+    const targets = apiProviders.filter((provider) => provider.authType === "api_key" && provider.hasKey);
+    await Promise.all(targets.map((provider) => get().fetchApiUsage(provider.id)));
   },
   setApiKey: async (provider: string, key: string) => {
     try {
       await tauri.setApiKey(provider, key);
-      await get().fetchApiProviders();
+      await Promise.all([
+        get().fetchApiProviders(),
+        get().fetchModelAvailabilityReport(),
+      ]);
+      await get().fetchApiUsage(provider);
       get().addToast("success", `API key saved for ${provider}`);
     } catch (err) {
       get().addToast("error", `Failed to save API key: ${err}`);
@@ -991,12 +1100,18 @@ export const useAppStore = create<AppState>((set, get) => ({
   deleteApiKey: async (provider: string) => {
     try {
       await tauri.deleteApiKey(provider);
-      await get().fetchApiProviders();
+      await Promise.all([
+        get().fetchApiProviders(),
+        get().fetchModelAvailabilityReport(),
+      ]);
       // Clear usage data
       set((state) => {
         const newUsage = { ...state.apiUsage };
         delete newUsage[provider];
-        return { apiUsage: newUsage };
+        const newHistory = { ...state.apiUsageHistory };
+        delete newHistory[provider];
+        persistApiUsageHistoryToStorage(newHistory);
+        return { apiUsage: newUsage, apiUsageHistory: newHistory };
       });
       get().addToast("success", `API key removed for ${provider}`);
     } catch (err) {
@@ -1068,20 +1183,51 @@ export const useAppStore = create<AppState>((set, get) => ({
   ackOverviewAlert: async (alertId: string) => {
     try {
       await tauri.ackAlert(alertId);
-      set((state) => ({
-        overviewMetrics: state.overviewMetrics
-          ? { ...state.overviewMetrics, openAlerts: Math.max(0, state.overviewMetrics.openAlerts - 1) }
-          : state.overviewMetrics,
-        overviewAlerts: state.overviewAlerts.map((item) =>
-          item.id === alertId ? { ...item, status: "acknowledged" } : item
-        ),
-      }));
-      await get().fetchOverviewAlerts();
+      await get().refreshAlertCenterData();
       get().addToast("success", "Alert acknowledged");
     } catch (err) {
       get().addToast("error", `Failed to acknowledge alert: ${err}`);
     }
   },
+  ackOverviewAlerts: async (alertIds: string[]) => {
+    if (alertIds.length === 0) return;
+    try {
+      const changed = await tauri.ackAlerts(alertIds);
+      await get().refreshAlertCenterData();
+      get().addToast("success", `${changed} alerts acknowledged`);
+    } catch (err) {
+      get().addToast("error", `Failed to acknowledge alerts: ${err}`);
+    }
+  },
+  ignoreOverviewAlert: async (alertId: string) => {
+    try {
+      await tauri.ignoreAlert(alertId);
+      await get().refreshAlertCenterData();
+      get().addToast("success", "Alert ignored");
+    } catch (err) {
+      get().addToast("error", `Failed to ignore alert: ${err}`);
+    }
+  },
+  ignoreOverviewAlerts: async (alertIds: string[]) => {
+    if (alertIds.length === 0) return;
+    try {
+      const changed = await tauri.ignoreAlerts(alertIds);
+      await get().refreshAlertCenterData();
+      get().addToast("success", `${changed} alerts ignored`);
+    } catch (err) {
+      get().addToast("error", `Failed to ignore alerts: ${err}`);
+    }
+  },
+  reopenOverviewAlert: async (alertId: string) => {
+    try {
+      await tauri.reopenAlert(alertId);
+      await get().refreshAlertCenterData();
+      get().addToast("success", "Alert reopened");
+    } catch (err) {
+      get().addToast("error", `Failed to reopen alert: ${err}`);
+    }
+  },
+  fetchAlertRunbook: async (source, severity) => tauri.getAlertRunbook(source, severity),
   fetchQueueSnapshot: async () => {
     try {
       const queue = await tauri.getQueueSnapshot();
@@ -1120,6 +1266,13 @@ export const useAppStore = create<AppState>((set, get) => ({
       get().fetchQueueSnapshot(),
       get().fetchRunSummary(),
       opts?.includeTrends === false ? Promise.resolve() : get().fetchOverviewTrends(get().overviewTrendMetric, 24),
+    ]);
+  },
+  refreshAlertCenterData: async () => {
+    await Promise.all([
+      get().fetchOverviewMetrics(24),
+      get().fetchOverviewAlerts(),
+      get().fetchQueueSnapshot(),
     ]);
   },
 
