@@ -993,10 +993,6 @@ fn diagnose_telegram_health_inner(state: &AppState) -> TelegramHealth {
     let log_tail = read_log_tail(&telegram_log_file_path(state), 50);
     let combined = log_tail.join("\n");
     let lower = combined.to_lowercase();
-    let poll_conflict = lower.contains("getupdates conflict")
-        || lower.contains("conflict: terminated by other getupdates request")
-        || lower.contains("error_code\":409")
-        || lower.contains("http 409");
     let network_issue = lower.contains("network error")
         || lower.contains("timed out")
         || lower.contains("reset by peer")
@@ -1029,6 +1025,11 @@ fn diagnose_telegram_health_inner(state: &AppState) -> TelegramHealth {
             break;
         }
     }
+    let last_error_lower = last_error.to_lowercase();
+    let poll_conflict = last_error_lower.contains("getupdates conflict")
+        || last_error_lower.contains("conflict: terminated by other getupdates request")
+        || last_error_lower.contains("error_code\":409")
+        || last_error_lower.contains("http 409");
     TelegramHealth {
         running,
         single_instance_ok,
@@ -1060,11 +1061,17 @@ fn start_telegram_process(state: &AppState) -> Result<u32, String> {
         .map_err(|e| format!("Failed to clone telegram log descriptor: {}", e))?;
 
     let python_bin = find_python_bin(state);
-    let child = Command::new(&python_bin)
-        .args(["-m", "scripts.telegram_bot"])
+    let env_path = PathBuf::from(&state.config_path).join(".env.v4.local");
+    let env_map = read_env_map(&env_path);
+    let mut cmd = Command::new(&python_bin);
+    cmd.args(["-m", "scripts.telegram_bot"])
         .current_dir(&state.config_path)
         .stdout(std::process::Stdio::from(log_file))
-        .stderr(std::process::Stdio::from(log_file_err))
+        .stderr(std::process::Stdio::from(log_file_err));
+    if !env_map.is_empty() {
+        cmd.envs(env_map);
+    }
+    let child = cmd
         .spawn()
         .map_err(|e| format!("Failed to spawn telegram bot via {}: {}", python_bin, e))?;
 
